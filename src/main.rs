@@ -1,7 +1,7 @@
 use anyhow::Context as _;
 use clap::Parser as _;
 use futures::TryStreamExt as _;
-use std::{fs, path};
+use std::{fs, path, sync};
 
 /// Sync the members of a GitHub organization with Linux user accounts for new members, installing their public keys for SSH access.
 #[derive(clap::Parser, Debug)]
@@ -22,7 +22,6 @@ struct Cli {
     #[cfg(target_os = "linux")]
     #[arg(long, action = clap::ArgAction::SetTrue)]
     dry_run: bool,
-
     #[cfg(not(target_os = "linux"))]
     #[arg(skip = true)]
     dry_run: bool,
@@ -32,9 +31,25 @@ struct Cli {
     verbose: bool,
 }
 
-#[derive(serde::Deserialize)]
-struct GithubKey {
-    key: String,
+#[derive(Debug)]
+struct Context {
+    octocrab: octocrab::Octocrab,
+    config: sync::Arc<Cli>,
+}
+
+impl Context {
+    async fn try_from_config(config: sync::Arc<Cli>) -> anyhow::Result<Self> {
+        let octocrab = org_client(&config).await?;
+        Ok(Context { octocrab, config })
+    }
+
+    pub fn config(&self) -> &Cli {
+        &self.config
+    }
+
+    pub fn octocrab(&self) -> &octocrab::Octocrab {
+        &self.octocrab
+    }
 }
 
 async fn org_client(args: &Cli) -> anyhow::Result<octocrab::Octocrab> {
@@ -62,23 +77,17 @@ async fn org_client(args: &Cli) -> anyhow::Result<octocrab::Octocrab> {
         .get_org_installation(&args.org)
         .await
         .with_context(|| format!("Failed to get installation for org '{}'", args.org))?;
-
-    Ok(app_client.installation(installation.id)?)
+    let install_crab = app_client.installation(installation.id)?;
+    log::debug!(
+        "Successfully authenticated to GitHub API, starting member sync for org '{}'",
+        args.org
+    );
+    Ok(install_crab)
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut args = Cli::parse();
-    let is_linux = cfg!(target_os = "linux");
-    if !is_linux {
-        args.dry_run = true;
-        log::warn!("Non-Linux host detected: running in dry-run mode for user management");
-    }
-
-    if args.dry_run {
-        log::info!("Running in dry-run mode: no changes will be made to Linux users or files");
-    }
-
     env_logger::builder()
         .filter_level(if args.verbose {
             log::LevelFilter::Debug
@@ -87,30 +96,32 @@ async fn main() -> anyhow::Result<()> {
         })
         .init();
 
-    let octo = org_client(&args).await?;
-    log::debug!(
-        "Successfully authenticated to GitHub API, starting member sync for org '{}'",
-        args.org
-    );
+    if !cfg!(target_os = "linux") {
+        args.dry_run = true;
+        log::warn!("Non-Linux host detected: running in dry-run mode for user management");
+    }
 
-    let current_members = list_all_org_members(&octo, &args.org).await?;
+    if args.dry_run {
+        log::info!("Running in dry-run mode: no changes will be made to Linux users or files");
+    }
+    let ctx = Context::try_from_config(sync::Arc::new(args)).await?;
+
+    let current_members = get_all_org_members(&ctx).await?;
     serde_json::to_writer_pretty(std::io::stdout(), &current_members)?;
 
     Ok(())
 }
 
-async fn list_all_org_members(
-    octocrab: &octocrab::Octocrab,
-    org: &str,
-) -> anyhow::Result<Vec<octocrab::models::Author>> {
-    let stream = octocrab
-        .orgs(org)
+async fn get_all_org_members(ctx: &Context) -> anyhow::Result<Vec<octocrab::models::Author>> {
+    let stream = ctx
+        .octocrab()
+        .orgs(&ctx.config().org)
         .list_members()
         .per_page(100)
         .send()
         .await
-        .with_context(|| format!("Failed to list members for org '{org}'"))?
-        .into_stream(octocrab);
+        .with_context(|| format!("Failed to list members for org '{}'", ctx.config().org))?
+        .into_stream(ctx.octocrab());
 
     Ok(stream.try_collect().await?)
 }
