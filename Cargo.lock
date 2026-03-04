@@ -859,24 +859,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "github-user-sync"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "env_logger",
- "futures",
- "jsonwebtoken",
- "log",
- "nix 0.30.1",
- "octocrab",
- "serde",
- "serde_json",
- "tokio",
- "zbus",
-]
-
-[[package]]
 name = "group"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1445,7 +1427,6 @@ dependencies = [
  "chrono",
  "either",
  "futures",
- "futures-core",
  "futures-util",
  "getrandom 0.2.17",
  "http",
@@ -1471,6 +1452,24 @@ dependencies = [
  "tracing",
  "url",
  "web-time",
+]
+
+[[package]]
+name = "octosync"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "env_logger",
+ "futures",
+ "jsonwebtoken",
+ "log",
+ "nix 0.30.1",
+ "octocrab",
+ "serde",
+ "serde_json",
+ "tokio",
+ "zbus",
 ]
 
 [[package]]
