@@ -1,6 +1,8 @@
 use anyhow::Context as _;
 use clap::Parser as _;
-use std::{fs, path};
+use futures::TryStreamExt as _;
+use nix::unistd::{Gid, Uid, User, chown};
+use std::{collections, fs, path};
 
 /// Sync the members of a GitHub organization with Linux user accounts for new members, installing their public keys for SSH access.
 #[derive(clap::Parser, Debug)]
@@ -84,5 +86,24 @@ async fn main() -> anyhow::Result<()> {
         args.org
     );
 
+    let current_members = list_all_org_members(&octo, &args.org).await?;
+    serde_json::to_writer_pretty(std::io::stdout(), &current_members)?;
+
     Ok(())
+}
+
+async fn list_all_org_members(
+    octocrab: &octocrab::Octocrab,
+    org: &str,
+) -> anyhow::Result<Vec<octocrab::models::Author>> {
+    let stream = octocrab
+        .orgs(org)
+        .list_members()
+        .per_page(100)
+        .send()
+        .await
+        .with_context(|| format!("Failed to list members for org '{org}'"))?
+        .into_stream(&octocrab);
+
+    Ok(stream.try_collect().await?)
 }
