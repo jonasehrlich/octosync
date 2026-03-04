@@ -19,7 +19,12 @@ struct Cli {
     private_key: path::PathBuf,
 
     /// Preview actions without writing files or changing Linux users
+    #[cfg(target_os = "linux")]
     #[arg(long, action = clap::ArgAction::SetTrue)]
+    dry_run: bool,
+
+    #[cfg(not(target_os = "linux"))]
+    #[arg(skip = true)]
     dry_run: bool,
 
     /// Enable verbose logging
@@ -63,7 +68,16 @@ async fn org_client(args: &Cli) -> anyhow::Result<octocrab::Octocrab> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = Cli::parse();
+    let mut args = Cli::parse();
+    let is_linux = cfg!(target_os = "linux");
+    if !is_linux {
+        args.dry_run = true;
+        log::warn!("Non-Linux host detected: running in dry-run mode for user management");
+    }
+
+    if args.dry_run {
+        log::info!("Running in dry-run mode: no changes will be made to Linux users or files");
+    }
 
     env_logger::builder()
         .filter_level(if args.verbose {
@@ -72,12 +86,6 @@ async fn main() -> anyhow::Result<()> {
             log::LevelFilter::Info
         })
         .init();
-
-    let is_linux = cfg!(target_os = "linux");
-    let effective_dry_run = args.dry_run || !is_linux;
-    if !is_linux {
-        log::warn!("Non-Linux host detected: running in dry-run mode for user management");
-    }
 
     let octo = org_client(&args).await?;
     log::debug!(
