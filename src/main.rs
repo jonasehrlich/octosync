@@ -3,6 +3,8 @@ use clap::Parser as _;
 use futures::TryStreamExt as _;
 use std::{fs, path, sync};
 
+mod store;
+
 /// Sync the members of a GitHub organization with Linux user accounts for new members, installing their public keys for SSH access.
 #[derive(clap::Parser, Debug)]
 struct Cli {
@@ -104,11 +106,20 @@ async fn main() -> anyhow::Result<()> {
     if args.dry_run {
         log::info!("Running in dry-run mode: no changes will be made to Linux users or files");
     }
-    let ctx = Context::try_from_config(sync::Arc::new(args)).await?;
+    let ctx = sync::Arc::new(Context::try_from_config(sync::Arc::new(args)).await?);
+
+    let store = store::Store::new(
+        ctx.clone(),
+        directories::ProjectDirs::from("", "", env!("CARGO_PKG_NAME"))
+            .context("Error determining project directory")?
+            .data_dir()
+            .to_path_buf(),
+    )?;
 
     let current_members = get_all_org_members(&ctx).await?;
     serde_json::to_writer_pretty(std::io::stdout(), &current_members)?;
 
+    store.save()?;
     Ok(())
 }
 
