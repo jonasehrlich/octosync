@@ -1,8 +1,7 @@
 use anyhow::Context as _;
 use clap::Parser as _;
 use futures::TryStreamExt as _;
-use nix::unistd::{Gid, Uid, User, chown};
-use std::{collections, fs, path};
+use std::{fs, path};
 
 /// Sync the members of a GitHub organization with Linux user accounts for new members, installing their public keys for SSH access.
 #[derive(clap::Parser, Debug)]
@@ -103,7 +102,7 @@ async fn list_all_org_members(
         .send()
         .await
         .with_context(|| format!("Failed to list members for org '{org}'"))?
-        .into_stream(&octocrab);
+        .into_stream(octocrab);
 
     Ok(stream.try_collect().await?)
 }
