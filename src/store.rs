@@ -83,6 +83,7 @@ pub struct Store {
 
 impl Store {
     /// Create a new store instance with the given path to the directory with
+    #[tracing::instrument(name = "Store::new")]
     pub async fn new(dir: &path::Path) -> anyhow::Result<Self> {
         fs::create_dir_all(&dir).await?;
         let mut s = Self {
@@ -103,23 +104,24 @@ impl Store {
     }
 
     /// Load the store from the file system
-    pub async fn load(&mut self) -> anyhow::Result<()> {
+    async fn load(&mut self) -> anyhow::Result<()> {
         self.users = self.load_users().await?;
 
         Ok(())
     }
 
     /// Load the users from the users database file, returning an empty map if the file doesn't exist
+    #[tracing::instrument(name = "Store::load_users", skip(self))]
     async fn load_users(&self) -> anyhow::Result<UserMap> {
         let path = self.user_path();
-        log::debug!("Loading users from '{}'", path.display());
+        tracing::debug!("Loading users '{}'", path.display());
 
         match fs::read_to_string(&path).await {
             Ok(content) => Ok(serde_json::from_str(&content).with_context(|| {
                 format!("Failed to parse users database from '{}'", path.display())
             })?),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                log::info!(
+                tracing::info!(
                     "Users database file '{}' not found, starting with an empty user map",
                     path.display()
                 );

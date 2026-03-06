@@ -70,21 +70,28 @@ impl FromStr for GroupMapping {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut args = Cli::parse();
-    env_logger::builder()
-        .filter_level(if args.verbose {
-            log::LevelFilter::Debug
-        } else {
-            log::LevelFilter::Info
-        })
+    let level = if args.verbose {
+        tracing::Level::DEBUG
+    } else {
+        tracing::Level::INFO
+    };
+
+    tracing_subscriber::fmt()
+        .compact()
+        .with_max_level(level)
+        .with_writer(std::io::stdout)
+        .with_file(true)
+        .with_line_number(true)
+        .with_target(false)
         .init();
 
     if !cfg!(target_os = "linux") {
+        tracing::warn!("Non-Linux OS detected, forcing dry-run mode");
         args.dry_run = true;
-        log::warn!("Non-Linux host detected: running in dry-run mode for user management");
     }
 
     if args.dry_run {
-        log::info!("Running in dry-run mode: no changes will be made to Linux users or files");
+        tracing::info!("Running in dry-run mode: no changes will be made to Linux users or files");
     }
     let data_dir = directories::ProjectDirs::from("", "", env!("CARGO_PKG_NAME"))
         .context("Error determining project directory")?

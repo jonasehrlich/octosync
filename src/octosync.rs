@@ -31,7 +31,7 @@ async fn org_client(args: &Cli) -> anyhow::Result<octocrab::Octocrab> {
         .await
         .with_context(|| format!("Failed to get installation for org '{}'", args.org))?;
     let install_crab = app_client.installation(installation.id)?;
-    log::debug!(
+    tracing::debug!(
         "Successfully authenticated to GitHub API, starting member sync for org '{}'",
         args.org
     );
@@ -41,7 +41,7 @@ async fn org_client(args: &Cli) -> anyhow::Result<octocrab::Octocrab> {
 #[derive(Debug)]
 pub struct Octosync {
     octocrab: sync::Arc<octocrab::Octocrab>,
-    _http: reqwest::Client,
+    // _http: reqwest::Client,
     config: sync::Arc<Cli>,
     data_dir: path::PathBuf,
 }
@@ -51,18 +51,21 @@ impl Octosync {
         Ok(Self {
             octocrab: sync::Arc::new(org_client(&config).await?),
             config,
-            _http: reqwest::Client::new(),
+            // _http: reqwest::Client::new(),
             data_dir: data_dir.to_path_buf(),
         })
     }
 
+    #[tracing::instrument(
+        name = "Octosync::process_user",
+        skip(self, gh_user, store),
+        fields(org = %self.config.org, user = %gh_user.login, id = gh_user.id.into_inner(), )
+    )]
     async fn process_user(
         &self,
         gh_user: &octocrab::models::Author,
         store: &store::Store,
     ) -> anyhow::Result<()> {
-        log::debug!("Processing user '{}'", gh_user.login);
-
         match store.users().get(&gh_user.id) {
             Some(user) => self.manage_existing_user(gh_user, user).await?,
             None => self.manage_new_user(gh_user).await?,
@@ -73,42 +76,28 @@ impl Octosync {
 
     async fn manage_existing_user(
         &self,
-        gh_user: &octocrab::models::Author,
-        user: &store::User,
+        _gh_user: &octocrab::models::Author,
+        _user: &store::User,
     ) -> anyhow::Result<()> {
-        log::debug!(
-            "User '{}' already exists in store {:?}",
-            gh_user.login,
-            user
-        );
+        tracing::debug!("User exists in store");
         Ok(())
     }
 
-    async fn manage_new_user(&self, gh_user: &octocrab::models::Author) -> anyhow::Result<()> {
-        log::info!(
-            "New user '{}' (ID {}) found in org '{}', creating Linux user account",
-            gh_user.login,
-            gh_user.id,
-            self.config.org
-        );
+    async fn manage_new_user(&self, _gh_user: &octocrab::models::Author) -> anyhow::Result<()> {
+        tracing::info!("New user");
         Ok(())
     }
 
     pub async fn sync(self) -> anyhow::Result<()> {
-        let mut store = store::Store::new(&self.data_dir).await?;
-        let org_members: Vec<octocrab::models::Author> = async {
-            let (org_members, _) = tokio::try_join!(
-                get_all_org_members(&self.octocrab, &self.config.org),
-                store.load()
-            )?;
-            log::info!(
-                "Successfully retrieved {} members for org '{}'",
-                org_members.len(),
-                self.config.org
-            );
-            Ok::<Vec<octocrab::models::Author>, anyhow::Error>(org_members)
-        }
-        .await?;
+        let (org_members, store) = tokio::try_join!(
+            get_all_org_members(&self.octocrab, &self.config.org),
+            store::Store::new(&self.data_dir)
+        )?;
+        tracing::info!(
+            "Successfully retrieved {} members for org '{}'",
+            org_members.len(),
+            self.config.org
+        );
 
         let tasks = org_members
             .iter()

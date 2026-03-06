@@ -20,6 +20,7 @@ impl PublicKeys {
     }
 
     /// Load the public keys from a file, returning an empty set if the file doesn't exist
+    #[tracing::instrument(name = "PublicKeys::from_file")] // --- IGNORE ---
     pub async fn from_file(path: &path::Path) -> anyhow::Result<Self> {
         use futures::TryStreamExt;
         use io::AsyncBufReadExt;
@@ -45,7 +46,7 @@ impl PublicKeys {
                                 if let Ok(key) = line.parse::<PublicKey>() {
                                     acc.keys.insert(key);
                                 } else {
-                                    log::warn!(
+                                    tracing::warn!(
                                         "Failed to parse public key from line '{}', skipping",
                                         line
                                     );
@@ -57,7 +58,7 @@ impl PublicKeys {
                     .await?)
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                log::info!(
+                tracing::debug!(
                     "Public keys file '{}' not found, starting with an empty key set",
                     path.display()
                 );
