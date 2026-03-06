@@ -36,14 +36,17 @@ struct Cli {
 
 #[derive(Debug)]
 struct Context {
-    octocrab: octocrab::Octocrab,
+    octocrab: sync::Arc<octocrab::Octocrab>,
     config: sync::Arc<Cli>,
 }
 
 impl Context {
     async fn try_from_config(config: sync::Arc<Cli>) -> anyhow::Result<Self> {
         let octocrab = org_client(&config).await?;
-        Ok(Context { octocrab, config })
+        Ok(Context {
+            octocrab: sync::Arc::new(octocrab),
+            config,
+        })
     }
 
     pub fn config(&self) -> &Cli {
@@ -115,12 +118,13 @@ async fn main() -> anyhow::Result<()> {
             .context("Error determining project directory")?
             .data_dir()
             .to_path_buf(),
-    )?;
+    )
+    .await?;
 
     let current_members = get_all_org_members(&ctx).await?;
     serde_json::to_writer_pretty(std::io::stdout(), &current_members)?;
 
-    store.save()?;
+    store.save().await?;
     Ok(())
 }
 

@@ -2,7 +2,8 @@ use crate::Context;
 use anyhow::Context as _;
 use nix::unistd;
 use serde::{Deserialize, Serialize};
-use std::{collections, fs, io, path, sync};
+use std::{collections, path, sync};
+use tokio::{fs, io};
 
 mod uid_serde {
     use serde::{self, Deserialize, Deserializer, Serialize, Serializer};
@@ -32,11 +33,27 @@ mod uid_serde {
 /// Canonical representation of a user that exists both on GitHub and as a Linux user,
 /// with the necessary information to manage their Linux account and SSH keys.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct User {
+pub struct User {
+    /// GitHub user ID, used as the primary key for identifying users in the store
     id: octocrab::models::UserId,
+    /// GitHub login/username, used for fetching user information and SSH keys from GitHub
     name: String,
+    /// Linux user UID associated with this GitHub user
     #[serde(with = "uid_serde")]
     uid: unistd::Uid,
+}
+
+#[allow(unused)]
+impl User {
+    /// Get the home directory path for this user, typically "/home/{name}"
+    pub fn home_dir(&self) -> path::PathBuf {
+        path::PathBuf::from(format!("/home/{}", self.name))
+    }
+
+    /// Get the SSH directory path for this user, typically "/home/{name}/.ssh"
+    pub fn ssh_dir(&self) -> path::PathBuf {
+        self.home_dir().join(".ssh")
+    }
 }
 
 type UserMap = collections::HashMap<octocrab::models::UserId, User>;
@@ -50,14 +67,14 @@ pub struct Store {
 
 impl Store {
     /// Create a new store instance with the given context and path to the members database
-    pub fn new(ctx: sync::Arc<Context>, dir: path::PathBuf) -> anyhow::Result<Self> {
-        fs::create_dir_all(&dir)?;
+    pub async fn new(ctx: sync::Arc<Context>, dir: path::PathBuf) -> anyhow::Result<Self> {
+        fs::create_dir_all(&dir).await?;
         let mut s = Self {
             _ctx: ctx,
             dir,
             users: UserMap::new(),
         };
-        s.load()?;
+        s.load().await?;
         Ok(s)
     }
 
@@ -67,24 +84,21 @@ impl Store {
     }
 
     /// Load the store from the file system
-    fn load(&mut self) -> anyhow::Result<()> {
-        self.users = self.load_users()?;
+    async fn load(&mut self) -> anyhow::Result<()> {
+        self.users = self.load_users().await?;
 
         Ok(())
     }
 
     /// Load the users from the users database file, returning an empty map if the file doesn't exist
-    fn load_users(&self) -> anyhow::Result<UserMap> {
-        match fs::File::open(self.user_path()) {
-            Ok(file) => {
-                let reader = io::BufReader::new(file);
-                Ok(serde_json::from_reader(reader).with_context(|| {
-                    format!(
-                        "Failed to parse users database from '{}'",
-                        self.user_path().display()
-                    )
-                })?)
-            }
+    async fn load_users(&self) -> anyhow::Result<UserMap> {
+        match fs::read_to_string(self.user_path()).await {
+            Ok(content) => Ok(serde_json::from_str(&content).with_context(|| {
+                format!(
+                    "Failed to parse users database from '{}'",
+                    self.user_path().display()
+                )
+            })?),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 log::info!(
                     "Users database file '{}' not found, starting with an empty user map",
@@ -105,14 +119,9 @@ impl Store {
         }
     }
 
-    pub fn save(&self) -> anyhow::Result<()> {
-        let writer = io::BufWriter::new(fs::File::create(self.user_path()).with_context(|| {
-            format!(
-                "Failed to create users database file '{}'",
-                self.user_path().display()
-            )
-        })?);
-        serde_json::to_writer_pretty(writer, &self.users)?;
+    pub async fn save(&self) -> anyhow::Result<()> {
+        let content = serde_json::to_string_pretty(&self.users)?;
+        fs::write(self.user_path(), content).await?;
         Ok(())
     }
 }
