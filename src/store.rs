@@ -1,8 +1,7 @@
-use crate::Context;
 use anyhow::Context as _;
 use nix::unistd;
 use serde::{Deserialize, Serialize};
-use std::{collections, path, sync};
+use std::{collections, path};
 use tokio::{fs, io};
 
 mod uid_serde {
@@ -54,28 +53,46 @@ impl User {
     pub fn ssh_dir(&self) -> path::PathBuf {
         self.home_dir().join(".ssh")
     }
+
+    /// Get the GitHub user ID
+    pub fn id(&self) -> octocrab::models::UserId {
+        self.id
+    }
+
+    /// Get the login/username
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Get the Linux user UID
+    pub fn uid(&self) -> unistd::Uid {
+        self.uid
+    }
 }
 
 type UserMap = collections::HashMap<octocrab::models::UserId, User>;
 
+#[derive(Debug)]
 pub struct Store {
-    _ctx: sync::Arc<Context>,
     dir: path::PathBuf,
     /// In-memory cache of users loaded from the members database, keyed by GitHub user ID
     users: UserMap,
 }
 
 impl Store {
-    /// Create a new store instance with the given context and path to the members database
-    pub async fn new(ctx: sync::Arc<Context>, dir: path::PathBuf) -> anyhow::Result<Self> {
+    /// Create a new store instance with the given path to the directory with
+    pub async fn new(dir: &path::Path) -> anyhow::Result<Self> {
         fs::create_dir_all(&dir).await?;
         let mut s = Self {
-            _ctx: ctx,
-            dir,
+            dir: dir.to_path_buf(),
             users: UserMap::new(),
         };
         s.load().await?;
         Ok(s)
+    }
+
+    pub fn users(&self) -> &UserMap {
+        &self.users
     }
 
     /// Get the file path for a given user in the store
@@ -84,7 +101,7 @@ impl Store {
     }
 
     /// Load the store from the file system
-    async fn load(&mut self) -> anyhow::Result<()> {
+    pub async fn load(&mut self) -> anyhow::Result<()> {
         self.users = self.load_users().await?;
 
         Ok(())
@@ -92,17 +109,17 @@ impl Store {
 
     /// Load the users from the users database file, returning an empty map if the file doesn't exist
     async fn load_users(&self) -> anyhow::Result<UserMap> {
-        match fs::read_to_string(self.user_path()).await {
+        let path = self.user_path();
+        log::debug!("Loading users from '{}'", path.display());
+
+        match fs::read_to_string(&path).await {
             Ok(content) => Ok(serde_json::from_str(&content).with_context(|| {
-                format!(
-                    "Failed to parse users database from '{}'",
-                    self.user_path().display()
-                )
+                format!("Failed to parse users database from '{}'", path.display())
             })?),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 log::info!(
                     "Users database file '{}' not found, starting with an empty user map",
-                    self.user_path().display()
+                    path.display()
                 );
                 // If the file doesn't exist, start with an empty user map
                 Ok(UserMap::new())
@@ -110,10 +127,7 @@ impl Store {
             Err(e) => {
                 // For other errors, return the error
                 Err(e).with_context(|| {
-                    format!(
-                        "Failed to open users database file '{}'",
-                        self.user_path().display()
-                    )
+                    format!("Failed to open users database file '{}'", path.display())
                 })
             }
         }
