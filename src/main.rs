@@ -3,6 +3,7 @@ use clap::Parser as _;
 use futures::TryStreamExt as _;
 use std::{fs, path, sync};
 
+mod public_keys;
 mod store;
 
 /// Sync the members of a GitHub organization with Linux user accounts for new members, installing their public keys for SSH access.
