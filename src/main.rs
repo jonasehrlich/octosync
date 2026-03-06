@@ -1,12 +1,14 @@
 use anyhow::Context as _;
 use clap::Parser as _;
+use std::str::FromStr;
 use std::{path, sync};
 
 mod octosync;
 mod public_keys;
 mod store;
 
-/// Sync the members of a GitHub organization with Linux user accounts for new members, installing their public keys for SSH access.
+/// Sync the members of a GitHub organization with Linux user accounts for new members,
+/// installing their public keys for SSH access.
 #[derive(clap::Parser, Debug)]
 struct Cli {
     /// Name of the organization to query
@@ -21,6 +23,12 @@ struct Cli {
     #[arg(long)]
     private_key: path::PathBuf,
 
+    /// Groups to add to the users. Can be used multiple times.
+    /// To add groups to all users, use `--group <linux-group>`.
+    /// To map GitHub Teams to Linux user groups use `--group <gh-team>:<linux-group>`.
+    #[arg(long, value_parser = clap::value_parser!(GroupMapping), verbatim_doc_comment)]
+    group: Vec<GroupMapping>,
+
     /// Preview actions without writing files or changing Linux users
     #[cfg(target_os = "linux")]
     #[arg(long, action = clap::ArgAction::SetTrue)]
@@ -32,6 +40,31 @@ struct Cli {
     /// Enable verbose logging
     #[arg(short, long, action = clap::ArgAction::SetTrue)]
     verbose: bool,
+}
+
+#[allow(unused)]
+#[derive(Debug, Clone)]
+enum GroupMapping {
+    MapGitHubTeam {
+        gh_team: String,
+        linux_group: String,
+    },
+    AddGroup(String),
+}
+
+impl FromStr for GroupMapping {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some((a, b)) = s.split_once(':') {
+            Ok(Self::MapGitHubTeam {
+                gh_team: a.to_string(),
+                linux_group: b.to_string(),
+            })
+        } else {
+            Ok(Self::AddGroup(s.to_string()))
+        }
+    }
 }
 
 #[tokio::main]
