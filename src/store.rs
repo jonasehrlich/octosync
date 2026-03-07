@@ -31,7 +31,7 @@ mod uid_serde {
 
 /// Canonical representation of a user that exists both on GitHub and as a Linux user,
 /// with the necessary information to manage their Linux account and SSH keys.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, bon::Builder)]
 pub struct User {
     /// GitHub user ID, used as the primary key for identifying users in the store
     id: octocrab::models::UserId,

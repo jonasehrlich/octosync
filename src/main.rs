@@ -6,6 +6,7 @@ use std::{path, sync};
 mod octosync;
 mod public_keys;
 mod store;
+mod user_manager;
 
 /// Sync the members of a GitHub organization with Linux user accounts for new members,
 /// installing their public keys for SSH access.

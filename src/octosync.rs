@@ -1,4 +1,4 @@
-use crate::{Cli, store};
+use crate::{Cli, store, user_manager, user_manager::CreateUser as _};
 use anyhow::Context as _;
 use std::{path, sync};
 use tokio::fs;
@@ -38,12 +38,12 @@ async fn org_client(args: &Cli) -> anyhow::Result<octocrab::Octocrab> {
     Ok(install_crab)
 }
 
-#[derive(Debug)]
 pub struct Octosync {
     octocrab: sync::Arc<octocrab::Octocrab>,
     // _http: reqwest::Client,
     config: sync::Arc<Cli>,
     data_dir: path::PathBuf,
+    user_manager: user_manager::PlatformUserManager,
 }
 
 impl Octosync {
@@ -53,6 +53,10 @@ impl Octosync {
             config,
             // _http: reqwest::Client::new(),
             data_dir: data_dir.to_path_buf(),
+            #[cfg(target_os = "linux")]
+            user_manager: user_manager::PlatformUserManager::new(),
+            #[cfg(not(target_os = "linux"))]
+            user_manager: user_manager::PlatformUserManager::new(1000),
         })
     }
 
@@ -65,27 +69,38 @@ impl Octosync {
         &self,
         gh_user: &octocrab::models::Author,
         store: &store::Store,
-    ) -> anyhow::Result<()> {
-        match store.users().get(&gh_user.id) {
+    ) -> anyhow::Result<store::User> {
+        let new_user = match store.users().get(&gh_user.id) {
             Some(user) => self.manage_existing_user(gh_user, user).await?,
-            None => self.manage_new_user(gh_user).await?,
-        }
+            None => self.create_user(gh_user).await?,
+        };
+        // Check for SSH keys and update them if necessary
+        Ok(new_user)
+    }
 
-        Ok(())
+    async fn create_user(&self, gh_user: &octocrab::models::Author) -> anyhow::Result<store::User> {
+        if self.config.dry_run {
+            tracing::info!("Would create user for GitHub user '{}'", gh_user.login);
+            return Ok(store::User::builder()
+                .id(gh_user.id)
+                .name(gh_user.login.clone())
+                .uid(nix::unistd::Uid::from_raw(1000))
+                .build());
+        }
+        self.user_manager.create_user(gh_user, vec![]).await
     }
 
     async fn manage_existing_user(
         &self,
         _gh_user: &octocrab::models::Author,
         _user: &store::User,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<store::User> {
         tracing::debug!("User exists in store");
-        Ok(())
-    }
 
-    async fn manage_new_user(&self, _gh_user: &octocrab::models::Author) -> anyhow::Result<()> {
-        tracing::info!("New user");
-        Ok(())
+        // TODO: check if it exists on the platform, if not, re-create it
+        // TODO: check if groups need to be updated
+        // TODO: if everything is up to date, just return the existing user
+        Ok(_user.clone())
     }
 
     pub async fn sync(self) -> anyhow::Result<()> {
