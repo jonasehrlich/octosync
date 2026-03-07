@@ -4,18 +4,18 @@ use serde::{Deserialize, Serialize};
 use std::{fmt, path, str::FromStr, string::ToString};
 use tokio::{fs, io};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PublicKeys {
     /// Key set representing the contents of an authorized_keys file
     keys: indexmap::IndexSet<PublicKey>,
     /// Modified time of the authorized_keys file, used for determining if the file needs to be updated
-    modified: chrono::DateTime<chrono::Utc>,
+    modified: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[allow(unused)]
 impl PublicKeys {
     /// Get the modified time of the authorized_keys file, used for determining if the file needs to be updated
-    pub fn modified(&self) -> chrono::DateTime<chrono::Utc> {
+    pub fn modified(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         self.modified
     }
 
@@ -39,7 +39,7 @@ impl PublicKeys {
                     .try_fold(
                         Self {
                             keys: indexmap::IndexSet::new(),
-                            modified: modified_time.into(),
+                            modified: Some(modified_time.into()),
                         },
                         |mut acc, line| async move {
                             if !line.trim().is_empty() {
@@ -65,7 +65,7 @@ impl PublicKeys {
                 // If the file doesn't exist, start with an empty key set
                 Ok(Self {
                     keys: indexmap::IndexSet::new(),
-                    modified: chrono::Utc::now(),
+                    modified: None,
                 })
             }
             Err(e) => {
@@ -100,7 +100,7 @@ impl FromStr for PublicKeys {
             .collect();
         Ok(Self {
             keys,
-            modified: chrono::Utc::now(),
+            ..Default::default()
         })
     }
 }
@@ -269,7 +269,7 @@ mod tests {
 
             let public_keys = PublicKeys {
                 keys,
-                modified: chrono::Utc::now(),
+                ..Default::default()
             };
 
             assert_eq!(
@@ -294,7 +294,7 @@ mod tests {
 
             let public_keys = PublicKeys {
                 keys,
-                modified: chrono::Utc::now(),
+                ..Default::default()
             };
 
             let result = public_keys.to_string();
@@ -342,9 +342,9 @@ mod tests {
             let now = chrono::Utc::now();
             let public_keys = PublicKeys {
                 keys: indexmap::IndexSet::new(),
-                modified: now,
+                modified: Some(now),
             };
-            assert_eq!(public_keys.modified(), now);
+            assert_eq!(public_keys.modified(), Some(now));
         }
 
         #[test]
@@ -359,7 +359,7 @@ mod tests {
 
             let public_keys = PublicKeys {
                 keys,
-                modified: now,
+                modified: Some(now),
             };
 
             let json = serde_json::to_string(&public_keys).expect("Failed to serialize");
@@ -412,7 +412,8 @@ mod tests {
 
             // Verify that modified time is set (should be close to now)
             let now = chrono::Utc::now();
-            let diff = now.signed_duration_since(public_keys.modified());
+            let modified_time = public_keys.modified().expect("Modified time should be set");
+            let diff = now.signed_duration_since(modified_time);
             assert!(diff.num_seconds() >= 0 && diff.num_seconds() < 5);
 
             // Cleanup
