@@ -54,6 +54,10 @@ impl User {
         self.home_dir().join(".ssh")
     }
 
+    pub fn public_keys_url(&self) -> String {
+        format!("https://github.com/{}.keys", self.name)
+    }
+
     /// Get the GitHub user ID
     pub fn id(&self) -> octocrab::models::UserId {
         self.id

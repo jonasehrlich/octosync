@@ -1,4 +1,7 @@
-use crate::{Cli, store, user_manager, user_manager::CreateUser as _};
+use crate::{
+    Cli, store, user_manager,
+    user_manager::{CreateUser as _, ManageAuthorizedKeys as _},
+};
 use anyhow::Context as _;
 use std::{path, sync};
 use tokio::fs;
@@ -40,7 +43,6 @@ async fn org_client(args: &Cli) -> anyhow::Result<octocrab::Octocrab> {
 
 pub struct Octosync {
     octocrab: sync::Arc<octocrab::Octocrab>,
-    // _http: reqwest::Client,
     config: sync::Arc<Cli>,
     data_dir: path::PathBuf,
     user_manager: user_manager::PlatformUserManager,
@@ -51,7 +53,6 @@ impl Octosync {
         Ok(Self {
             octocrab: sync::Arc::new(org_client(&config).await?),
             config,
-            // _http: reqwest::Client::new(),
             data_dir: data_dir.to_path_buf(),
             #[cfg(target_os = "linux")]
             user_manager: user_manager::PlatformUserManager::new(),
@@ -74,7 +75,11 @@ impl Octosync {
             Some(user) => self.manage_existing_user(gh_user, user).await?,
             None => self.create_user(gh_user).await?,
         };
-        // Check for SSH keys and update them if necessary
+
+        self.user_manager
+            .update_authorized_keys(&new_user)
+            .await
+            .context("Failed to sync SSH keys")?;
         Ok(new_user)
     }
 
