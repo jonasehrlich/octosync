@@ -97,6 +97,10 @@ impl FromStr for GroupMapping {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("Failed to install rustls crypto provider"))?;
+
     let mut args = Cli::parse();
     let level = if args.global.verbose {
         tracing::Level::DEBUG
