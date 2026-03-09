@@ -168,8 +168,8 @@ impl Octosync {
             );
             return Ok(());
         }
-        let store = store::UserStore::from_dir(&self.data_dir).await?;
-        let set: tokio::task::JoinSet<_> = store
+        let mut store = store::UserStore::from_dir(&self.data_dir).await?;
+        let mut set: tokio::task::JoinSet<_> = store
             .data()
             .values()
             .map(|user| {
@@ -180,16 +180,44 @@ impl Octosync {
                     if dry_run {
                         tracing::info!("Would delete user '{}'", user.name());
                     } else {
-                        user_manager.delete_user(&user).await?;
+                        user_manager.delete_user(&user).await.inspect_err(|e| {
+                            tracing::error!("Failed to delete user '{}': {:?}", user.name(), e);
+                        })?;
                     }
                     Ok::<store::User, anyhow::Error>(user)
                 }
             })
             .collect();
 
-        set.join_all().await;
+        while let Some(res) = set.join_next().await {
+            match res {
+                Ok(Ok(user)) => {
+                    store.data_mut().remove(&user.id());
+                }
+                Ok(Err(e)) => {
+                    tracing::error!("Failed to delete user: {:?}", e);
+                }
+                Err(e) => {
+                    tracing::error!("Task join error while deleting user: {:?}", e);
+                }
+            };
+        }
+
         if !self.global_config.dry_run {
-            store.delete().await?;
+            if store.data().is_empty() {
+                tracing::info!("All users deleted successfully, removing store data file");
+
+                store.delete().await?;
+            } else {
+                tracing::warn!(
+                    "Some users could not be deleted. Remaining users in store: {}",
+                    store.data().len()
+                );
+                store
+                    .save()
+                    .await
+                    .context("Failed to save store data after deletion")?;
+            }
         } else {
             tracing::info!("Would delete store data file");
         }

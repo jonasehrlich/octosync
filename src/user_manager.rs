@@ -115,11 +115,11 @@ mod linux {
     }
 
     impl DeleteUser for LinuxUserManager {
-        #[tracing::instrument(name = "UserManager::delete_user", skip(self, user))]
+        #[tracing::instrument(name = "UserManager::delete_user", skip(self, user), fields(user = %user.name()))]
         async fn delete_user(&self, user: &store::User) -> anyhow::Result<()> {
             // Before deleting the user, we need to kill all their processes to ensure there are no running processes that would prevent deletion
             if let Some(linux_user) = nix::unistd::User::from_uid(user.uid())? {
-                kill_all_processes_for_user(&linux_user).await?;
+                kill_processes_for_user(&linux_user).await?;
             } else {
                 tracing::warn!(
                     "User not found in system when attempting to delete. Skipping process kill.",
@@ -258,51 +258,26 @@ mod linux {
         Ok(())
     }
 
-    /// Forcefully kills all processes owned by the given user.
-    /// This is used before modifying or deleting a user to ensure there are no running processes
-    /// that would prevent deletion.
-    async fn kill_all_processes_for_user(user: &nix::unistd::User) -> anyhow::Result<()> {
-        tracing::info!("Kill all processes");
-        let proc = process::Command::new("/usr/bin/killall")
-            .arg("--signal")
-            .arg("KILL")
-            .arg("--user")
-            .arg(&user.name)
-            .output();
+    #[tracing::instrument(name = "kill_processes", skip(user), fields(user = %user.name))]
+    pub async fn kill_processes_for_user(user: &nix::unistd::User) -> anyhow::Result<()> {
+        let uid = user.uid.as_raw();
+        tokio::task::spawn_blocking(move || {
+            if let Ok(procs) = procfs::process::all_processes() {
+                for proc in procs.flatten() {
+                    if let Ok(stat) = proc.status() {
+                        if stat.ruid == uid {
+                            let pid = nix::unistd::Pid::from_raw(proc.pid);
+                            let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
 
-        let o = proc.await.with_context(|| {
-            format!(
-                "Failed to wait for killall command to finish when killing processes for user '{}'",
-                user.name
-            )
-        })?;
-
-        if o.status.success() {
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!(
-                "Failed to kill processes for user '{}': {}",
-                user.name,
-                String::from_utf8_lossy(&o.stderr)
-            ))
-        }
-    }
-
-    /// Get the appropriate admin group for the current Linux distribution.
-    #[allow(unused)]
-    async fn get_admin_group() -> &'static str {
-        if let Ok(os_info) = fs::read_to_string("/etc/os-release").await {
-            let os_info = os_info.to_lowercase();
-            if os_info.contains("fedora")
-                || os_info.contains("arch")
-                || os_info.contains("rhel")
-                || os_info.contains("centos")
-            {
-                return "wheel";
+                            tracing::debug!(pid = proc.pid, "Killed process");
+                        }
+                    }
+                }
             }
-        }
-        // Default to sudo for Debian/Ubuntu and others
-        "sudo"
+        })
+        .await?;
+
+        Ok(())
     }
 
     async fn fetch_public_keys_for_user(
