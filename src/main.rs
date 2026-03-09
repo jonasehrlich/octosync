@@ -1,3 +1,5 @@
+#![cfg(any(target_os = "linux", target_os = "macos"))]
+
 use anyhow::Context as _;
 use clap::Parser as _;
 use std::str::FromStr;
