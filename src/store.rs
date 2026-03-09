@@ -79,31 +79,40 @@ type UserMap = collections::HashMap<octocrab::models::UserId, User>;
 const USERS_FILE_NAME: &str = "users.json";
 
 #[derive(Debug)]
-pub struct Store {
+pub struct UserStore {
     dir: path::PathBuf,
     /// In-memory cache of users loaded from the members database, keyed by GitHub user ID
     users: UserMap,
 }
 
-impl Store {
-    /// Create a new store instance with the given path to the directory with
-    #[tracing::instrument(name = "Store::new")]
+impl UserStore {
+    /// Create a new store instance with the given directory, without loading any data
     pub async fn new(dir: &path::Path) -> anyhow::Result<Self> {
         fs::create_dir_all(&dir).await?;
-        let mut s = Self {
+        Ok(Self {
             dir: dir.to_path_buf(),
             users: UserMap::new(),
-        };
+        })
+    }
+
+    /// Create a new store loading data from the directory
+    #[tracing::instrument(name = "Store::from_dir")]
+    pub async fn from_dir(dir: &path::Path) -> anyhow::Result<Self> {
+        let mut s = Self::new(dir).await?;
         s.load().await?;
         Ok(s)
     }
 
-    pub fn users(&self) -> &UserMap {
+    pub fn data(&self) -> &UserMap {
         &self.users
     }
 
-    /// Get the file path for a given user in the store
-    fn user_path(&self) -> path::PathBuf {
+    pub fn data_mut(&mut self) -> &mut UserMap {
+        &mut self.users
+    }
+
+    /// Get the file path for the users database file
+    fn path(&self) -> path::PathBuf {
         self.dir.join(USERS_FILE_NAME)
     }
 
@@ -117,7 +126,7 @@ impl Store {
     /// Load the users from the users database file, returning an empty map if the file doesn't exist
     #[tracing::instrument(name = "Store::load_users", skip(self))]
     async fn load_users(&self) -> anyhow::Result<UserMap> {
-        let path = self.user_path();
+        let path = self.path();
         tracing::debug!("Loading users '{}'", path.display());
 
         match fs::read_to_string(&path).await {
@@ -143,7 +152,7 @@ impl Store {
 
     pub async fn save(&self) -> anyhow::Result<()> {
         let content = serde_json::to_string_pretty(&self.users)?;
-        fs::write(self.user_path(), content).await?;
+        fs::write(self.path(), content).await?;
         Ok(())
     }
 }
@@ -215,7 +224,7 @@ mod tests {
         }
     }
 
-    mod store {
+    mod user_store {
         use super::*;
 
         #[tokio::test]
@@ -223,7 +232,7 @@ mod tests {
             let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
             let store_path = temp_dir.path().join("store");
 
-            let store = Store::new(&store_path)
+            let store = UserStore::from_dir(&store_path)
                 .await
                 .expect("Failed to create store");
 
@@ -236,7 +245,7 @@ mod tests {
             let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
 
             // Create store in existing directory
-            let store = Store::new(temp_dir.path())
+            let store = UserStore::from_dir(temp_dir.path())
                 .await
                 .expect("Failed to create store");
 
@@ -248,7 +257,7 @@ mod tests {
             let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
 
             // Create a store and add some users
-            let _store = Store::new(temp_dir.path())
+            let _store = UserStore::new(temp_dir.path())
                 .await
                 .expect("Failed to create store");
 
@@ -277,7 +286,7 @@ mod tests {
                 .expect("Failed to write users file");
 
             // Now load the store
-            let loaded_store = Store::new(temp_dir.path())
+            let loaded_store = UserStore::from_dir(temp_dir.path())
                 .await
                 .expect("Failed to load store");
 
@@ -307,7 +316,7 @@ mod tests {
             let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
 
             // Create store in a directory without users.json
-            let store = Store::new(temp_dir.path())
+            let store = UserStore::from_dir(temp_dir.path())
                 .await
                 .expect("Failed to create store");
 
@@ -319,7 +328,7 @@ mod tests {
         async fn save() {
             let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
 
-            let mut store = Store::new(temp_dir.path())
+            let mut store = UserStore::new(temp_dir.path())
                 .await
                 .expect("Failed to create store");
 
@@ -358,7 +367,7 @@ mod tests {
             let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
 
             // Create store and add users
-            let mut store = Store::new(temp_dir.path())
+            let mut store = UserStore::from_dir(temp_dir.path())
                 .await
                 .expect("Failed to create store");
 
@@ -380,7 +389,7 @@ mod tests {
             store.save().await.expect("Failed to save store");
 
             // Load in a new store instance
-            let loaded_store = Store::new(temp_dir.path())
+            let loaded_store = UserStore::from_dir(temp_dir.path())
                 .await
                 .expect("Failed to load store");
 
@@ -412,12 +421,12 @@ mod tests {
         async fn user_path() {
             let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
 
-            let store = Store::new(temp_dir.path())
+            let store = UserStore::new(temp_dir.path())
                 .await
                 .expect("Failed to create store");
 
             let expected_path = temp_dir.path().join(USERS_FILE_NAME);
-            assert_eq!(store.user_path(), expected_path);
+            assert_eq!(store.path(), expected_path);
         }
 
         #[tokio::test]
@@ -433,7 +442,7 @@ mod tests {
             .expect("Failed to write invalid JSON");
 
             // Attempting to create/load the store should fail
-            let result = Store::new(temp_dir.path()).await;
+            let result = UserStore::from_dir(temp_dir.path()).await;
             assert!(result.is_err());
         }
 
@@ -441,7 +450,7 @@ mod tests {
         async fn multiple_users() {
             let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
 
-            let mut store = Store::new(temp_dir.path())
+            let mut store = UserStore::new(temp_dir.path())
                 .await
                 .expect("Failed to create store");
 
@@ -459,7 +468,7 @@ mod tests {
             store.save().await.expect("Failed to save store");
 
             // Load in new instance
-            let loaded_store = Store::new(temp_dir.path())
+            let loaded_store = UserStore::from_dir(temp_dir.path())
                 .await
                 .expect("Failed to load store");
 

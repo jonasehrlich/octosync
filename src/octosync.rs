@@ -3,7 +3,8 @@ use crate::{
     user_manager::{CreateUser as _, ManageAuthorizedKeys as _},
 };
 use anyhow::Context as _;
-use std::{path, sync};
+use futures::StreamExt as _;
+use std::{collections, path, sync};
 use tokio::fs;
 
 async fn org_client(args: &Cli) -> anyhow::Result<octocrab::Octocrab> {
@@ -69,9 +70,9 @@ impl Octosync {
     async fn process_user(
         &self,
         gh_user: &octocrab::models::Author,
-        store: &store::Store,
+        store: &store::UserStore,
     ) -> anyhow::Result<store::User> {
-        let new_user = match store.users().get(&gh_user.id) {
+        let new_user = match store.data().get(&gh_user.id) {
             Some(user) => self.manage_existing_user(gh_user, user).await?,
             None => self.create_user(gh_user).await?,
         };
@@ -111,20 +112,47 @@ impl Octosync {
     pub async fn sync(self) -> anyhow::Result<()> {
         let (org_members, store) = tokio::try_join!(
             get_all_org_members(&self.octocrab, &self.config.org),
-            store::Store::new(&self.data_dir)
+            store::UserStore::from_dir(&self.data_dir)
         )?;
         tracing::info!(
             "Successfully retrieved {} members for org '{}'",
             org_members.len(),
             self.config.org
         );
+        let _org_member_map: collections::HashMap<octocrab::models::UserId, String> =
+            collections::HashMap::from_iter(
+                org_members.iter().map(|user| (user.id, user.login.clone())),
+            );
 
-        let tasks = org_members
-            .iter()
-            .map(|gh_user| self.process_user(gh_user, &store));
-        futures::future::join_all(tasks).await;
+        let self_arc = sync::Arc::new(self);
+        let store_arc = sync::Arc::new(store);
+        let mut set: tokio::task::JoinSet<_> = org_members
+            .into_iter()
+            .map(|gh_user| {
+                let self_arc = self_arc.clone();
+                let store_arc = store_arc.clone();
+                async move { self_arc.process_user(&gh_user, &store_arc).await }
+            })
+            .collect();
 
-        store.save().await?;
+        let user_stream = async_stream::stream! {
+            while let Some(res) = set.join_next().await {
+                yield res;
+            }
+        };
+
+        let new_store = user_stream
+            .filter_map(|r| async move { r.ok()?.ok() })
+            .fold(
+                store::UserStore::new(&self_arc.data_dir).await?,
+                |mut store: store::UserStore, item| async move {
+                    store.data_mut().insert(item.id(), item);
+                    store
+                },
+            )
+            .await;
+
+        new_store.save().await?;
         Ok(())
     }
 }
