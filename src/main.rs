@@ -8,10 +8,8 @@ mod public_keys;
 mod store;
 mod user_manager;
 
-/// Sync the members of a GitHub organization with Linux user accounts for new members,
-/// installing their public keys for SSH access.
-#[derive(clap::Parser, Debug)]
-struct Cli {
+#[derive(clap::Args, Debug)]
+struct InstallationClientArgs {
     /// Name of the organization to query
     #[arg(long)]
     org: String,
@@ -23,13 +21,10 @@ struct Cli {
     /// Path to a file containing the GitHub App private key in PEM format
     #[arg(long)]
     private_key: path::PathBuf,
+}
 
-    /// Groups to add to the users. Can be used multiple times.
-    /// To add groups to all users, use `--group <linux-group>`.
-    /// To map GitHub Teams to Linux user groups use `--group <gh-team>:<linux-group>`.
-    #[arg(long, value_parser = clap::value_parser!(GroupMapping), verbatim_doc_comment)]
-    group: Vec<GroupMapping>,
-
+#[derive(clap::Args, Debug)]
+struct GlobalArgs {
     /// Preview actions without writing files or changing Linux users
     #[cfg(target_os = "linux")]
     #[arg(long, action = clap::ArgAction::SetTrue)]
@@ -41,6 +36,34 @@ struct Cli {
     /// Enable verbose logging
     #[arg(short, long, action = clap::ArgAction::SetTrue)]
     verbose: bool,
+}
+
+/// Sync the members of a GitHub organization with Linux user accounts for new members,
+/// installing their public keys for SSH access.
+#[derive(clap::Parser, Debug)]
+struct Cli {
+    #[command(flatten)]
+    global: GlobalArgs,
+    #[command(subcommand)]
+    command: Commands,
+}
+
+/// Arguments for the sync subcommand
+#[derive(clap::Args, Debug)]
+struct SyncArgs {
+    #[command(flatten)]
+    octocrab: InstallationClientArgs,
+    /// Groups to add to the users. Can be used multiple times.
+    /// To add groups to all users, use `--group <linux-group>`.
+    /// To map GitHub Teams to Linux user groups use `--group <gh-team>:<linux-group>`.
+    #[arg(long, value_parser = clap::value_parser!(GroupMapping), verbatim_doc_comment)]
+    group: Vec<GroupMapping>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Commands {
+    /// Synchronize GitHub organization members with Linux user accounts
+    Sync(SyncArgs),
 }
 
 #[allow(unused)]
@@ -71,7 +94,7 @@ impl FromStr for GroupMapping {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut args = Cli::parse();
-    let level = if args.verbose {
+    let level = if args.global.verbose {
         tracing::Level::DEBUG
     } else {
         tracing::Level::INFO
@@ -88,19 +111,22 @@ async fn main() -> anyhow::Result<()> {
 
     if !cfg!(target_os = "linux") {
         tracing::warn!("Non-Linux OS detected, forcing dry-run mode");
-        args.dry_run = true;
+        args.global.dry_run = true;
     }
 
-    if args.dry_run {
+    if args.global.dry_run {
         tracing::info!("Running in dry-run mode: no changes will be made to Linux users or files");
     }
     let data_dir = directories::ProjectDirs::from("", "", env!("CARGO_PKG_NAME"))
         .context("Error determining project directory")?
         .data_dir()
         .to_path_buf();
-    let app = octosync::Octosync::new(sync::Arc::new(args), &data_dir).await?;
+    let app = octosync::Octosync::new(sync::Arc::new(args.global), &data_dir).await?;
 
-    app.sync().await?;
-
+    match args.command {
+        Commands::Sync(a) => {
+            app.sync(&a).await?;
+        }
+    }
     Ok(())
 }

@@ -1,13 +1,13 @@
 use crate::{
-    Cli, store, user_manager,
-    user_manager::{CreateUser as _, ManageAuthorizedKeys as _},
+    GlobalArgs, InstallationClientArgs, SyncArgs, store,
+    user_manager::{self, CreateUser as _, ManageAuthorizedKeys as _},
 };
 use anyhow::Context as _;
 use futures::StreamExt as _;
 use std::{collections, path, sync};
 use tokio::fs;
 
-async fn org_client(args: &Cli) -> anyhow::Result<octocrab::Octocrab> {
+async fn org_client(args: &InstallationClientArgs) -> anyhow::Result<octocrab::Octocrab> {
     let private_key = fs::read(args.private_key.as_path())
         .await
         .with_context(|| {
@@ -43,17 +43,18 @@ async fn org_client(args: &Cli) -> anyhow::Result<octocrab::Octocrab> {
 }
 
 pub struct Octosync {
-    octocrab: sync::Arc<octocrab::Octocrab>,
-    config: sync::Arc<Cli>,
+    global_config: sync::Arc<GlobalArgs>,
     data_dir: path::PathBuf,
     user_manager: user_manager::PlatformUserManager,
 }
 
 impl Octosync {
-    pub async fn new(config: sync::Arc<Cli>, data_dir: &path::Path) -> anyhow::Result<Self> {
+    pub async fn new(
+        global_config: sync::Arc<GlobalArgs>,
+        data_dir: &path::Path,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
-            octocrab: sync::Arc::new(org_client(&config).await?),
-            config,
+            global_config,
             data_dir: data_dir.to_path_buf(),
             #[cfg(target_os = "linux")]
             user_manager: user_manager::PlatformUserManager::new(),
@@ -65,7 +66,7 @@ impl Octosync {
     #[tracing::instrument(
         name = "Octosync::process_user",
         skip(self, gh_user, store),
-        fields(org = %self.config.org, user = %gh_user.login, id = gh_user.id.into_inner(), )
+        fields(user = %gh_user.login, id = gh_user.id.into_inner(), )
     )]
     async fn process_user(
         &self,
@@ -85,7 +86,7 @@ impl Octosync {
     }
 
     async fn create_user(&self, gh_user: &octocrab::models::Author) -> anyhow::Result<store::User> {
-        if self.config.dry_run {
+        if self.global_config.dry_run {
             tracing::info!("Would create user for GitHub user '{}'", gh_user.login);
             return Ok(store::User::builder()
                 .id(gh_user.id)
@@ -109,16 +110,19 @@ impl Octosync {
         Ok(_user.clone())
     }
 
-    pub async fn sync(self) -> anyhow::Result<()> {
+    #[tracing::instrument(
+        name = "Octosync::sync",
+        skip(self, args),
+        fields(org = %args.octocrab.org)
+    )]
+    pub async fn sync(self, args: &SyncArgs) -> anyhow::Result<()> {
+        let octocrab = sync::Arc::new(org_client(&args.octocrab).await?);
+
         let (org_members, store) = tokio::try_join!(
-            get_all_org_members(&self.octocrab, &self.config.org),
+            get_all_org_members(&octocrab, &args.octocrab.org),
             store::UserStore::from_dir(&self.data_dir)
         )?;
-        tracing::info!(
-            "Successfully retrieved {} members for org '{}'",
-            org_members.len(),
-            self.config.org
-        );
+        tracing::info!("Successfully retrieved {} members", org_members.len());
         let _org_member_map: collections::HashMap<octocrab::models::UserId, String> =
             collections::HashMap::from_iter(
                 org_members.iter().map(|user| (user.id, user.login.clone())),
