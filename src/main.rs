@@ -64,6 +64,8 @@ struct SyncArgs {
 enum Commands {
     /// Synchronize GitHub organization members with Linux user accounts
     Sync(SyncArgs),
+    /// Delete all stored user data and Linux users created by octosync
+    Delete,
 }
 
 #[allow(unused)]
@@ -126,6 +128,9 @@ async fn main() -> anyhow::Result<()> {
     match args.command {
         Commands::Sync(a) => {
             app.sync(&a).await?;
+        }
+        Commands::Delete => {
+            app.delete().await?;
         }
     }
     Ok(())

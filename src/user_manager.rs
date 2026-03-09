@@ -12,7 +12,7 @@ pub trait CreateUser {
 #[allow(unused)]
 pub trait DeleteUser {
     /// Deletes the platform user associated with the given GitHub user.
-    async fn delete_user(&self, user: &octocrab::models::Author) -> anyhow::Result<()>;
+    async fn delete_user(&self, user: &store::User) -> anyhow::Result<()>;
 }
 
 pub trait ManageAuthorizedKeys {
@@ -33,6 +33,7 @@ mod linux {
     use std::path;
     use tokio::{fs, process};
 
+    #[derive(Clone, Debug)]
     pub struct LinuxUserManager {
         http_client: reqwest::Client,
     }
@@ -115,9 +116,9 @@ mod linux {
 
     impl DeleteUser for LinuxUserManager {
         #[tracing::instrument(name = "UserManager::delete_user", skip(self, user))]
-        async fn delete_user(&self, user: &octocrab::models::Author) -> anyhow::Result<()> {
+        async fn delete_user(&self, user: &store::User) -> anyhow::Result<()> {
             // Before deleting the user, we need to kill all their processes to ensure there are no running processes that would prevent deletion
-            if let Some(linux_user) = nix::unistd::User::from_name(&user.login)? {
+            if let Some(linux_user) = nix::unistd::User::from_uid(user.uid())? {
                 kill_all_processes_for_user(&linux_user).await?;
             } else {
                 tracing::warn!(
@@ -127,19 +128,20 @@ mod linux {
 
             let proc = process::Command::new("/usr/sbin/userdel")
                 .arg("--remove")
-                .arg(&user.login)
+                .arg(&user.name())
                 .output();
 
             let o = proc
                 .await
-                .context("Failed to wait for userdel command to finish ")?;
+                .context("Failed to wait for userdel command to finish")?;
 
             if o.status.success() {
+                tracing::info!("Deleted user");
                 Ok(())
             } else {
                 Err(anyhow::anyhow!(
                     "Failed to delete user '{}': {}",
-                    user.login,
+                    user.name(),
                     String::from_utf8_lossy(&o.stderr)
                 ))
             }
@@ -357,11 +359,9 @@ mod mock {
     }
 
     impl DeleteUser for MockUserManager {
-        async fn delete_user(&self, user: &octocrab::models::Author) -> anyhow::Result<()> {
-            tracing::info!(
-                "Mock deleting user '{}' (not actually deleting users on non-Linux OS)",
-                user.login
-            );
+        #[tracing::instrument(name = "UserManager::delete_user", skip(self, user), fields(user = %user.name()))]
+        async fn delete_user(&self, user: &store::User) -> anyhow::Result<()> {
+            tracing::info!("Would delete user");
             Ok(())
         }
     }

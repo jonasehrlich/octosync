@@ -1,6 +1,6 @@
 use crate::{
     GlobalArgs, InstallationClientArgs, SyncArgs, store,
-    user_manager::{self, CreateUser as _, ManageAuthorizedKeys as _},
+    user_manager::{self, CreateUser as _, DeleteUser as _, ManageAuthorizedKeys as _},
 };
 use anyhow::Context as _;
 use futures::StreamExt as _;
@@ -157,6 +157,42 @@ impl Octosync {
             .await;
 
         new_store.save().await?;
+        Ok(())
+    }
+
+    #[tracing::instrument(name = "Octosync::delete", skip(self))]
+    pub async fn delete(&self) -> anyhow::Result<()> {
+        if self.global_config.dry_run {
+            tracing::info!(
+                "Would clear all stored user data and delete all Linux users created by octosync"
+            );
+            return Ok(());
+        }
+        let store = store::UserStore::from_dir(&self.data_dir).await?;
+        let set: tokio::task::JoinSet<_> = store
+            .data()
+            .values()
+            .map(|user| {
+                let user = user.clone();
+                let user_manager = self.user_manager.clone();
+                let dry_run = self.global_config.dry_run;
+                async move {
+                    if dry_run {
+                        tracing::info!("Would delete user '{}'", user.name());
+                    } else {
+                        user_manager.delete_user(&user).await?;
+                    }
+                    Ok::<store::User, anyhow::Error>(user)
+                }
+            })
+            .collect();
+
+        set.join_all().await;
+        if !self.global_config.dry_run {
+            store.delete().await?;
+        } else {
+            tracing::info!("Would delete store data file");
+        }
         Ok(())
     }
 }

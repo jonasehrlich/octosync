@@ -155,6 +155,22 @@ impl UserStore {
         fs::write(self.path(), content).await?;
         Ok(())
     }
+
+    pub async fn delete(self) -> anyhow::Result<()> {
+        fs::remove_file(self.path()).await.or_else(|e| {
+            if e.kind() == io::ErrorKind::NotFound {
+                Ok(())
+            } else {
+                Err(e).with_context(|| {
+                    format!(
+                        "Failed to delete users database file '{}'",
+                        self.path().display()
+                    )
+                })
+            }
+        })?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
