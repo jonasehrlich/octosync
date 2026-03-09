@@ -3,7 +3,7 @@ use crate::{
     user_manager::{self, CreateUser as _, DeleteUser as _, ManageAuthorizedKeys as _},
 };
 use anyhow::Context as _;
-use futures::StreamExt as _;
+use futures::{StreamExt as _, stream};
 use std::{collections, path, sync};
 use tokio::fs;
 
@@ -145,7 +145,7 @@ impl Octosync {
             }
         };
 
-        let new_store = user_stream
+        let mut new_store = user_stream
             .filter_map(|r| async move { r.ok()?.ok() })
             .fold(
                 store::UserStore::new(&self_arc.data_dir).await?,
@@ -155,6 +155,32 @@ impl Octosync {
                 },
             )
             .await;
+
+        // Users that failed to delete that need to be added to the store again to be retried on the next sync
+        let users_to_re_add = stream::iter(
+            store_arc
+                .data()
+                .values()
+                .filter(|user| !new_store.data().contains_key(&user.id())),
+        )
+        .filter_map(|u| async {
+            self_arc
+                .user_manager
+                .delete_user(u)
+                .await
+                .map_err(|_| u.clone())
+                .err()
+        })
+        .collect::<Vec<_>>()
+        .await;
+
+        for user in users_to_re_add {
+            tracing::warn!(
+                "Failed to delete user '{}', re-adding to store for retry on next sync",
+                user.name()
+            );
+            new_store.data_mut().insert(user.id(), user);
+        }
 
         new_store.save().await?;
         Ok(())
