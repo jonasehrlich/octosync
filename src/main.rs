@@ -2,13 +2,78 @@
 
 use anyhow::Context as _;
 use clap::Parser as _;
+use fs2::FileExt as _;
 use std::str::FromStr;
-use std::{path, sync};
+use std::{fs, path, sync};
 
 mod octosync;
 mod public_keys;
 mod store;
 mod user_manager;
+
+#[derive(Debug)]
+struct ProcessLock {
+    path: path::PathBuf,
+    file: fs::File,
+}
+
+impl ProcessLock {
+    fn acquire(data_dir: &path::Path) -> anyhow::Result<Self> {
+        fs::create_dir_all(data_dir).with_context(|| {
+            format!(
+                "Failed to create data directory for lockfile '{}'",
+                data_dir.display()
+            )
+        })?;
+
+        let lock_path = data_dir.join("octosync.lock");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("Failed to open lockfile '{}'", lock_path.display()))?;
+
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(Self {
+                path: lock_path,
+                file,
+            }),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                anyhow::bail!(
+                    "Another octosync process is already running (lockfile: '{}')",
+                    lock_path.display()
+                );
+            }
+            Err(err) => Err(err)
+                .with_context(|| format!("Failed to acquire lockfile '{}'", lock_path.display())),
+        }
+    }
+}
+
+impl Drop for ProcessLock {
+    fn drop(&mut self) {
+        if let Err(err) = self.file.unlock() {
+            tracing::warn!(
+                "Failed to unlock lockfile '{}' on exit: {}",
+                self.path.display(),
+                err
+            );
+            // If unlocking failed, keep the lockfile to avoid races with other processes.
+            return;
+        }
+        if let Err(err) = fs::remove_file(&self.path)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                "Failed to remove lockfile '{}' on exit: {}",
+                self.path.display(),
+                err
+            );
+        }
+    }
+}
 
 #[derive(clap::Args, Debug)]
 struct InstallationClientArgs {
@@ -129,6 +194,8 @@ async fn main() -> anyhow::Result<()> {
         .context("Error determining project directory")?
         .data_dir()
         .to_path_buf();
+    let _process_lock = ProcessLock::acquire(&data_dir)?;
+
     let app = octosync::Octosync::new(sync::Arc::new(args.global), &data_dir).await?;
 
     match args.command {
