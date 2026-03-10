@@ -85,7 +85,7 @@ impl FromStr for GroupMapping {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if let Some((_a, _b)) = s.split_once(':') {
-            unimplemented!("Mapping GitHub teams to Linux groups is not implemented yet");
+            Err("Mapping GitHub teams to Linux groups is not implemented yet".to_string())
             // Ok(Self::MapGitHubTeam {
             //     gh_team: a.to_string(),
             //     linux_group: b.to_string(),

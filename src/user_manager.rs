@@ -26,7 +26,7 @@ pub trait ManageSupplementaryGroups {
 }
 
 pub trait UpdateUser {
-    /// Updates the use name and home
+    /// Updates the user name and home
     async fn update_user(
         &self,
         gh_user: &octocrab::models::Author,
