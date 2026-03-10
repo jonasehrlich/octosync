@@ -54,7 +54,15 @@ impl ProcessLock {
 
 impl Drop for ProcessLock {
     fn drop(&mut self) {
-        let _ = self.file.unlock();
+        if let Err(err) = self.file.unlock() {
+            tracing::warn!(
+                "Failed to unlock lockfile '{}' on exit: {}",
+                self.path.display(),
+                err
+            );
+            // If unlocking failed, keep the lockfile to avoid races with other processes.
+            return;
+        }
         if let Err(err) = fs::remove_file(&self.path)
             && err.kind() != std::io::ErrorKind::NotFound
         {
