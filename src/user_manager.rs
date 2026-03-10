@@ -77,7 +77,7 @@ mod linux {
             }
 
             let mut command = process::Command::new("/usr/sbin/useradd");
-            if groups.len() > 0 {
+            if !groups.is_empty() {
                 unimplemented!(
                     "Group management is not yet implemented. Cannot add user to groups: {:?}",
                     groups
@@ -137,7 +137,7 @@ mod linux {
 
             let proc = process::Command::new("/usr/sbin/userdel")
                 .arg("--remove")
-                .arg(&user.name())
+                .arg(user.name())
                 .output();
 
             let o = proc
@@ -330,13 +330,13 @@ mod linux {
         tokio::task::spawn_blocking(move || {
             if let Ok(procs) = procfs::process::all_processes() {
                 for proc in procs.flatten() {
-                    if let Ok(stat) = proc.status() {
-                        if stat.ruid == uid {
-                            let pid = nix::unistd::Pid::from_raw(proc.pid);
-                            let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+                    if let Ok(stat) = proc.status()
+                        && stat.ruid == uid
+                    {
+                        let pid = nix::unistd::Pid::from_raw(proc.pid);
+                        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
 
-                            tracing::debug!(pid = proc.pid, "Killed process");
-                        }
+                        tracing::debug!(pid = proc.pid, "Killed process");
                     }
                 }
             }
@@ -351,13 +351,13 @@ mod linux {
         user: &store::User,
     ) -> anyhow::Result<public_keys::PublicKeys> {
         let keys = http_client
-            .get(&user.public_keys_url())
+            .get(user.public_keys_url())
             .send()
             .await?
             .error_for_status()?
             .text()
             .await?;
-        Ok(keys.parse()?)
+        keys.parse()
     }
 }
 
