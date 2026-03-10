@@ -1,6 +1,8 @@
 use crate::{
     GlobalArgs, InstallationClientArgs, SyncArgs, store,
-    user_manager::{self, CreateUser as _, DeleteUser as _, ManageAuthorizedKeys as _},
+    user_manager::{
+        self, CreateUser as _, DeleteUser as _, ManageAuthorizedKeys as _, UpdateUser as _,
+    },
 };
 use anyhow::Context as _;
 use futures::{StreamExt as _, stream};
@@ -99,15 +101,16 @@ impl Octosync {
 
     async fn manage_existing_user(
         &self,
-        _gh_user: &octocrab::models::Author,
-        _user: &store::User,
+        gh_user: &octocrab::models::Author,
+        user: &store::User,
     ) -> anyhow::Result<store::User> {
         tracing::debug!("User exists in store");
 
         // TODO: check if it exists on the platform, if not, re-create it
         // TODO: check if groups need to be updated
         // TODO: if everything is up to date, just return the existing user
-        Ok(_user.clone())
+
+        self.user_manager.update_user(gh_user, user).await
     }
 
     #[tracing::instrument(

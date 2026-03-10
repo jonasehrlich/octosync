@@ -20,6 +20,15 @@ pub trait ManageAuthorizedKeys {
     async fn update_authorized_keys(&self, user: &store::User) -> anyhow::Result<()>;
 }
 
+pub trait UpdateUser {
+    /// Updates the use name and home
+    async fn update_user(
+        &self,
+        gh_user: &octocrab::models::Author,
+        available_user: &store::User,
+    ) -> anyhow::Result<store::User>;
+}
+
 #[cfg(target_os = "linux")]
 pub type PlatformUserManager = linux::LinuxUserManager;
 #[cfg(not(target_os = "linux"))]
@@ -144,6 +153,63 @@ mod linux {
                     user.name(),
                     String::from_utf8_lossy(&o.stderr)
                 ))
+            }
+        }
+    }
+
+    impl UpdateUser for LinuxUserManager {
+        #[tracing::instrument(
+            name = "UserManager::update_user",
+            skip(self, gh_user, available_user),
+            fields(from_uid = available_user.uid().as_raw(), from = %available_user.name(), to = %gh_user.login)
+        )]
+        async fn update_user(
+            &self,
+            gh_user: &octocrab::models::Author,
+            available_user: &store::User,
+        ) -> anyhow::Result<store::User> {
+            let linux_user =
+                nix::unistd::User::from_uid(available_user.uid())?.ok_or_else(|| {
+                    anyhow::anyhow!("User not found in system when attempting to update user",)
+                })?;
+
+            if gh_user.login != linux_user.name {
+                kill_processes_for_user(&linux_user).await?;
+                let output = process::Command::new("/usr/sbin/usermod")
+                    .arg("--home")
+                    .arg(format!("/home/{}", gh_user.login))
+                    .arg("--move-home")
+                    .arg("--login")
+                    .arg(&gh_user.login)
+                    .arg(&linux_user.name)
+                    .output()
+                    .await
+                    .context("Failed to execute usermod command")?;
+
+                if output.status.success() {
+                    tracing::info!(
+                        "Updated username from '{}' to '{}'",
+                        linux_user.name,
+                        gh_user.login
+                    );
+                    Ok(store::User::builder()
+                        .id(available_user.id())
+                        .uid(available_user.uid())
+                        .name(gh_user.login.clone())
+                        .build())
+                } else {
+                    tracing::error!(
+                        "Failed to update username: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    Err(anyhow::anyhow!(
+                        "Failed to update username for {}: {}",
+                        linux_user.name,
+                        String::from_utf8_lossy(&output.stderr)
+                    ))
+                }
+            } else {
+                Ok(available_user.clone())
             }
         }
     }
@@ -348,6 +414,29 @@ mod mock {
                 user.name()
             );
             Ok(())
+        }
+    }
+
+    impl UpdateUser for MockUserManager {
+        async fn update_user(
+            &self,
+            gh_user: &octocrab::models::Author,
+            available_user: &store::User,
+        ) -> anyhow::Result<store::User> {
+            if gh_user.login != available_user.name() {
+                tracing::info!(
+                    "Mock updating username from '{}' to '{}' (not actually updating users on non-Linux OS)",
+                    available_user.name(),
+                    gh_user.login
+                );
+                Ok(store::User::builder()
+                    .id(available_user.id())
+                    .uid(available_user.uid())
+                    .name(gh_user.login.clone())
+                    .build())
+            } else {
+                Ok(available_user.clone())
+            }
         }
     }
 
