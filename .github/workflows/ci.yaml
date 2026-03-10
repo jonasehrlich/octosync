@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    uses: ./.github/workflows/check.yaml
+
+  build:
+    uses: ./.github/workflows/build.yaml
+    needs: check
+
+  test:
+    uses: ./.github/workflows/test.yaml
+    needs: build
