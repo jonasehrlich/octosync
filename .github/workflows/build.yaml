@@ -39,11 +39,3 @@ jobs:
 
       - name: Build for ${{ matrix.target }}
         run: cargo zigbuild --target ${{ matrix.target }} --release
-
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: octosync-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/octosync
-          if-no-files-found: warn
-          retention-days: 1
