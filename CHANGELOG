@@ -1,0 +1,10 @@
+# Changelog
+
+## v0.2.0
+
+- Added group sync with the `--group` option.
+- Added locking of the data directory to prevent concurrent access issues.
+
+## v0.1.0
+
+- Initial release of the project.
