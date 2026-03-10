@@ -115,7 +115,6 @@ impl Octosync {
     )]
     pub async fn sync(self, args: &SyncArgs) -> anyhow::Result<()> {
         let octocrab = sync::Arc::new(org_client(&args.octocrab).await?);
-
         let (org_members, store) = tokio::try_join!(
             get_all_org_members(&octocrab, &args.octocrab.org),
             store::UserStore::from_dir(&self.data_dir)
@@ -137,6 +136,10 @@ impl Octosync {
                 })
                 .collect::<Vec<_>>(),
         );
+        // Don't create the groups as part of the try_join above, because at some point we also need
+        // to support mapping GitHub teams to Linux groups, which requires the user -> team -> group mapping
+        // to be available created before processing the users
+        self_arc.user_manager.ensure_groups_exists(&groups).await?;
 
         let mut set: tokio::task::JoinSet<_> = org_members
             .into_iter()

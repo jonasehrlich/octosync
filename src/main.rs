@@ -81,17 +81,19 @@ enum GroupMapping {
 }
 
 impl FromStr for GroupMapping {
-    type Err = String;
+    type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if let Some((_a, _b)) = s.split_once(':') {
-            Err("Mapping GitHub teams to Linux groups is not implemented yet".to_string())
+            Err(anyhow::anyhow!(
+                "Mapping GitHub teams to Linux groups is not implemented yet"
+            ))
             // Ok(Self::MapGitHubTeam {
-            //     gh_team: a.to_string(),
-            //     linux_group: b.to_string(),
+            //     gh_team: validate_group_name(_a)?,
+            //     linux_group: validate_group_name(_b)?,
             // })
         } else {
-            Ok(Self::AddGroup(s.to_string()))
+            Ok(Self::AddGroup(validate_group_name(s)?))
         }
     }
 }
@@ -143,4 +145,69 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+pub fn validate_group_name(group: &str) -> anyhow::Result<String> {
+    let is_valid = !group.is_empty()
+        && group.len() <= 32
+        && !group.starts_with("-")
+        && !group.ends_with("-")
+        && group
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+
+    if !is_valid {
+        return Err(anyhow::anyhow!(
+            "Invalid  group name '{}'. Allowed characters: [A-Za-z0-9_-], max length 32.",
+            group
+        ));
+    }
+    Ok(group.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod validate_group_name {
+        use super::*;
+
+        #[test]
+        fn valid_groups() {
+            let groups = vec![
+                "developers".to_string(),
+                "team_alpha".to_string(),
+                "ops-team".to_string(),
+                "group123".to_string(),
+            ];
+            let result = groups
+                .iter()
+                .map(|group| validate_group_name(group))
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(result.len(), 4);
+            assert_eq!(result, groups);
+        }
+
+        #[test]
+        fn invalid_groups() {
+            let groups = vec![
+                "invalid group".to_string(),
+                "toolonggroupname_exceeding_32_characters".to_string(),
+                "invalid,comma".to_string(),
+                "invalid$char".to_string(),
+                "-foobar".to_string(),
+                "foo-".to_string(),
+            ];
+
+            for group in groups {
+                let result = validate_group_name(&group);
+                assert!(
+                    result.is_err(),
+                    "Expected group '{}' to be invalid, but it was accepted",
+                    group
+                );
+            }
+        }
+    }
 }

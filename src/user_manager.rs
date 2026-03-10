@@ -5,7 +5,6 @@ pub trait CreateUser {
     async fn create_user(&self, user: &octocrab::models::Author) -> anyhow::Result<store::User>;
 }
 
-#[allow(unused)]
 pub trait DeleteUser {
     /// Deletes the platform user associated with the given GitHub user.
     async fn delete_user(&self, user: &store::User) -> anyhow::Result<()>;
@@ -23,6 +22,9 @@ pub trait ManageSupplementaryGroups {
         user: &store::User,
         groups: &[String],
     ) -> anyhow::Result<()>;
+
+    /// Ensure that a list of groups exists on the system, creating any that are missing.
+    async fn ensure_groups_exists(&self, groups: &[String]) -> anyhow::Result<()>;
 }
 
 pub trait UpdateUser {
@@ -101,6 +103,14 @@ impl ManageSupplementaryGroups for PlatformUserManager {
             Self::Mock(manager) => manager.sync_supplementary_groups(user, groups).await,
         }
     }
+
+    async fn ensure_groups_exists(&self, groups: &[String]) -> anyhow::Result<()> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Linux(manager) => manager.ensure_groups_exists(groups).await,
+            Self::Mock(manager) => manager.ensure_groups_exists(groups).await,
+        }
+    }
 }
 
 impl UpdateUser for PlatformUserManager {
@@ -139,7 +149,6 @@ mod linux {
     }
 
     impl CreateUser for LinuxUserManager {
-        /// Creates a
         #[tracing::instrument(name = "UserManager::create_user", skip(self, user))]
         async fn create_user(
             &self,
@@ -297,9 +306,6 @@ mod linux {
             user: &store::User,
             groups: &[String],
         ) -> anyhow::Result<()> {
-            let groups = sanitize_groups(groups)?;
-            ensure_groups_exist(&groups).await?;
-
             let linux_user = nix::unistd::User::from_uid(user.uid())
                 .context("Failed to read user before syncing groups")?
                 .ok_or_else(|| {
@@ -327,58 +333,35 @@ mod linux {
 
             sync_user_supplementary_groups_by_name(&linux_user.name, &supplementary_groups).await
         }
-    }
 
-    fn sanitize_groups(groups: &[String]) -> anyhow::Result<Vec<String>> {
-        let mut seen = std::collections::BTreeSet::new();
-        for group in groups {
-            let is_valid = !group.is_empty()
-                && group.len() <= 32
-                && !group.contains(',')
-                && group
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        async fn ensure_groups_exists(&self, groups: &[String]) -> anyhow::Result<()> {
+            for group in groups {
+                if nix::unistd::Group::from_name(group)
+                    .with_context(|| format!("Failed to check if group '{}' exists", group))?
+                    .is_some()
+                {
+                    continue;
+                }
 
-            if !is_valid {
-                anyhow::bail!(
-                    "Invalid Linux group name '{}'. Allowed characters: [A-Za-z0-9_-], max length 32.",
-                    group
-                );
+                let output = process::Command::new("/usr/sbin/groupadd")
+                    .arg(group)
+                    .output()
+                    .await
+                    .with_context(|| format!("Failed to execute groupadd for '{}'", group))?;
+
+                if output.status.success() {
+                    tracing::info!("Created missing group '{}'", group);
+                } else {
+                    return Err(anyhow::anyhow!(
+                        "Failed to create missing group '{}': {}",
+                        group,
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                }
             }
 
-            seen.insert(group.clone());
+            Ok(())
         }
-
-        Ok(seen.into_iter().collect())
-    }
-
-    async fn ensure_groups_exist(groups: &[String]) -> anyhow::Result<()> {
-        for group in groups {
-            if nix::unistd::Group::from_name(group)
-                .with_context(|| format!("Failed to check if group '{}' exists", group))?
-                .is_some()
-            {
-                continue;
-            }
-
-            let output = process::Command::new("/usr/sbin/groupadd")
-                .arg(group)
-                .output()
-                .await
-                .with_context(|| format!("Failed to execute groupadd for '{}'", group))?;
-
-            if output.status.success() {
-                tracing::info!("Created missing group '{}'", group);
-            } else {
-                return Err(anyhow::anyhow!(
-                    "Failed to create missing group '{}': {}",
-                    group,
-                    String::from_utf8_lossy(&output.stderr)
-                ));
-            }
-        }
-
-        Ok(())
     }
 
     async fn sync_user_supplementary_groups_by_name(
@@ -643,6 +626,14 @@ mod mock {
                 "Mock syncing supplementary groups {:?} for user '{}' (not actually managing groups on non-Linux OS)",
                 groups,
                 user.name()
+            );
+            Ok(())
+        }
+
+        async fn ensure_groups_exists(&self, groups: &[String]) -> anyhow::Result<()> {
+            tracing::info!(
+                "Mock ensuring groups exist: {:?} (not actually managing groups on non-Linux OS)",
+                groups,
             );
             Ok(())
         }
