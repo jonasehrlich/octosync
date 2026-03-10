@@ -34,10 +34,88 @@ pub trait UpdateUser {
     ) -> anyhow::Result<store::User>;
 }
 
-#[cfg(target_os = "linux")]
-pub type PlatformUserManager = linux::LinuxUserManager;
-#[cfg(not(target_os = "linux"))]
-pub type PlatformUserManager = mock::MockUserManager;
+#[derive(Clone, Debug)]
+pub enum PlatformUserManager {
+    #[cfg(target_os = "linux")]
+    Linux(linux::LinuxUserManager),
+    Mock(mock::MockUserManager),
+}
+
+impl PlatformUserManager {
+    pub fn new(dry_run: bool) -> Self {
+        if dry_run {
+            return Self::Mock(mock::MockUserManager::new(1000));
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            Self::Linux(linux::LinuxUserManager::new())
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            Self::Mock(mock::MockUserManager::new(1000))
+        }
+    }
+}
+
+impl CreateUser for PlatformUserManager {
+    async fn create_user(&self, user: &octocrab::models::Author) -> anyhow::Result<store::User> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Linux(manager) => manager.create_user(user).await,
+            Self::Mock(manager) => manager.create_user(user).await,
+        }
+    }
+}
+
+impl DeleteUser for PlatformUserManager {
+    async fn delete_user(&self, user: &store::User) -> anyhow::Result<()> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Linux(manager) => manager.delete_user(user).await,
+            Self::Mock(manager) => manager.delete_user(user).await,
+        }
+    }
+}
+
+impl ManageAuthorizedKeys for PlatformUserManager {
+    async fn update_authorized_keys(&self, user: &store::User) -> anyhow::Result<()> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Linux(manager) => manager.update_authorized_keys(user).await,
+            Self::Mock(manager) => manager.update_authorized_keys(user).await,
+        }
+    }
+}
+
+impl ManageSupplementaryGroups for PlatformUserManager {
+    async fn sync_supplementary_groups(
+        &self,
+        user: &store::User,
+        groups: &[String],
+    ) -> anyhow::Result<()> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Linux(manager) => manager.sync_supplementary_groups(user, groups).await,
+            Self::Mock(manager) => manager.sync_supplementary_groups(user, groups).await,
+        }
+    }
+}
+
+impl UpdateUser for PlatformUserManager {
+    async fn update_user(
+        &self,
+        gh_user: &octocrab::models::Author,
+        available_user: &store::User,
+    ) -> anyhow::Result<store::User> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Linux(manager) => manager.update_user(gh_user, available_user).await,
+            Self::Mock(manager) => manager.update_user(gh_user, available_user).await,
+        }
+    }
+}
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -478,7 +556,6 @@ mod linux {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
 mod mock {
     use super::*;
     use std::sync;

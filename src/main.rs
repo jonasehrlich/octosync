@@ -124,7 +124,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if args.global.dry_run {
-        tracing::info!("Running in dry-run mode: no changes will be made to Linux users or files");
+        tracing::info!(
+            "Running in dry-run mode: using mock platform user manager for user/group/key operations"
+        );
     }
     let data_dir = directories::ProjectDirs::from("", "", env!("CARGO_PKG_NAME"))
         .context("Error determining project directory")?

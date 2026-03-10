@@ -46,7 +46,6 @@ async fn org_client(args: &InstallationClientArgs) -> anyhow::Result<octocrab::O
 }
 
 pub struct Octosync {
-    global_config: sync::Arc<GlobalArgs>,
     data_dir: path::PathBuf,
     user_manager: user_manager::PlatformUserManager,
 }
@@ -56,13 +55,10 @@ impl Octosync {
         global_config: sync::Arc<GlobalArgs>,
         data_dir: &path::Path,
     ) -> anyhow::Result<Self> {
+        let user_manager = user_manager::PlatformUserManager::new(global_config.dry_run);
         Ok(Self {
-            global_config,
             data_dir: data_dir.to_path_buf(),
-            #[cfg(target_os = "linux")]
-            user_manager: user_manager::PlatformUserManager::new(),
-            #[cfg(not(target_os = "linux"))]
-            user_manager: user_manager::PlatformUserManager::new(1000),
+            user_manager,
         })
     }
 
@@ -95,14 +91,6 @@ impl Octosync {
     }
 
     async fn create_user(&self, gh_user: &octocrab::models::Author) -> anyhow::Result<store::User> {
-        if self.global_config.dry_run {
-            tracing::info!("Would create user for GitHub user '{}'", gh_user.login);
-            return Ok(store::User::builder()
-                .id(gh_user.id)
-                .name(gh_user.login.clone())
-                .uid(nix::unistd::Uid::from_raw(1000))
-                .build());
-        }
         self.user_manager.create_user(gh_user).await
     }
 
@@ -209,12 +197,6 @@ impl Octosync {
 
     #[tracing::instrument(name = "Octosync::delete", skip(self))]
     pub async fn delete(&self) -> anyhow::Result<()> {
-        if self.global_config.dry_run {
-            tracing::info!(
-                "Would clear all stored user data and delete all Linux users created by octosync"
-            );
-            return Ok(());
-        }
         let mut store = store::UserStore::from_dir(&self.data_dir).await?;
         let mut set: tokio::task::JoinSet<_> = store
             .data()
@@ -222,15 +204,10 @@ impl Octosync {
             .map(|user| {
                 let user = user.clone();
                 let user_manager = self.user_manager.clone();
-                let dry_run = self.global_config.dry_run;
                 async move {
-                    if dry_run {
-                        tracing::info!("Would delete user '{}'", user.name());
-                    } else {
-                        user_manager.delete_user(&user).await.inspect_err(|e| {
-                            tracing::error!("Failed to delete user '{}': {:?}", user.name(), e);
-                        })?;
-                    }
+                    user_manager.delete_user(&user).await.inspect_err(|e| {
+                        tracing::error!("Failed to delete user '{}': {:?}", user.name(), e);
+                    })?;
                     Ok::<store::User, anyhow::Error>(user)
                 }
             })
@@ -250,23 +227,19 @@ impl Octosync {
             };
         }
 
-        if !self.global_config.dry_run {
-            if store.data().is_empty() {
-                tracing::info!("All users deleted successfully, removing store data file");
+        if store.data().is_empty() {
+            tracing::info!("All users deleted successfully, removing store data file");
 
-                store.delete().await?;
-            } else {
-                tracing::warn!(
-                    "Some users could not be deleted. Remaining users in store: {}",
-                    store.data().len()
-                );
-                store
-                    .save()
-                    .await
-                    .context("Failed to save store data after deletion")?;
-            }
+            store.delete().await?;
         } else {
-            tracing::info!("Would delete store data file");
+            tracing::warn!(
+                "Some users could not be deleted. Remaining users in store: {}",
+                store.data().len()
+            );
+            store
+                .save()
+                .await
+                .context("Failed to save store data after deletion")?;
         }
         Ok(())
     }
