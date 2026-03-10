@@ -73,22 +73,23 @@ enum Commands {
 #[allow(unused)]
 #[derive(Debug, Clone)]
 enum GroupMapping {
+    AddGroup(String),
     MapGitHubTeam {
         gh_team: String,
         linux_group: String,
     },
-    AddGroup(String),
 }
 
 impl FromStr for GroupMapping {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if let Some((a, b)) = s.split_once(':') {
-            Ok(Self::MapGitHubTeam {
-                gh_team: a.to_string(),
-                linux_group: b.to_string(),
-            })
+        if let Some((_a, _b)) = s.split_once(':') {
+            unimplemented!("Mapping GitHub teams to Linux groups is not implemented yet");
+            // Ok(Self::MapGitHubTeam {
+            //     gh_team: a.to_string(),
+            //     linux_group: b.to_string(),
+            // })
         } else {
             Ok(Self::AddGroup(s.to_string()))
         }

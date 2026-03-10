@@ -2,11 +2,7 @@ use crate::store;
 
 pub trait CreateUser {
     /// Creates a platform user for the given GitHub user.
-    async fn create_user(
-        &self,
-        user: &octocrab::models::Author,
-        groups: Vec<String>,
-    ) -> anyhow::Result<store::User>;
+    async fn create_user(&self, user: &octocrab::models::Author) -> anyhow::Result<store::User>;
 }
 
 #[allow(unused)]
@@ -18,6 +14,15 @@ pub trait DeleteUser {
 pub trait ManageAuthorizedKeys {
     /// Updates the authorized_keys for the given user based on their GitHub data.
     async fn update_authorized_keys(&self, user: &store::User) -> anyhow::Result<()>;
+}
+
+pub trait ManageSupplementaryGroups {
+    /// Synchronizes supplementary groups for the given user.
+    async fn sync_supplementary_groups(
+        &self,
+        user: &store::User,
+        groups: &[String],
+    ) -> anyhow::Result<()>;
 }
 
 pub trait UpdateUser {
@@ -61,7 +66,6 @@ mod linux {
         async fn create_user(
             &self,
             user: &octocrab::models::Author,
-            groups: Vec<String>,
         ) -> anyhow::Result<store::User> {
             if let Ok(Some(existing_user)) = nix::unistd::User::from_name(&user.login) {
                 tracing::info!(
@@ -69,6 +73,7 @@ mod linux {
                     user.login,
                     existing_user.uid
                 );
+
                 return Ok(store::User::builder()
                     .id(user.id)
                     .uid(existing_user.uid)
@@ -77,13 +82,6 @@ mod linux {
             }
 
             let mut command = process::Command::new("/usr/sbin/useradd");
-            if !groups.is_empty() {
-                unimplemented!(
-                    "Group management is not yet implemented. Cannot add user to groups: {:?}",
-                    groups
-                );
-                // command.arg("--groups").arg(groups.join(","));
-            }
             command
                 .arg("--create-home")
                 .arg("--shell")
@@ -98,7 +96,7 @@ mod linux {
                 .context("Failed to wait for useradd command to finish")?;
 
             if o.status.success() {
-                tracing::info!("Created user with additional groups: {:?}", groups);
+                tracing::info!("Created user");
 
                 let linux_user = nix::unistd::User::from_name(&user.login)
                     .context("Failed to retrieve user info for newly created user ")?
@@ -173,44 +171,163 @@ mod linux {
                     anyhow::anyhow!("User not found in system when attempting to update user",)
                 })?;
 
-            if gh_user.login != linux_user.name {
-                kill_processes_for_user(&linux_user).await?;
-                let output = process::Command::new("/usr/sbin/usermod")
-                    .arg("--home")
-                    .arg(format!("/home/{}", gh_user.login))
-                    .arg("--move-home")
-                    .arg("--login")
-                    .arg(&gh_user.login)
-                    .arg(&linux_user.name)
-                    .output()
-                    .await
-                    .context("Failed to execute usermod command")?;
-
-                if output.status.success() {
-                    tracing::info!(
-                        "Updated username from '{}' to '{}'",
-                        linux_user.name,
-                        gh_user.login
-                    );
-                    Ok(store::User::builder()
-                        .id(available_user.id())
-                        .uid(available_user.uid())
-                        .name(gh_user.login.clone())
-                        .build())
-                } else {
-                    tracing::error!(
-                        "Failed to update username: {}",
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                    Err(anyhow::anyhow!(
-                        "Failed to update username for {}: {}",
-                        linux_user.name,
-                        String::from_utf8_lossy(&output.stderr)
-                    ))
-                }
-            } else {
-                Ok(available_user.clone())
+            if gh_user.login == linux_user.name {
+                return Ok(available_user.clone());
             }
+
+            kill_processes_for_user(&linux_user).await?;
+            let output = process::Command::new("/usr/sbin/usermod")
+                .arg("--home")
+                .arg(format!("/home/{}", gh_user.login))
+                .arg("--move-home")
+                .arg("--login")
+                .arg(&gh_user.login)
+                .arg(&linux_user.name)
+                .output()
+                .await
+                .context("Failed to execute usermod command")?;
+
+            if output.status.success() {
+                tracing::info!(
+                    "Updated username from '{}' to '{}'",
+                    linux_user.name,
+                    gh_user.login
+                );
+                Ok(store::User::builder()
+                    .id(available_user.id())
+                    .uid(available_user.uid())
+                    .name(gh_user.login.clone())
+                    .build())
+            } else {
+                tracing::error!(
+                    "Failed to update username: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                Err(anyhow::anyhow!(
+                    "Failed to update username for {}: {}",
+                    linux_user.name,
+                    String::from_utf8_lossy(&output.stderr)
+                ))
+            }
+        }
+    }
+
+    impl ManageSupplementaryGroups for LinuxUserManager {
+        #[tracing::instrument(name = "UserManager::sync_supplementary_groups", skip(self, user, groups), fields(user = %user.name()))]
+        async fn sync_supplementary_groups(
+            &self,
+            user: &store::User,
+            groups: &[String],
+        ) -> anyhow::Result<()> {
+            let groups = sanitize_groups(groups)?;
+            ensure_groups_exist(&groups).await?;
+
+            let linux_user = nix::unistd::User::from_uid(user.uid())
+                .context("Failed to read user before syncing groups")?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "User '{}' was not found while syncing supplementary groups",
+                        user.name()
+                    )
+                })?;
+
+            let primary_group_name = nix::unistd::Group::from_gid(linux_user.gid)
+                .context("Failed to read primary group while syncing groups")?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Primary group for '{}' was not found while syncing groups",
+                        user.name()
+                    )
+                })?
+                .name;
+
+            let supplementary_groups: Vec<String> = groups
+                .iter()
+                .filter(|group| group.as_str() != primary_group_name)
+                .cloned()
+                .collect();
+
+            sync_user_supplementary_groups_by_name(&linux_user.name, &supplementary_groups).await
+        }
+    }
+
+    fn sanitize_groups(groups: &[String]) -> anyhow::Result<Vec<String>> {
+        let mut seen = std::collections::BTreeSet::new();
+        for group in groups {
+            let is_valid = !group.is_empty()
+                && group.len() <= 32
+                && !group.contains(',')
+                && group
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+
+            if !is_valid {
+                anyhow::bail!(
+                    "Invalid Linux group name '{}'. Allowed characters: [A-Za-z0-9_-], max length 32.",
+                    group
+                );
+            }
+
+            seen.insert(group.clone());
+        }
+
+        Ok(seen.into_iter().collect())
+    }
+
+    async fn ensure_groups_exist(groups: &[String]) -> anyhow::Result<()> {
+        for group in groups {
+            if nix::unistd::Group::from_name(group)
+                .with_context(|| format!("Failed to check if group '{}' exists", group))?
+                .is_some()
+            {
+                continue;
+            }
+
+            let output = process::Command::new("/usr/sbin/groupadd")
+                .arg(group)
+                .output()
+                .await
+                .with_context(|| format!("Failed to execute groupadd for '{}'", group))?;
+
+            if output.status.success() {
+                tracing::info!("Created missing group '{}'", group);
+            } else {
+                return Err(anyhow::anyhow!(
+                    "Failed to create missing group '{}': {}",
+                    group,
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn sync_user_supplementary_groups_by_name(
+        user_name: &str,
+        supplementary_groups: &[String],
+    ) -> anyhow::Result<()> {
+        let output = process::Command::new("/usr/sbin/usermod")
+            .arg("--groups")
+            .arg(supplementary_groups.join(","))
+            .arg(user_name)
+            .output()
+            .await
+            .context("Failed to execute usermod command for group updates")?;
+
+        if output.status.success() {
+            tracing::info!(
+                "Synchronized supplementary groups for '{}' to {:?}",
+                user_name,
+                supplementary_groups
+            );
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "Failed to update groups for user '{}': {}",
+                user_name,
+                String::from_utf8_lossy(&output.stderr)
+            ))
         }
     }
 
@@ -383,7 +500,6 @@ mod mock {
         async fn create_user(
             &self,
             user: &octocrab::models::Author,
-            _groups: Vec<String>,
         ) -> anyhow::Result<store::User> {
             let uid = self.uid_generator.get_next();
             tracing::info!(
@@ -437,6 +553,21 @@ mod mock {
             } else {
                 Ok(available_user.clone())
             }
+        }
+    }
+
+    impl ManageSupplementaryGroups for MockUserManager {
+        async fn sync_supplementary_groups(
+            &self,
+            user: &store::User,
+            groups: &[String],
+        ) -> anyhow::Result<()> {
+            tracing::info!(
+                "Mock syncing supplementary groups {:?} for user '{}' (not actually managing groups on non-Linux OS)",
+                groups,
+                user.name()
+            );
+            Ok(())
         }
     }
 

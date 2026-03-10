@@ -1,7 +1,8 @@
 use crate::{
     GlobalArgs, InstallationClientArgs, SyncArgs, store,
     user_manager::{
-        self, CreateUser as _, DeleteUser as _, ManageAuthorizedKeys as _, UpdateUser as _,
+        self, CreateUser as _, DeleteUser as _, ManageAuthorizedKeys as _,
+        ManageSupplementaryGroups as _, UpdateUser as _,
     },
 };
 use anyhow::Context as _;
@@ -74,11 +75,17 @@ impl Octosync {
         &self,
         gh_user: &octocrab::models::Author,
         store: &store::UserStore,
+        groups: &[String],
     ) -> anyhow::Result<store::User> {
         let new_user = match store.data().get(&gh_user.id) {
             Some(user) => self.manage_existing_user(gh_user, user).await?,
             None => self.create_user(gh_user).await?,
         };
+
+        self.user_manager
+            .sync_supplementary_groups(&new_user, groups)
+            .await
+            .context("Failed to sync supplementary groups")?;
 
         self.user_manager
             .update_authorized_keys(&new_user)
@@ -96,7 +103,7 @@ impl Octosync {
                 .uid(nix::unistd::Uid::from_raw(1000))
                 .build());
         }
-        self.user_manager.create_user(gh_user, vec![]).await
+        self.user_manager.create_user(gh_user).await
     }
 
     async fn manage_existing_user(
@@ -133,12 +140,23 @@ impl Octosync {
 
         let self_arc = sync::Arc::new(self);
         let store_arc = sync::Arc::new(store);
+        let groups = sync::Arc::new(
+            args.group
+                .iter()
+                .filter_map(|mapping| match mapping {
+                    crate::GroupMapping::AddGroup(group) => Some(group.clone()),
+                    crate::GroupMapping::MapGitHubTeam { .. } => None, // Not implemented yet
+                })
+                .collect::<Vec<_>>(),
+        );
+
         let mut set: tokio::task::JoinSet<_> = org_members
             .into_iter()
             .map(|gh_user| {
                 let self_arc = self_arc.clone();
                 let store_arc = store_arc.clone();
-                async move { self_arc.process_user(&gh_user, &store_arc).await }
+                let groups = groups.clone();
+                async move { self_arc.process_user(&gh_user, &store_arc, &groups).await }
             })
             .collect();
 
