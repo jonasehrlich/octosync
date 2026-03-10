@@ -108,6 +108,7 @@ struct GlobalArgs {
 /// Sync the members of a GitHub organization with Linux user accounts for new members,
 /// installing their public keys for SSH access.
 #[derive(clap::Parser, Debug)]
+#[command(version)]
 struct Cli {
     #[command(flatten)]
     global: GlobalArgs,
