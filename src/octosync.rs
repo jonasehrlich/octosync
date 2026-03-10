@@ -1,7 +1,8 @@
 use crate::{
     GlobalArgs, InstallationClientArgs, SyncArgs, store,
     user_manager::{
-        self, CreateUser as _, DeleteUser as _, ManageAuthorizedKeys as _, UpdateUser as _,
+        self, CreateUser as _, DeleteUser as _, ManageAuthorizedKeys as _,
+        ManageSupplementaryGroups as _, UpdateUser as _,
     },
 };
 use anyhow::Context as _;
@@ -45,7 +46,6 @@ async fn org_client(args: &InstallationClientArgs) -> anyhow::Result<octocrab::O
 }
 
 pub struct Octosync {
-    global_config: sync::Arc<GlobalArgs>,
     data_dir: path::PathBuf,
     user_manager: user_manager::PlatformUserManager,
 }
@@ -55,13 +55,10 @@ impl Octosync {
         global_config: sync::Arc<GlobalArgs>,
         data_dir: &path::Path,
     ) -> anyhow::Result<Self> {
+        let user_manager = user_manager::PlatformUserManager::new(global_config.dry_run);
         Ok(Self {
-            global_config,
             data_dir: data_dir.to_path_buf(),
-            #[cfg(target_os = "linux")]
-            user_manager: user_manager::PlatformUserManager::new(),
-            #[cfg(not(target_os = "linux"))]
-            user_manager: user_manager::PlatformUserManager::new(1000),
+            user_manager,
         })
     }
 
@@ -74,11 +71,17 @@ impl Octosync {
         &self,
         gh_user: &octocrab::models::Author,
         store: &store::UserStore,
+        groups: &[String],
     ) -> anyhow::Result<store::User> {
         let new_user = match store.data().get(&gh_user.id) {
             Some(user) => self.manage_existing_user(gh_user, user).await?,
             None => self.create_user(gh_user).await?,
         };
+
+        self.user_manager
+            .sync_supplementary_groups(&new_user, groups)
+            .await
+            .context("Failed to sync supplementary groups")?;
 
         self.user_manager
             .update_authorized_keys(&new_user)
@@ -88,15 +91,7 @@ impl Octosync {
     }
 
     async fn create_user(&self, gh_user: &octocrab::models::Author) -> anyhow::Result<store::User> {
-        if self.global_config.dry_run {
-            tracing::info!("Would create user for GitHub user '{}'", gh_user.login);
-            return Ok(store::User::builder()
-                .id(gh_user.id)
-                .name(gh_user.login.clone())
-                .uid(nix::unistd::Uid::from_raw(1000))
-                .build());
-        }
-        self.user_manager.create_user(gh_user, vec![]).await
+        self.user_manager.create_user(gh_user).await
     }
 
     async fn manage_existing_user(
@@ -120,7 +115,6 @@ impl Octosync {
     )]
     pub async fn sync(self, args: &SyncArgs) -> anyhow::Result<()> {
         let octocrab = sync::Arc::new(org_client(&args.octocrab).await?);
-
         let (org_members, store) = tokio::try_join!(
             get_all_org_members(&octocrab, &args.octocrab.org),
             store::UserStore::from_dir(&self.data_dir)
@@ -133,12 +127,27 @@ impl Octosync {
 
         let self_arc = sync::Arc::new(self);
         let store_arc = sync::Arc::new(store);
+        let groups = sync::Arc::new(
+            args.group
+                .iter()
+                .filter_map(|mapping| match mapping {
+                    crate::GroupMapping::AddGroup(group) => Some(group.clone()),
+                    crate::GroupMapping::MapGitHubTeam { .. } => None, // Not implemented yet
+                })
+                .collect::<Vec<_>>(),
+        );
+        // Don't create the groups as part of the try_join above, because at some point we also need
+        // to support mapping GitHub teams to Linux groups, which requires the user -> team -> group mapping
+        // to be available created before processing the users
+        self_arc.user_manager.ensure_groups_exists(&groups).await?;
+
         let mut set: tokio::task::JoinSet<_> = org_members
             .into_iter()
             .map(|gh_user| {
                 let self_arc = self_arc.clone();
                 let store_arc = store_arc.clone();
-                async move { self_arc.process_user(&gh_user, &store_arc).await }
+                let groups = groups.clone();
+                async move { self_arc.process_user(&gh_user, &store_arc, &groups).await }
             })
             .collect();
 
@@ -191,12 +200,6 @@ impl Octosync {
 
     #[tracing::instrument(name = "Octosync::delete", skip(self))]
     pub async fn delete(&self) -> anyhow::Result<()> {
-        if self.global_config.dry_run {
-            tracing::info!(
-                "Would clear all stored user data and delete all Linux users created by octosync"
-            );
-            return Ok(());
-        }
         let mut store = store::UserStore::from_dir(&self.data_dir).await?;
         let mut set: tokio::task::JoinSet<_> = store
             .data()
@@ -204,15 +207,10 @@ impl Octosync {
             .map(|user| {
                 let user = user.clone();
                 let user_manager = self.user_manager.clone();
-                let dry_run = self.global_config.dry_run;
                 async move {
-                    if dry_run {
-                        tracing::info!("Would delete user '{}'", user.name());
-                    } else {
-                        user_manager.delete_user(&user).await.inspect_err(|e| {
-                            tracing::error!("Failed to delete user '{}': {:?}", user.name(), e);
-                        })?;
-                    }
+                    user_manager.delete_user(&user).await.inspect_err(|e| {
+                        tracing::error!("Failed to delete user '{}': {:?}", user.name(), e);
+                    })?;
                     Ok::<store::User, anyhow::Error>(user)
                 }
             })
@@ -232,23 +230,19 @@ impl Octosync {
             };
         }
 
-        if !self.global_config.dry_run {
-            if store.data().is_empty() {
-                tracing::info!("All users deleted successfully, removing store data file");
+        if store.data().is_empty() {
+            tracing::info!("All users deleted successfully, removing store data file");
 
-                store.delete().await?;
-            } else {
-                tracing::warn!(
-                    "Some users could not be deleted. Remaining users in store: {}",
-                    store.data().len()
-                );
-                store
-                    .save()
-                    .await
-                    .context("Failed to save store data after deletion")?;
-            }
+            store.delete().await?;
         } else {
-            tracing::info!("Would delete store data file");
+            tracing::warn!(
+                "Some users could not be deleted. Remaining users in store: {}",
+                store.data().len()
+            );
+            store
+                .save()
+                .await
+                .context("Failed to save store data after deletion")?;
         }
         Ok(())
     }
