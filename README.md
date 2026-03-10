@@ -13,6 +13,17 @@ Synchronize GitHub organization members to local user accounts on a Linux system
 - Create a private key for the GitHub App and save the `.pem` file to the project directory.
 - Download the application for your platform from the
   [releases](https://github.com/jonasehrlich/octosync/releases).
+- Create a cron job to run the application at your desired interval, e.g., every hour:
+
+```sh
+0 * * * * /path/to/octosync sync --org \<org-name\> --app-id \<app-id\> --private-key /path/to/private-key.pem
+```
+
+## Installation
+
+Install the latest version from the
+[releases](https://github.com/jonasehrlich/octosync/releases/latest) page or build from source using
+the instructions below.
 
 ## Run
 
@@ -22,7 +33,8 @@ octosync sync --org \<org-name\> --app-id \<app-id\> --private-key \<private-key
 
 ## Development
 
-When developing on Linux, you can run the application directly using `cargo run`. For cross-compilation to other platforms, use `cargo-zigbuild` as described below.
+When developing on Linux, you can run the application directly using `cargo run`. For
+cross-compilation to other platforms, use `cargo-zigbuild` as described below.
 
 ### Cross-compilation
 
