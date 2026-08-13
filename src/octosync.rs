@@ -14,6 +14,10 @@ use tokio::fs;
 /// user's home directory, which is disk- and CPU-heavy, so it is not unbounded.
 const MAX_CONCURRENT_DELETES: usize = 4;
 
+/// Maximum number of users that are processed concurrently. Processing a user talks
+/// to GitHub and spawns system commands, so it is not unbounded.
+const MAX_CONCURRENT_USER_SYNCS: usize = 32;
+
 async fn org_client(args: &InstallationClientArgs) -> anyhow::Result<octocrab::Octocrab> {
     let private_key = fs::read(args.private_key.as_path())
         .await
@@ -90,10 +94,14 @@ impl Octosync {
             .await
             .context("Failed to sync supplementary groups")?;
 
-        self.user_manager
-            .update_authorized_keys(&new_user)
-            .await
-            .context("Failed to sync SSH keys")?;
+        // A failed keys fetch must not fail user processing: the existing
+        // authorized_keys file stays in place and the fetch is retried on the next sync.
+        if let Err(e) = self.user_manager.update_authorized_keys(&new_user).await {
+            tracing::error!(
+                "Failed to sync SSH keys, keeping existing authorized_keys: {:?}",
+                e
+            );
+        }
         Ok(new_user)
     }
 
@@ -108,9 +116,7 @@ impl Octosync {
     ) -> anyhow::Result<store::User> {
         tracing::debug!("User exists in store");
 
-        // TODO: check if it exists on the platform, if not, re-create it
-        // TODO: check if groups need to be updated
-        // TODO: if everything is up to date, just return the existing user
+        // TODO: re-create the user if it no longer exists on the platform
 
         self.user_manager.update_user(gh_user, user).await
     }
@@ -121,120 +127,121 @@ impl Octosync {
         fields(org = %args.octocrab.org)
     )]
     pub async fn sync(self, args: &SyncArgs) -> anyhow::Result<()> {
-        let octocrab = sync::Arc::new(org_client(&args.octocrab).await?);
-        let (org_members, store) = tokio::try_join!(
+        let octocrab = org_client(&args.octocrab).await?;
+        let (org_members, old_store) = tokio::try_join!(
             get_all_org_members(&octocrab, &args.octocrab.org),
             store::UserStore::from_dir(&self.data_dir)
         )?;
         tracing::info!("Successfully retrieved {} members", org_members.len());
-        let _org_member_map: collections::HashMap<octocrab::models::UserId, String> =
+        let org_member_map: collections::HashMap<octocrab::models::UserId, String> =
             collections::HashMap::from_iter(
                 org_members.iter().map(|user| (user.id, user.login.clone())),
             );
 
-        let self_arc = sync::Arc::new(self);
-        let store_arc = sync::Arc::new(store);
-        let groups = sync::Arc::new(
-            args.group
-                .iter()
-                .filter_map(|mapping| match mapping {
-                    crate::GroupMapping::AddGroup(group) => Some(group.clone()),
-                    crate::GroupMapping::MapGitHubTeam { .. } => None, // Not implemented yet
-                })
-                .collect::<Vec<_>>(),
-        );
+        let groups: Vec<String> = args
+            .group
+            .iter()
+            .filter_map(|mapping| match mapping {
+                crate::GroupMapping::AddGroup(group) => Some(group.clone()),
+                crate::GroupMapping::MapGitHubTeam { .. } => None, // Not implemented yet
+            })
+            .collect();
         // Don't create the groups as part of the try_join above, because at some point we also need
         // to support mapping GitHub teams to Linux groups, which requires the user -> team -> group mapping
         // to be available created before processing the users
-        self_arc.user_manager.ensure_groups_exists(&groups).await?;
+        self.user_manager.ensure_groups_exists(&groups).await?;
 
-        let mut set: tokio::task::JoinSet<_> = org_members
-            .into_iter()
-            .map(|gh_user| {
-                let self_arc = self_arc.clone();
-                let store_arc = store_arc.clone();
-                let groups = groups.clone();
-                async move { self_arc.process_user(&gh_user, &store_arc, &groups).await }
-            })
-            .collect();
+        let mut new_store = self
+            .process_members(&org_members, &old_store, &groups)
+            .await?;
 
-        let user_stream = async_stream::stream! {
-            while let Some(res) = set.join_next().await {
-                yield res;
-            }
-        };
+        let (users_to_retry, users_to_delete) =
+            partition_stale_users(old_store.data(), new_store.data(), &org_member_map);
 
-        let mut new_store = user_stream
-            .filter_map(|r| async move { r.ok()?.ok() })
-            .fold(
-                store::UserStore::new(&self_arc.data_dir).await?,
-                |mut store: store::UserStore, item| async move {
-                    store.data_mut().insert(item.id(), item);
-                    store
-                },
-            )
-            .await;
-
-        // Users that failed to delete that need to be added to the store again to be retried on the next sync
-        let users_to_re_add = stream::iter(
-            store_arc
-                .data()
-                .values()
-                .filter(|user| !new_store.data().contains_key(&user.id())),
-        )
-        .map(|u| {
-            let user_manager = &self_arc.user_manager;
-            async move {
-                user_manager
-                    .delete_user(u)
-                    .await
-                    .map_err(|_| u.clone())
-                    .err()
-            }
-        })
-        // Deletion archives the user's home directory, which can take a while for large
-        // home directories, run a few deletions concurrently
-        .buffer_unordered(MAX_CONCURRENT_DELETES)
-        .filter_map(|res| async move { res })
-        .collect::<Vec<_>>()
-        .await;
-
-        for user in users_to_re_add {
+        for user in users_to_retry {
             tracing::warn!(
-                "Failed to delete user '{}', re-adding to store for retry on next sync",
+                "Keeping user '{}' in store after failed processing, retrying on next sync",
                 user.name()
             );
-            new_store.data_mut().insert(user.id(), user);
+            new_store.data_mut().insert(user.id(), user.clone());
+        }
+
+        for user in self.delete_users(users_to_delete).await {
+            tracing::warn!(
+                "Re-adding user '{}' to store after failed deletion, retrying on next sync",
+                user.name()
+            );
+            new_store.data_mut().insert(user.id(), user.clone());
         }
 
         new_store.save().await?;
         Ok(())
     }
 
-    #[tracing::instrument(name = "Octosync::delete", skip(self))]
-    pub async fn delete(&self) -> anyhow::Result<()> {
-        let mut store = store::UserStore::from_dir(&self.data_dir).await?;
-        let deleted_users: Vec<_> = stream::iter(store.data().values())
-            .map(|user| {
-                let user_manager = &self.user_manager;
-                async move {
-                    user_manager
-                        .delete_user(user)
-                        .await
-                        .inspect_err(|e| {
-                            tracing::error!("Failed to delete user '{}': {:?}", user.name(), e);
-                        })
-                        .ok()
-                        .map(|()| user.id())
-                }
+    /// Process all org members concurrently and collect the successfully processed
+    /// users into a new store.
+    ///
+    /// A processing failure is logged and leaves the user out of the returned store.
+    /// It never signals that the user left the org; [`partition_stale_users`] alone
+    /// decides which users are deleted.
+    async fn process_members(
+        &self,
+        org_members: &[octocrab::models::Author],
+        store: &store::UserStore,
+        groups: &[String],
+    ) -> anyhow::Result<store::UserStore> {
+        let mut new_store = store::UserStore::new(&self.data_dir).await?;
+        *new_store.data_mut() = stream::iter(org_members)
+            .map(|gh_user| async move {
+                self.process_user(gh_user, store, groups)
+                    .await
+                    .inspect_err(|e| {
+                        tracing::error!("Failed to process user '{}': {:?}", gh_user.login, e);
+                    })
+                    .ok()
             })
+            .buffer_unordered(MAX_CONCURRENT_USER_SYNCS)
+            .filter_map(|res| async move { res })
+            .map(|user| (user.id(), user))
+            .collect()
+            .await;
+        Ok(new_store)
+    }
+
+    /// Delete the given users concurrently and return the users whose deletion failed.
+    ///
+    /// Failures are logged; callers must keep the returned users in the store so the
+    /// deletion is retried on the next sync.
+    async fn delete_users<'a>(&self, users: Vec<&'a store::User>) -> Vec<&'a store::User> {
+        stream::iter(users)
+            .map(|user| async move {
+                self.user_manager
+                    .delete_user(user)
+                    .await
+                    .map_err(|e| {
+                        tracing::error!("Failed to delete user '{}': {:?}", user.name(), e);
+                        user
+                    })
+                    .err()
+            })
+            // Deletion archives the user's home directory, which can take a while for large
+            // home directories, run a few deletions concurrently
             .buffer_unordered(MAX_CONCURRENT_DELETES)
             .filter_map(|res| async move { res })
             .collect()
-            .await;
-        for id in deleted_users {
-            store.data_mut().remove(&id);
-        }
+            .await
+    }
+
+    #[tracing::instrument(name = "Octosync::delete", skip(self))]
+    pub async fn delete(&self) -> anyhow::Result<()> {
+        let mut store = store::UserStore::from_dir(&self.data_dir).await?;
+        let failed_ids: collections::HashSet<octocrab::models::UserId> = self
+            .delete_users(store.data().values().collect())
+            .await
+            .into_iter()
+            .map(store::User::id)
+            .collect();
+        store.data_mut().retain(|id, _| failed_ids.contains(id));
 
         if store.data().is_empty() {
             tracing::info!("All users deleted successfully, removing store data file");
@@ -254,6 +261,24 @@ impl Octosync {
     }
 }
 
+/// Split the users of the previous store that are missing from the new store into
+/// users to keep for a retry and users to delete.
+///
+/// Deletion is decided solely by absence from the fetched org member list. A user that
+/// is still an org member but missing from the new store failed processing; deleting
+/// them would turn any correlated per-user failure (e.g. rate-limited key fetches)
+/// into a mass deletion, so they are kept unchanged and retried on the next sync.
+fn partition_stale_users<'a>(
+    old_users: &'a collections::HashMap<octocrab::models::UserId, store::User>,
+    new_users: &collections::HashMap<octocrab::models::UserId, store::User>,
+    org_member_map: &collections::HashMap<octocrab::models::UserId, String>,
+) -> (Vec<&'a store::User>, Vec<&'a store::User>) {
+    old_users
+        .values()
+        .filter(|user| !new_users.contains_key(&user.id()))
+        .partition(|user| org_member_map.contains_key(&user.id()))
+}
+
 async fn get_all_org_members(
     octocrab: &octocrab::Octocrab,
     org: &str,
@@ -269,4 +294,105 @@ async fn get_all_org_members(
         .into_stream(octocrab);
 
     Ok(stream.try_collect().await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn user(id: u64, name: &str) -> store::User {
+        store::User::builder()
+            .id(octocrab::models::UserId(id))
+            .name(name.to_string())
+            .uid(nix::unistd::Uid::from_raw(1000 + id as u32))
+            .build()
+    }
+
+    fn user_map(
+        users: &[store::User],
+    ) -> collections::HashMap<octocrab::models::UserId, store::User> {
+        users.iter().map(|u| (u.id(), u.clone())).collect()
+    }
+
+    fn member_map(users: &[store::User]) -> collections::HashMap<octocrab::models::UserId, String> {
+        users
+            .iter()
+            .map(|u| (u.id(), u.name().to_string()))
+            .collect()
+    }
+
+    mod partition_stale_users {
+        use super::*;
+
+        /// Regression test for the 2026-08-12 incident: every member is still in the
+        /// org, but all of them failed processing, so the new store is empty.
+        /// No user may be deleted; all must be retried.
+        #[test]
+        fn all_members_failed_processing_deletes_nobody() {
+            let users = [user(1, "a"), user(2, "b"), user(3, "c")];
+            let old = user_map(&users);
+            let new = user_map(&[]);
+            let members = member_map(&users);
+
+            let (retry, delete) = partition_stale_users(&old, &new, &members);
+
+            assert_eq!(retry.len(), 3);
+            assert!(delete.is_empty());
+        }
+
+        #[test]
+        fn user_absent_from_member_list_is_deleted() {
+            let remaining = user(1, "a");
+            let left = user(2, "b");
+            let old = user_map(&[remaining.clone(), left.clone()]);
+            let new = user_map(&[remaining]);
+            let members = member_map(std::slice::from_ref(&old[&octocrab::models::UserId(1)]));
+
+            let (retry, delete) = partition_stale_users(&old, &new, &members);
+
+            assert!(retry.is_empty());
+            assert_eq!(delete, vec![&left]);
+        }
+
+        #[test]
+        fn successfully_processed_user_is_neither_retried_nor_deleted() {
+            let processed = user(1, "a");
+            let old = user_map(std::slice::from_ref(&processed));
+            let new = user_map(std::slice::from_ref(&processed));
+            let members = member_map(&[processed]);
+
+            let (retry, delete) = partition_stale_users(&old, &new, &members);
+
+            assert!(retry.is_empty());
+            assert!(delete.is_empty());
+        }
+
+        #[test]
+        fn failed_member_is_retried_while_removed_member_is_deleted() {
+            let processed = user(1, "a");
+            let failed = user(2, "b");
+            let left = user(3, "c");
+            let old = user_map(&[processed.clone(), failed.clone(), left.clone()]);
+            let new = user_map(std::slice::from_ref(&processed));
+            let members = member_map(&[processed, failed.clone()]);
+
+            let (retry, delete) = partition_stale_users(&old, &new, &members);
+
+            assert_eq!(retry, vec![&failed]);
+            assert_eq!(delete, vec![&left]);
+        }
+
+        #[test]
+        fn new_member_in_new_store_only_is_untouched() {
+            let joined = user(1, "a");
+            let old = user_map(&[]);
+            let new = user_map(std::slice::from_ref(&joined));
+            let members = member_map(&[joined]);
+
+            let (retry, delete) = partition_stale_users(&old, &new, &members);
+
+            assert!(retry.is_empty());
+            assert!(delete.is_empty());
+        }
+    }
 }
