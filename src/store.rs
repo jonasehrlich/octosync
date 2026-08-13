@@ -54,10 +54,6 @@ impl User {
         self.home_dir().join(".ssh")
     }
 
-    pub fn public_keys_url(&self) -> String {
-        format!("https://github.com/{}.keys", self.name)
-    }
-
     /// Get the GitHub user ID
     pub fn id(&self) -> octocrab::models::UserId {
         self.id
@@ -151,26 +147,21 @@ impl UserStore {
     }
 
     pub async fn save(&self) -> anyhow::Result<()> {
-        use tokio::io::AsyncWriteExt as _;
-
         let content = serde_json::to_string_pretty(&self.users)?;
         let path = self.path();
-        // Write to a temporary file and rename it into place, so a failed write (e.g. on a
-        // full disk) can not truncate the existing database
-        let tmp_path = self.dir.join(format!("{USERS_FILE_NAME}.tmp"));
-        let result = async {
-            let mut file = fs::File::create(&tmp_path).await?;
-            file.write_all(content.as_bytes()).await?;
-            file.sync_all().await?;
-            drop(file);
-            fs::rename(&tmp_path, &path).await
-        }
-        .await;
-        if result.is_err() {
-            let _ = fs::remove_file(&tmp_path).await;
-        }
-        result
-            .with_context(|| format!("Failed to write users database file '{}'", path.display()))?;
+        // Stage in a temporary file that atomically replaces the database on commit, so a
+        // failed write (e.g. on a full disk) can not truncate it
+        let dest = path.clone();
+        tokio::task::spawn_blocking(move || {
+            use std::io::Write as _;
+
+            let mut file = atomic_write_file::AtomicWriteFile::open(&dest)?;
+            file.write_all(content.as_bytes())?;
+            file.commit()
+        })
+        .await
+        .context("Atomic write task failed")?
+        .with_context(|| format!("Failed to write users database file '{}'", path.display()))?;
         Ok(())
     }
 

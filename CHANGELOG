@@ -10,6 +10,16 @@
 - A failed authorized keys fetch no longer fails user processing; the existing `authorized_keys`
   file is kept and the fetch is retried on the next sync.
   [#15](https://github.com/jonasehrlich/octosync/pull/15)
+- Fetch public keys through the authenticated GitHub client instead of the anonymous, rate-limited
+  `https://github.com/<login>.keys` endpoint [#15](https://github.com/jonasehrlich/octosync/pull/15)
+- Validate fetched public keys, skipping malformed entries
+  [#15](https://github.com/jonasehrlich/octosync/pull/15)
+- Manage fetched keys in a marked, octosync-managed block inside `authorized_keys`
+  [#15](https://github.com/jonasehrlich/octosync/pull/15)
+- Write `authorized_keys` atomically, never follow symlinks and enforce exact permissions on `.ssh`
+  and `authorized_keys` [#15](https://github.com/jonasehrlich/octosync/pull/15)
+- Add request timeouts to the GitHub client and bound the sync concurrency
+  [#15](https://github.com/jonasehrlich/octosync/pull/15)
 
 ## v0.3.0
 

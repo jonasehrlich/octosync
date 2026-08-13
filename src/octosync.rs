@@ -1,5 +1,5 @@
 use crate::{
-    GlobalArgs, InstallationClientArgs, SyncArgs, store,
+    GlobalArgs, InstallationClientArgs, SyncArgs, public_keys, store,
     user_manager::{
         self, CreateUser as _, DeleteUser as _, ManageAuthorizedKeys as _,
         ManageSupplementaryGroups as _, UpdateUser as _,
@@ -7,16 +7,21 @@ use crate::{
 };
 use anyhow::Context as _;
 use futures::{StreamExt as _, stream};
-use std::{collections, path, sync};
+use std::{collections, path, sync, time};
 use tokio::fs;
 
 /// Maximum number of user deletions that run concurrently. Each deletion archives the
 /// user's home directory, which is disk- and CPU-heavy, so it is not unbounded.
 const MAX_CONCURRENT_DELETES: usize = 4;
 
-/// Maximum number of users that are processed concurrently. Processing a user talks
-/// to GitHub and spawns system commands, so it is not unbounded.
-const MAX_CONCURRENT_USER_SYNCS: usize = 32;
+/// Maximum number of users processed concurrently during a sync. Bounds the number of
+/// GitHub requests and user management commands in flight at the same time.
+const MAX_CONCURRENT_USER_SYNCS: usize = 8;
+
+/// Timeout for establishing a connection to the GitHub API
+const CONNECT_TIMEOUT: time::Duration = time::Duration::from_secs(10);
+/// Timeout for individual socket reads/writes, so a hung request cannot stall the sync forever
+const READ_WRITE_TIMEOUT: time::Duration = time::Duration::from_secs(30);
 
 async fn org_client(args: &InstallationClientArgs) -> anyhow::Result<octocrab::Octocrab> {
     let private_key = fs::read(args.private_key.as_path())
@@ -31,6 +36,9 @@ async fn org_client(args: &InstallationClientArgs) -> anyhow::Result<octocrab::O
 
     let app_client = octocrab::Octocrab::builder()
         .app(args.app_id, jwt)
+        .set_connect_timeout(Some(CONNECT_TIMEOUT))
+        .set_read_timeout(Some(READ_WRITE_TIMEOUT))
+        .set_write_timeout(Some(READ_WRITE_TIMEOUT))
         .build()
         .with_context(|| {
             format!(
@@ -75,11 +83,12 @@ impl Octosync {
 
     #[tracing::instrument(
         name = "Octosync::process_user",
-        skip(self, gh_user, store),
+        skip_all,
         fields(user = %gh_user.login, id = gh_user.id.into_inner(), )
     )]
     async fn process_user(
         &self,
+        octocrab: &octocrab::Octocrab,
         gh_user: &octocrab::models::Author,
         store: &store::UserStore,
         groups: &[String],
@@ -94,13 +103,24 @@ impl Octosync {
             .await
             .context("Failed to sync supplementary groups")?;
 
-        // A failed keys fetch must not fail user processing: the existing
-        // authorized_keys file stays in place and the fetch is retried on the next sync.
-        if let Err(e) = self.user_manager.update_authorized_keys(&new_user).await {
-            tracing::error!(
-                "Failed to sync SSH keys, keeping existing authorized_keys: {:?}",
-                e
-            );
+        // A failed fetch must not fail processing the user: the authorized_keys file keeps its
+        // current keys and is refreshed on the next sync
+        match public_keys::PublicKeys::fetch(octocrab, new_user.name()).await {
+            Ok(keys) => {
+                if keys.is_empty() {
+                    tracing::warn!("User has no public keys on GitHub");
+                }
+                self.user_manager
+                    .update_authorized_keys(&new_user, &keys)
+                    .await
+                    .context("Failed to sync SSH keys")?;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to fetch public keys, not updating authorized_keys: {:#}",
+                    e
+                );
+            }
         }
         Ok(new_user)
     }
@@ -152,7 +172,7 @@ impl Octosync {
         self.user_manager.ensure_groups_exists(&groups).await?;
 
         let mut new_store = self
-            .process_members(&org_members, &old_store, &groups)
+            .process_members(&octocrab, &org_members, &old_store, &groups)
             .await?;
 
         let (users_to_retry, users_to_delete) =
@@ -186,6 +206,7 @@ impl Octosync {
     /// decides which users are deleted.
     async fn process_members(
         &self,
+        octocrab: &octocrab::Octocrab,
         org_members: &[octocrab::models::Author],
         store: &store::UserStore,
         groups: &[String],
@@ -193,7 +214,7 @@ impl Octosync {
         let mut new_store = store::UserStore::new(&self.data_dir).await?;
         *new_store.data_mut() = stream::iter(org_members)
             .map(|gh_user| async move {
-                self.process_user(gh_user, store, groups)
+                self.process_user(octocrab, gh_user, store, groups)
                     .await
                     .inspect_err(|e| {
                         tracing::error!("Failed to process user '{}': {:?}", gh_user.login, e);
