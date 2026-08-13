@@ -1,4 +1,5 @@
 use crate::store;
+use std::path;
 
 pub trait CreateUser {
     /// Creates a platform user for the given GitHub user.
@@ -43,19 +44,27 @@ pub enum PlatformUserManager {
     Mock(mock::MockUserManager),
 }
 
+#[bon::bon]
 impl PlatformUserManager {
-    pub fn new(dry_run: bool) -> Self {
+    #[builder]
+    pub fn new(
+        /// Directory where home directories of deleted users are archived
+        home_archive_dir: path::PathBuf,
+        /// Preview actions without changing users, groups or files on the system
+        dry_run: bool,
+    ) -> Self {
         if dry_run {
             return Self::Mock(mock::MockUserManager::new(1000));
         }
 
         #[cfg(target_os = "linux")]
         {
-            Self::Linux(linux::LinuxUserManager::new())
+            Self::Linux(linux::LinuxUserManager::new(home_archive_dir))
         }
 
         #[cfg(not(target_os = "linux"))]
         {
+            let _ = home_archive_dir;
             Self::Mock(mock::MockUserManager::new(1000))
         }
     }
@@ -138,12 +147,15 @@ mod linux {
     #[derive(Clone, Debug)]
     pub struct LinuxUserManager {
         http_client: reqwest::Client,
+        /// Directory where home directories of deleted users are archived
+        home_archive_dir: path::PathBuf,
     }
 
     impl LinuxUserManager {
-        pub fn new() -> Self {
+        pub fn new(home_archive_dir: path::PathBuf) -> Self {
             Self {
                 http_client: reqwest::Client::new(),
+                home_archive_dir,
             }
         }
     }
@@ -211,34 +223,79 @@ mod linux {
     impl DeleteUser for LinuxUserManager {
         #[tracing::instrument(name = "UserManager::delete_user", skip(self, user), fields(user = %user.name()))]
         async fn delete_user(&self, user: &store::User) -> anyhow::Result<()> {
-            // Before deleting the user, we need to kill all their processes to ensure there are no running processes that would prevent deletion
-            if let Some(linux_user) = nix::unistd::User::from_uid(user.uid())? {
-                kill_processes_for_user(&linux_user).await?;
-            } else {
-                tracing::warn!(
-                    "User not found in system when attempting to delete. Skipping process kill.",
+            // userdel operates on the account name, so resolve the account the same way to
+            // guarantee the home directory that is archived is the one userdel --remove deletes
+            let Some(linux_user) = nix::unistd::User::from_name(user.name())? else {
+                // The account may exist under a different name, e.g. when a usermod rename
+                // succeeded but the store update was lost. Whether that is this user or an
+                // unrelated account that reuses the UID can not be decided here, refuse
+                // instead of orphaning the account or deleting a wrong one.
+                if let Some(other_user) = nix::unistd::User::from_uid(user.uid())? {
+                    anyhow::bail!(
+                        "No user named '{}' in the system, but UID {} belongs to '{}', refusing to delete",
+                        user.name(),
+                        user.uid(),
+                        other_user.name
+                    );
+                }
+                tracing::warn!("User not found in system when attempting to delete, nothing to do");
+                return Ok(());
+            };
+            if linux_user.uid != user.uid() {
+                anyhow::bail!(
+                    "User '{}' has UID {} in the system but UID {} in the store, refusing to delete",
+                    user.name(),
+                    linux_user.uid,
+                    user.uid()
                 );
             }
 
-            let proc = process::Command::new("/usr/sbin/userdel")
-                .arg("--remove")
-                .arg(user.name())
-                .output();
+            // Before deleting the user, we need to kill all their processes to ensure there are no running processes that would prevent deletion
+            kill_processes_for_user(&linux_user).await?;
 
-            let o = proc
-                .await
-                .context("Failed to wait for userdel command to finish")?;
-
-            if o.status.success() {
-                tracing::info!("Deleted user");
-                Ok(())
-            } else {
-                Err(anyhow::anyhow!(
-                    "Failed to delete user '{}': {}",
-                    user.name(),
-                    String::from_utf8_lossy(&o.stderr)
-                ))
+            // Archive the home directory before userdel --remove deletes it. If archiving
+            // fails, bail out so the user stays in the store and deletion is retried later.
+            let receipt =
+                crate::archiver::archive_home_dir(&self.home_archive_dir, user, &linux_user.dir)
+                    .await
+                    .context("Home directory was not archived, not deleting user")?;
+            if let Some(archive_path) = receipt.archive_path() {
+                tracing::info!(
+                    "Archived home directory '{}' to '{}'",
+                    linux_user.dir.display(),
+                    archive_path.display()
+                );
             }
+
+            remove_account(user, receipt).await
+        }
+    }
+
+    /// Remove the platform account of a user with `userdel --remove`. Taking an
+    /// [`crate::archiver::ArchiveReceipt`] forces the home directory to be archived before
+    /// the account and its home directory can be deleted.
+    async fn remove_account(
+        user: &store::User,
+        _archived: crate::archiver::ArchiveReceipt,
+    ) -> anyhow::Result<()> {
+        let proc = process::Command::new("/usr/sbin/userdel")
+            .arg("--remove")
+            .arg(user.name())
+            .output();
+
+        let o = proc
+            .await
+            .context("Failed to wait for userdel command to finish")?;
+
+        if o.status.success() {
+            tracing::info!("Deleted user");
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "Failed to delete user '{}': {}",
+                user.name(),
+                String::from_utf8_lossy(&o.stderr)
+            ))
         }
     }
 
@@ -578,7 +635,7 @@ mod mock {
     impl DeleteUser for MockUserManager {
         #[tracing::instrument(name = "UserManager::delete_user", skip(self, user), fields(user = %user.name()))]
         async fn delete_user(&self, user: &store::User) -> anyhow::Result<()> {
-            tracing::info!("Would delete user");
+            tracing::info!("Would archive home directory and delete user");
             Ok(())
         }
     }

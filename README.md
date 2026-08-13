@@ -31,6 +31,18 @@ the instructions below.
 octosync sync --org \<org-name\> --app-id \<app-id\> --private-key \<private-key.pem\>
 ```
 
+### Home directory archives
+
+Before a user is deleted, their home directory is archived to
+`<data-dir>/home-archive/<user>-<uid>-<timestamp>.tar.gz`. The archive directory and the
+archives are owned by root with permissions `700` and `600` respectively, so only root can
+access them. If archiving fails, the user is not deleted and the deletion is retried on the
+next sync.
+
+Sockets and other special files cannot be stored in a tar archive and are skipped with a
+warning. Only the three most recent archives are kept per user, older ones are pruned after
+a successful archive. In dry-run mode, archiving is neither performed nor validated.
+
 ## Development
 
 When developing on Linux, you can run the application directly using `cargo run`. For
@@ -48,4 +60,10 @@ Build for the target platform using
 
 ```sh
 cargo zigbuild --target \<target-triple\>
+```
+
+e.g:
+
+```sh
+cargo zigbuild --target aarch64-unknown-linux-gnu
 ```
