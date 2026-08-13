@@ -21,7 +21,7 @@
 - Add request timeouts to the GitHub client and bound the sync concurrency
   [#15](https://github.com/jonasehrlich/octosync/pull/15)
 - Refuse a sync that would delete every stored user
-  [#11](https://github.com/jonasehrlich/octosync/issues/11)
+  [#17](https://github.com/jonasehrlich/octosync/pull/17)
 
 ## v0.3.0
 
