@@ -22,3 +22,11 @@ repos:
         name: rust:check
       - id: clippy
         name: rust:lint
+  - repo: https://github.com/hukkin/mdformat
+    rev: 1.0.0
+    hooks:
+      - id: mdformat
+        args: [--number, --wrap, "100", --end-of-line, lf]
+        additional_dependencies:
+          - mdformat-myst
+          - mdformat-gfm-alerts
