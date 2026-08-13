@@ -109,8 +109,8 @@ struct GlobalArgs {
     verbose: bool,
 }
 
-/// Sync the members of a GitHub organization with Linux user accounts for new members,
-/// installing their public keys for SSH access.
+/// Sync the members of a GitHub organization with Linux user accounts and manage
+/// their authorized SSH keys
 #[derive(clap::Parser, Debug)]
 #[command(version)]
 struct Cli {
