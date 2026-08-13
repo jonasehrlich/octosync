@@ -151,8 +151,26 @@ impl UserStore {
     }
 
     pub async fn save(&self) -> anyhow::Result<()> {
+        use tokio::io::AsyncWriteExt as _;
+
         let content = serde_json::to_string_pretty(&self.users)?;
-        fs::write(self.path(), content).await?;
+        let path = self.path();
+        // Write to a temporary file and rename it into place, so a failed write (e.g. on a
+        // full disk) can not truncate the existing database
+        let tmp_path = self.dir.join(format!("{USERS_FILE_NAME}.tmp"));
+        let result = async {
+            let mut file = fs::File::create(&tmp_path).await?;
+            file.write_all(content.as_bytes()).await?;
+            file.sync_all().await?;
+            drop(file);
+            fs::rename(&tmp_path, &path).await
+        }
+        .await;
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp_path).await;
+        }
+        result
+            .with_context(|| format!("Failed to write users database file '{}'", path.display()))?;
         Ok(())
     }
 
