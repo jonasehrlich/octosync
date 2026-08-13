@@ -10,6 +10,10 @@ use futures::{StreamExt as _, stream};
 use std::{collections, path, sync};
 use tokio::fs;
 
+/// Maximum number of user deletions that run concurrently. Each deletion archives the
+/// user's home directory, which is disk- and CPU-heavy, so it is not unbounded.
+const MAX_CONCURRENT_DELETES: usize = 4;
+
 async fn org_client(args: &InstallationClientArgs) -> anyhow::Result<octocrab::Octocrab> {
     let private_key = fs::read(args.private_key.as_path())
         .await
@@ -178,14 +182,20 @@ impl Octosync {
                 .values()
                 .filter(|user| !new_store.data().contains_key(&user.id())),
         )
-        .filter_map(|u| async {
-            self_arc
-                .user_manager
-                .delete_user(u)
-                .await
-                .map_err(|_| u.clone())
-                .err()
+        .map(|u| {
+            let user_manager = &self_arc.user_manager;
+            async move {
+                user_manager
+                    .delete_user(u)
+                    .await
+                    .map_err(|_| u.clone())
+                    .err()
+            }
         })
+        // Deletion archives the user's home directory, which can take a while for large
+        // home directories, run a few deletions concurrently
+        .buffer_unordered(MAX_CONCURRENT_DELETES)
+        .filter_map(|res| async move { res })
         .collect::<Vec<_>>()
         .await;
 
@@ -204,33 +214,26 @@ impl Octosync {
     #[tracing::instrument(name = "Octosync::delete", skip(self))]
     pub async fn delete(&self) -> anyhow::Result<()> {
         let mut store = store::UserStore::from_dir(&self.data_dir).await?;
-        let mut set: tokio::task::JoinSet<_> = store
-            .data()
-            .values()
+        let deleted_users: Vec<_> = stream::iter(store.data().values())
             .map(|user| {
-                let user = user.clone();
-                let user_manager = self.user_manager.clone();
+                let user_manager = &self.user_manager;
                 async move {
-                    user_manager.delete_user(&user).await.inspect_err(|e| {
-                        tracing::error!("Failed to delete user '{}': {:?}", user.name(), e);
-                    })?;
-                    Ok::<store::User, anyhow::Error>(user)
+                    user_manager
+                        .delete_user(user)
+                        .await
+                        .inspect_err(|e| {
+                            tracing::error!("Failed to delete user '{}': {:?}", user.name(), e);
+                        })
+                        .ok()
+                        .map(|()| user.id())
                 }
             })
-            .collect();
-
-        while let Some(res) = set.join_next().await {
-            match res {
-                Ok(Ok(user)) => {
-                    store.data_mut().remove(&user.id());
-                }
-                Ok(Err(e)) => {
-                    tracing::error!("Failed to delete user: {:?}", e);
-                }
-                Err(e) => {
-                    tracing::error!("Task join error while deleting user: {:?}", e);
-                }
-            };
+            .buffer_unordered(MAX_CONCURRENT_DELETES)
+            .filter_map(|res| async move { res })
+            .collect()
+            .await;
+        for id in deleted_users {
+            store.data_mut().remove(&id);
         }
 
         if store.data().is_empty() {
