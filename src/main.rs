@@ -6,6 +6,8 @@ use fs2::FileExt as _;
 use std::str::FromStr;
 use std::{fs, path, sync};
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod archiver;
 mod octosync;
 mod public_keys;
 mod store;

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Archive home directories of deleted users in the data directory
+
 ## v0.3.0
 
 - Added a `--version` flag to display the current version of the application.

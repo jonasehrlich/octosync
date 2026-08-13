@@ -55,7 +55,10 @@ impl Octosync {
         global_config: sync::Arc<GlobalArgs>,
         data_dir: &path::Path,
     ) -> anyhow::Result<Self> {
-        let user_manager = user_manager::PlatformUserManager::new(global_config.dry_run);
+        let user_manager = user_manager::PlatformUserManager::builder()
+            .dry_run(global_config.dry_run)
+            .home_archive_dir(data_dir.join("home-archive"))
+            .build();
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
             user_manager,
