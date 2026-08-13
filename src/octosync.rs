@@ -153,6 +153,16 @@ impl Octosync {
             store::UserStore::from_dir(&self.data_dir)
         )?;
         tracing::info!("Successfully retrieved {} members", org_members.len());
+
+        if org_members.is_empty() && !old_store.data().is_empty() {
+            anyhow::bail!(
+                "Refusing to sync: org '{}' returned no members while {} users are stored. \
+                 Run the 'delete' command to remove all users intentionally.",
+                args.octocrab.org,
+                old_store.data().len()
+            );
+        }
+
         let org_member_map: collections::HashMap<octocrab::models::UserId, String> =
             collections::HashMap::from_iter(
                 org_members.iter().map(|user| (user.id, user.login.clone())),
@@ -184,6 +194,21 @@ impl Octosync {
                 user.name()
             );
             new_store.data_mut().insert(user.id(), user.clone());
+        }
+
+        if would_delete_all_users(old_store.data(), &users_to_delete) {
+            for user in users_to_delete {
+                new_store.data_mut().insert(user.id(), user.clone());
+            }
+            new_store.save().await?;
+            anyhow::bail!(
+                "Refusing to delete all {} stored users in a single sync. None of them is in \
+                 the fetched member list of org '{}' ({} members). All users are kept in \
+                 the store; run the 'delete' command to remove them intentionally.",
+                old_store.data().len(),
+                args.octocrab.org,
+                org_members.len()
+            );
         }
 
         for user in self.delete_users(users_to_delete).await {
@@ -300,6 +325,19 @@ fn partition_stale_users<'a>(
         .partition(|user| org_member_map.contains_key(&user.id()))
 }
 
+/// Circuit breaker for [`Octosync::sync`]. True when the pending deletions would empty
+/// a non-empty store.
+///
+/// A member list that no longer contains a single stored user is far more likely a
+/// mis-scoped installation, an org rename or an empty-but-successful API response than
+/// every member leaving at once, so such a sync must refuse to delete anyone.
+fn would_delete_all_users(
+    old_users: &collections::HashMap<octocrab::models::UserId, store::User>,
+    users_to_delete: &[&store::User],
+) -> bool {
+    !users_to_delete.is_empty() && users_to_delete.len() == old_users.len()
+}
+
 async fn get_all_org_members(
     octocrab: &octocrab::Octocrab,
     org: &str,
@@ -403,6 +441,22 @@ mod tests {
             assert_eq!(delete, vec![&left]);
         }
 
+        /// The successful-but-empty member list: `sync()` bails on this before
+        /// processing, but the circuit breaker must still trip as defense in depth.
+        #[test]
+        fn empty_member_list_puts_all_users_in_delete_bucket_and_trips_guard() {
+            let users = [user(1, "a"), user(2, "b")];
+            let old = user_map(&users);
+            let new = user_map(&[]);
+            let members = member_map(&[]);
+
+            let (retry, delete) = partition_stale_users(&old, &new, &members);
+
+            assert!(retry.is_empty());
+            assert_eq!(delete.len(), 2);
+            assert!(would_delete_all_users(&old, &delete));
+        }
+
         #[test]
         fn new_member_in_new_store_only_is_untouched() {
             let joined = user(1, "a");
@@ -414,6 +468,46 @@ mod tests {
 
             assert!(retry.is_empty());
             assert!(delete.is_empty());
+        }
+    }
+
+    mod deletes_entire_store {
+        use super::*;
+
+        #[test]
+        fn deleting_every_stored_user_trips_the_guard() {
+            let users = [user(1, "a"), user(2, "b")];
+            let old = user_map(&users);
+            let delete: Vec<&store::User> = old.values().collect();
+
+            assert!(would_delete_all_users(&old, &delete));
+        }
+
+        #[test]
+        fn deleting_a_subset_is_allowed() {
+            let users = [user(1, "a"), user(2, "b")];
+            let old = user_map(&users);
+            let delete = vec![&old[&octocrab::models::UserId(1)]];
+
+            assert!(!would_delete_all_users(&old, &delete));
+        }
+
+        #[test]
+        fn nothing_to_delete_is_allowed() {
+            let old = user_map(&[user(1, "a")]);
+
+            assert!(!would_delete_all_users(&old, &[]));
+        }
+
+        /// A single-user store where that user really left still trips the guard;
+        /// the explicit delete command is the intentional path for this case.
+        #[test]
+        fn deleting_the_only_stored_user_trips_the_guard() {
+            let only = user(1, "a");
+            let old = user_map(std::slice::from_ref(&only));
+            let delete: Vec<&store::User> = old.values().collect();
+
+            assert!(would_delete_all_users(&old, &delete));
         }
     }
 }
