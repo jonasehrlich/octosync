@@ -49,9 +49,9 @@ pub struct ExpireAccount {
 #[hannibal::message(response = anyhow::Result<PurgeOutcome>)]
 pub struct PurgeAccount {
     pub user: store::User,
-    /// Latest shadow-expiry day an account may have to be purged.
+    /// Purge the account if it has been expired since before this timestamp.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub expired_before: i64,
+    pub expired_before: chrono::DateTime<chrono::Utc>,
 }
 
 /// Result of checking and applying a [`PurgeAccount`] operation.

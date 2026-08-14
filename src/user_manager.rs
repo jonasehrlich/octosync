@@ -116,7 +116,7 @@ impl UserManager {
     pub async fn purge_user(
         &self,
         user: &store::User,
-        expired_before: i64,
+        expired_before: chrono::DateTime<chrono::Utc>,
     ) -> anyhow::Result<PurgeOutcome> {
         self.purge_account
             .call(PurgeAccount {

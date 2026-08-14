@@ -263,7 +263,6 @@ impl Octosync {
     ) -> anyhow::Result<()> {
         let now = chrono::Utc::now();
         let cutoff = now - chrono::Duration::days(purge_after_days.into());
-        let expired_before = cutoff.timestamp() / (24 * 60 * 60);
 
         let candidates: Vec<store::User> = store
             .departed()
@@ -275,7 +274,7 @@ impl Octosync {
             .collect();
 
         for user in candidates {
-            match self.user_manager.purge_user(&user, expired_before).await {
+            match self.user_manager.purge_user(&user, cutoff).await {
                 Ok(user_manager::PurgeOutcome::Purged) => {
                     tracing::info!(
                         user = %user.name(),

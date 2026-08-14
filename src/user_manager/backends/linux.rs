@@ -805,27 +805,18 @@ async fn sync_user_supplementary_groups_by_name(
     }
 }
 
-const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
-
-fn days_since_epoch() -> anyhow::Result<i64> {
-    let days = time::SystemTime::now()
-        .duration_since(time::UNIX_EPOCH)
-        .context("System time is before the epoch")?
-        .as_secs()
-        / SECONDS_PER_DAY;
-    Ok(days as i64)
-}
+const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
 
 /// Expire the account as of yesterday; existing sessions are handled separately.
 async fn expire_account(name: &str) -> anyhow::Result<()> {
-    let expire_days = days_since_epoch()? - 1;
-    if account_is_expired(name, expire_days)? {
+    let expire_at = chrono::Utc::now() - chrono::Duration::days(1);
+    if account_is_expired(name, expire_at)? {
         return Ok(());
     }
     let output = process::Command::new("/usr/sbin/usermod")
         .arg("--expiredate")
         // Use epoch days to avoid YYYY-MM-DD timezone interpretation.
-        .arg(expire_days.to_string())
+        .arg(shadow_days(expire_at).to_string())
         .arg(name)
         .output()
         .await
@@ -844,7 +835,7 @@ async fn expire_account(name: &str) -> anyhow::Result<()> {
 
 /// Clear an effective expiry while preserving a future scheduled expiry.
 async fn clear_departure_expiry(name: &str) -> anyhow::Result<()> {
-    if !account_is_expired(name, days_since_epoch()?)? {
+    if !account_is_expired(name, chrono::Utc::now())? {
         return Ok(());
     }
 
@@ -867,9 +858,13 @@ async fn clear_departure_expiry(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Whether the shadow expiry is on or before `as_of_days`.
-fn account_is_expired(name: &str, as_of_days: i64) -> anyhow::Result<bool> {
-    Ok(account_expire_days(name)?.is_some_and(|expire_days| expire_days <= as_of_days))
+/// Whether the shadow expiry is on or before `as_of`.
+fn account_is_expired(name: &str, as_of: chrono::DateTime<chrono::Utc>) -> anyhow::Result<bool> {
+    Ok(account_expire_days(name)?.is_some_and(|expire_days| expire_days <= shadow_days(as_of)))
+}
+
+fn shadow_days(timestamp: chrono::DateTime<chrono::Utc>) -> i64 {
+    timestamp.timestamp().div_euclid(SECONDS_PER_DAY)
 }
 
 /// Read the shadow expiry as days since the epoch through libc's `getspnam`.
