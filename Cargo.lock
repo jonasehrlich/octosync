@@ -1624,6 +1624,7 @@ dependencies = [
  "futures",
  "hannibal",
  "jsonwebtoken",
+ "libc",
  "nix",
  "octocrab",
  "procfs",

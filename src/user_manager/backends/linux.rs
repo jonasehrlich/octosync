@@ -46,6 +46,10 @@ impl hannibal::Handler<CreateUser> for LinuxUserManager {
                 "User already exists. Skipping creation."
             );
 
+            // The adopted account may carry the expiry of a failed deletion whose
+            // store entry is gone, e.g. after the delete command wiped the store
+            clear_deletion_expiry(&existing_user.name).await?;
+
             return Ok(store::User::builder()
                 .id(user.id)
                 .uid(existing_user.uid)
@@ -161,6 +165,10 @@ impl hannibal::Handler<UpdateUser> for LinuxUserManager {
             );
         }
 
+        // The account may still carry the expiry of a deletion that failed after
+        // PrepareUserDeletion, e.g. when the user left and rejoined within one window
+        clear_deletion_expiry(&linux_user.name).await?;
+
         if gh_user.login == linux_user.name {
             // Rebuild the entry from the system account, healing a stored name that a
             // lost store update after a rename left stale
@@ -224,6 +232,11 @@ impl hannibal::Handler<PrepareUserDeletion> for LinuxUserManager {
             tracing::warn!("User not found in system when attempting to delete, nothing to do");
             return Ok(DeletionPreparation::NothingToDo);
         };
+
+        // The password is locked, but pubkey SSH keeps working while the home directory
+        // is archived. Expire the account before the sweep so no new session can start
+        // anywhere in the deletion window.
+        expire_account(&linux_user.name).await?;
 
         // Kill all of the user's processes so none can block the deletion or keep
         // writing to the home directory while it is archived
@@ -465,6 +478,100 @@ async fn sync_user_supplementary_groups_by_name(
             String::from_utf8_lossy(&output.stderr)
         ))
     }
+}
+
+const SECONDS_PER_DAY: u64 = 86_400;
+
+/// Today as the day number since the epoch, the unit of the shadow expiry field
+fn days_since_epoch() -> anyhow::Result<i64> {
+    let days = time::SystemTime::now()
+        .duration_since(time::UNIX_EPOCH)
+        .context("System time is before the epoch")?
+        .as_secs()
+        / SECONDS_PER_DAY;
+    Ok(days as i64)
+}
+
+/// Expire the account so no new session (password or pubkey SSH) can start while its
+/// deletion is in progress. Sessions already running are handled by the process sweep.
+///
+/// The expiry is set to the day before the deletion: the shadow field has day
+/// granularity and some login paths treat an account as expired only strictly after
+/// its date, so the deletion day itself could keep logins open until midnight.
+async fn expire_account(name: &str) -> anyhow::Result<()> {
+    let expire_days = days_since_epoch()? - 1;
+    let output = process::Command::new("/usr/sbin/usermod")
+        .arg("--expiredate")
+        // shadow parses a plain number as days since the epoch, which sidesteps the
+        // timezone interpretation of a YYYY-MM-DD date. chage displays it as a date.
+        .arg(expire_days.to_string())
+        .arg(name)
+        .output()
+        .await
+        .context("Failed to execute usermod command for account expiry")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to expire account '{}': {}",
+            name,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    tracing::info!("Expired account so no new session can start during deletion");
+    Ok(())
+}
+
+/// Lift an expiry that is already in effect, so a user whose account survived a failed
+/// deletion and who is synced again is not locked out silently. An expiry in the
+/// future is an operator's scheduled offboarding and stays.
+///
+/// octosync owns the account lifecycle of synced users, so a past expiry set by an
+/// operator does not survive a sync either. Suspending a member is done by removing
+/// them from the org.
+async fn clear_deletion_expiry(name: &str) -> anyhow::Result<()> {
+    let Some(expire_days) = account_expire_days(name)? else {
+        return Ok(());
+    };
+    if expire_days > days_since_epoch()? {
+        return Ok(());
+    }
+
+    let output = process::Command::new("/usr/sbin/usermod")
+        .arg("--expiredate")
+        .arg("")
+        .arg(name)
+        .output()
+        .await
+        .context("Failed to execute usermod command to clear the account expiry")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to clear the expiry of account '{}': {}",
+            name,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    tracing::info!("Cleared the expiry of the re-activated account");
+    Ok(())
+}
+
+/// The account's expiry as days since the epoch, `None` when no expiry is set, read
+/// through the same NSS lookup the passwd queries of this module use.
+fn account_expire_days(name: &str) -> anyhow::Result<Option<i64>> {
+    let c_name = std::ffi::CString::new(name).context("User name contains an interior NUL byte")?;
+    // SAFETY: getspnam returns a pointer into static storage, which is only unsound
+    // when another thread calls it concurrently. Every call site runs on the user
+    // manager actor, which processes one message at a time.
+    let entry = unsafe { libc::getspnam(c_name.as_ptr()) };
+    if entry.is_null() {
+        // No shadow entry means no expiry to consider
+        return Ok(None);
+    }
+    // SAFETY: checked to be non-null above, and the field is copied out before any
+    // following getspnam call can overwrite the storage
+    let expire_days = unsafe { (*entry).sp_expire };
+    // An empty expiry field is reported as -1
+    Ok((expire_days >= 0).then_some(expire_days))
 }
 
 /// Grace period a SIGTERM'd process gets to exit before it is killed

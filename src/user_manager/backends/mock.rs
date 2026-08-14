@@ -93,7 +93,7 @@ impl hannibal::Handler<PrepareUserDeletion> for MockUserManager {
         _ctx: &mut hannibal::Context<Self>,
         msg: PrepareUserDeletion,
     ) -> anyhow::Result<DeletionPreparation> {
-        tracing::info!("Would archive home directory and delete user");
+        tracing::info!("Would expire the account, archive the home directory and delete the user");
         Ok(DeletionPreparation::NothingToDo)
     }
 }

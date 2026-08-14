@@ -23,8 +23,9 @@ pub struct UpdateUser {
 }
 
 /// Prepares the deletion of a platform user: verifies that the stored user still
-/// matches the platform account and stops everything that could block the deletion
-/// or keep writing to the home directory while it is archived.
+/// matches the platform account, expires the account so no new session can start,
+/// and stops everything that could block the deletion or keep writing to the home
+/// directory while it is archived.
 #[hannibal::message(response = anyhow::Result<DeletionPreparation>)]
 pub struct PrepareUserDeletion {
     pub user: store::User,
