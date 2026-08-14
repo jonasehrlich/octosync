@@ -46,6 +46,12 @@
   ([#22](https://github.com/jonasehrlich/octosync/pull/22))
 - The `delete` command keeps the store file and writes tombstones instead of removing `users.json`,
   preserving the UID memory of a full wipe ([#22](https://github.com/jonasehrlich/octosync/pull/22))
+- Track the primary group GID in the store and re-create a rejoining member's private group with
+  `groupadd --gid <stored>` before `useradd --gid <stored>`, so group ownership of files outside the
+  archived home directory also survives the delete and re-create cycle. A GID that meanwhile belongs
+  to another group fails the re-creation loudly instead of falling back to a fresh one. Entries
+  migrated from a v1 store carry no GID and are backfilled on their next update.
+  ([#22](https://github.com/jonasehrlich/octosync/pull/22))
 
 ## v0.3.0
 

@@ -95,17 +95,19 @@ impl UserManager {
         }
     }
 
-    /// Sends [`CreateUser`] to the actor and awaits the created user. `uid` is the
-    /// stored UID of a rejoining member, see [`CreateUser`].
+    /// Sends [`CreateUser`] to the actor and awaits the created user. `uid` and `gid`
+    /// are the stored IDs of a rejoining member, see [`CreateUser`].
     pub async fn create_user(
         &self,
         gh_user: &octocrab::models::Author,
         uid: Option<nix::unistd::Uid>,
+        gid: Option<nix::unistd::Gid>,
     ) -> anyhow::Result<store::User> {
         self.create_user
             .call(CreateUser {
                 gh_user: gh_user.clone(),
                 uid,
+                gid,
             })
             .await
             .context(ACTOR_ERROR)?

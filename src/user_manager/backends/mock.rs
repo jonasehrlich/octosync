@@ -35,14 +35,20 @@ impl hannibal::Handler<CreateUser> for MockUserManager {
                 nix::unistd::Uid::from_raw(self.next_uid as _)
             }
         };
+        // Mimic the user-private group Linux creates: same numeric ID as the user
+        let gid = msg
+            .gid
+            .unwrap_or_else(|| nix::unistd::Gid::from_raw(uid.as_raw()));
         tracing::info!(
-            "Mock creating user '{}' with UID {} (not actually creating users on non-Linux OS)",
+            "Mock creating user '{}' with UID {} and GID {} (not actually creating users on non-Linux OS)",
             msg.gh_user.login,
-            uid
+            uid,
+            gid
         );
         Ok(store::User::builder()
             .name(msg.gh_user.login.clone())
             .uid(uid)
+            .gid(gid)
             .id(msg.gh_user.id)
             .build())
     }
@@ -68,6 +74,7 @@ impl hannibal::Handler<UpdateUser> for MockUserManager {
             return Ok(store::User::builder()
                 .id(msg.available_user.id())
                 .uid(msg.available_user.uid())
+                .maybe_gid(msg.available_user.gid())
                 .name(msg.gh_user.login.clone())
                 .build());
         }
@@ -80,6 +87,7 @@ impl hannibal::Handler<UpdateUser> for MockUserManager {
             Ok(store::User::builder()
                 .id(msg.available_user.id())
                 .uid(msg.available_user.uid())
+                .maybe_gid(msg.available_user.gid())
                 .name(msg.gh_user.login.clone())
                 .build())
         } else {

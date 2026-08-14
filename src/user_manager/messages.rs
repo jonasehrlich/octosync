@@ -8,19 +8,21 @@ use std::path;
 
 /// Creates a platform user for the given GitHub user without a password.
 ///
-/// `uid` is the stored UID of a rejoining member: the account is created with exactly
-/// this UID so file ownership survives the delete and re-create cycle. When the UID is
-/// taken, creation fails instead of falling back to a fresh UID.
+/// `uid` and `gid` are the stored IDs of a rejoining member: the account is created
+/// with exactly this UID and its private group with exactly this GID, so file
+/// ownership survives the delete and re-create cycle. When either ID is taken,
+/// creation fails instead of falling back to a fresh one.
 #[hannibal::message(response = anyhow::Result<store::User>)]
 pub struct CreateUser {
     pub gh_user: octocrab::models::Author,
     pub uid: Option<nix::unistd::Uid>,
+    pub gid: Option<nix::unistd::Gid>,
 }
 
 /// Renames the platform user of `available_user` (login and home directory) to the
-/// GitHub login of `gh_user`, re-creating the account with the stored name and UID
-/// first when it no longer exists on the system. Refuses when the stored UID or name
-/// belongs to a different account.
+/// GitHub login of `gh_user`, re-creating the account with the stored name, UID and
+/// GID first when it no longer exists on the system. Refuses when the stored UID or
+/// name belongs to a different account.
 #[hannibal::message(response = anyhow::Result<store::User>)]
 pub struct UpdateUser {
     pub gh_user: octocrab::models::Author,

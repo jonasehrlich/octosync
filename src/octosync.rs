@@ -146,7 +146,11 @@ impl Octosync {
             );
         }
         self.user_manager
-            .create_user(gh_user, archived.map(store::ArchivedUser::uid))
+            .create_user(
+                gh_user,
+                archived.map(store::ArchivedUser::uid),
+                archived.and_then(store::ArchivedUser::gid),
+            )
             .await
     }
 
@@ -402,6 +406,7 @@ mod tests {
             .id(octocrab::models::UserId(id))
             .name(name.to_string())
             .uid(nix::unistd::Uid::from_raw(1000 + id as u32))
+            .gid(nix::unistd::Gid::from_raw(2000 + id as u32))
             .build()
     }
 
@@ -593,13 +598,13 @@ mod tests {
         }
 
         /// A rejoining member (present in the archived map, absent from the active
-        /// users) is created with the stored UID and their tombstone is spent.
+        /// users) is created with the stored UID and GID and their tombstone is spent.
         #[tokio::test]
-        async fn process_members_recreates_a_rejoined_member_with_the_stored_uid() {
+        async fn process_members_recreates_a_rejoined_member_with_the_stored_ids() {
             let mut actor = TestingUserManager::default();
             actor.create_user.push_back(Ok(user(1, "alice")));
             actor.sync_supplementary_groups.push_back(Ok(()));
-            let received_uids = actor.create_user_uids.clone();
+            let received_ids = actor.create_user_ids.clone();
             let (octosync, _data_dir) = octosync_with(actor);
             let mut old_store = store::UserStore::new(_data_dir.path()).await.unwrap();
             old_store.archive_user(user(1, "alice"), chrono::Utc::now());
@@ -615,8 +620,11 @@ mod tests {
                 .unwrap();
 
             assert_eq!(
-                *received_uids.lock().unwrap(),
-                [Some(nix::unistd::Uid::from_raw(1001))]
+                *received_ids.lock().unwrap(),
+                [(
+                    Some(nix::unistd::Uid::from_raw(1001)),
+                    Some(nix::unistd::Gid::from_raw(2001))
+                )]
             );
             assert!(new_store.data().contains_key(&octocrab::models::UserId(1)));
             assert!(new_store.archived().is_empty());

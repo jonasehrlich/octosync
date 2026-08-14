@@ -40,8 +40,9 @@ impl hannibal::Handler<CreateUser> for LinuxUserManager {
     ) -> anyhow::Result<store::User> {
         let user = &msg.gh_user;
         if let Ok(Some(existing_user)) = nix::unistd::User::from_name(&user.login) {
-            // Adopting an account whose UID differs from the stored one would silently
-            // recreate the ownership drift the stored UID exists to prevent
+            // Adopting an account whose UID or primary GID differs from the stored
+            // ones would silently recreate the ownership drift the stored IDs exist
+            // to prevent
             if let Some(uid) = msg.uid
                 && existing_user.uid != uid
             {
@@ -51,6 +52,17 @@ impl hannibal::Handler<CreateUser> for LinuxUserManager {
                     user.login,
                     existing_user.uid,
                     uid
+                );
+            }
+            if let Some(gid) = msg.gid
+                && existing_user.gid != gid
+            {
+                anyhow::bail!(
+                    "User '{}' already exists with primary GID {} but the store expects GID {}, \
+                     refusing to adopt the account",
+                    user.login,
+                    existing_user.gid,
+                    gid
                 );
             }
             tracing::info!(
@@ -66,25 +78,28 @@ impl hannibal::Handler<CreateUser> for LinuxUserManager {
             return Ok(store::User::builder()
                 .id(user.id)
                 .uid(existing_user.uid)
+                .gid(existing_user.gid)
                 .name(existing_user.name.clone())
                 .build());
         }
 
-        let linux_user = add_account(&user.login, msg.uid).await?;
+        let linux_user = add_account(&user.login, msg.uid, msg.gid).await?;
         Ok(store::User::builder()
             .id(user.id)
             .uid(linux_user.uid)
+            .gid(linux_user.gid)
             .name(linux_user.name.clone())
             .build())
     }
 }
 
 /// Create a platform account with `useradd` and return it. Re-creating a previously
-/// deleted account with its stored UID keeps ownership of files outside the home
-/// directory intact.
+/// deleted account with its stored UID and private-group GID keeps ownership of files
+/// outside the home directory intact.
 async fn add_account(
     login: &str,
     uid: Option<nix::unistd::Uid>,
+    gid: Option<nix::unistd::Gid>,
 ) -> anyhow::Result<nix::unistd::User> {
     let mut command = process::Command::new("/usr/sbin/useradd");
     command
@@ -95,6 +110,12 @@ async fn add_account(
         .arg("!");
     if let Some(uid) = uid {
         command.arg("--uid").arg(uid.to_string());
+    }
+    if let Some(gid) = gid {
+        // With --gid, useradd uses the given group as the primary group instead of
+        // creating a private one, so the group must exist with the stored GID first
+        ensure_private_group(login, gid).await?;
+        command.arg("--gid").arg(gid.to_string());
     }
     command.arg(login);
 
@@ -119,9 +140,9 @@ async fn add_account(
 }
 
 /// Re-create the platform account of a stored user that is gone from the system, using
-/// the stored name and UID so file ownership and a home directory that survived the
-/// deletion stay intact. A changed GitHub login is applied afterwards by the regular
-/// rename path.
+/// the stored name, UID and GID so file ownership and a home directory that survived
+/// the deletion stay intact. A changed GitHub login is applied afterwards by the
+/// regular rename path.
 async fn recreate_account(
     gh_user: &octocrab::models::Author,
     available_user: &store::User,
@@ -144,7 +165,48 @@ async fn recreate_account(
     }
 
     tracing::info!("User no longer exists in the system, re-creating with the stored UID");
-    add_account(available_user.name(), Some(available_user.uid())).await
+    add_account(
+        available_user.name(),
+        Some(available_user.uid()),
+        available_user.gid(),
+    )
+    .await
+}
+
+/// Ensure the user-private group of a re-created account exists as `login` with the
+/// stored GID, refusing when the GID meanwhile belongs to another group. Falling back
+/// to a fresh GID would leave files with the old GID group-owned by whichever group is
+/// allocated it next.
+async fn ensure_private_group(login: &str, gid: nix::unistd::Gid) -> anyhow::Result<()> {
+    if let Some(group) = nix::unistd::Group::from_gid(gid)
+        .with_context(|| format!("Failed to check whether GID {gid} is in use"))?
+    {
+        if group.name == login {
+            // Already re-created, e.g. by an attempt that failed after groupadd
+            return Ok(());
+        }
+        anyhow::bail!(
+            "GID {gid} already belongs to group '{}', refusing to re-create the private \
+             group of '{login}' with it",
+            group.name
+        );
+    }
+
+    let o = process::Command::new("/usr/sbin/groupadd")
+        .arg("--gid")
+        .arg(gid.to_string())
+        .arg(login)
+        .output()
+        .await
+        .context("Failed to wait for groupadd command to finish")?;
+    if !o.status.success() {
+        anyhow::bail!(
+            "Failed to re-create private group '{login}' with GID {gid}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
+    tracing::info!(gid = gid.as_raw(), "Re-created private group");
+    Ok(())
 }
 
 impl hannibal::Handler<UpdateUser> for LinuxUserManager {
@@ -184,11 +246,12 @@ impl hannibal::Handler<UpdateUser> for LinuxUserManager {
 
         if gh_user.login == linux_user.name {
             // Rebuild the entry from the system account, healing a stored name that a
-            // lost store update after a rename left stale
-
+            // lost store update after a rename left stale and backfilling the primary
+            // GID into entries migrated from a v1 store
             return Ok(store::User::builder()
                 .id(available_user.id())
                 .uid(linux_user.uid)
+                .gid(linux_user.gid)
                 .name(linux_user.name.clone())
                 .build());
         }
@@ -214,6 +277,7 @@ impl hannibal::Handler<UpdateUser> for LinuxUserManager {
             Ok(store::User::builder()
                 .id(available_user.id())
                 .uid(available_user.uid())
+                .gid(linux_user.gid)
                 .name(gh_user.login.clone())
                 .build())
         } else {

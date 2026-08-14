@@ -29,6 +29,27 @@ mod uid_serde {
     }
 }
 
+mod gid_serde {
+    use serde::{self, Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(gid: &Option<nix::unistd::Gid>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // Cast to u32 to keep the JSON format stable across OSs
+        #[allow(clippy::unnecessary_cast)]
+        gid.map(|gid| gid.as_raw() as u32).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<nix::unistd::Gid>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let val = Option::<u32>::deserialize(deserializer)?;
+        Ok(val.map(|val| nix::unistd::Gid::from_raw(val as _)))
+    }
+}
+
 /// Canonical representation of a user that exists both on GitHub and as a Linux user,
 /// with the necessary information to manage their Linux account and SSH keys.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, bon::Builder)]
@@ -40,6 +61,11 @@ pub struct User {
     /// Linux user UID associated with this GitHub user
     #[serde(with = "uid_serde")]
     uid: unistd::Uid,
+    /// GID of the user's primary group. `None` for entries migrated from v1, whose
+    /// account may be gone from the system and have no GID to read. Backfilled from
+    /// the system on the next update of the user.
+    #[serde(default, with = "gid_serde", skip_serializing_if = "Option::is_none")]
+    gid: Option<unistd::Gid>,
 }
 
 #[allow(unused)]
@@ -68,6 +94,11 @@ impl User {
     pub fn uid(&self) -> unistd::Uid {
         self.uid
     }
+
+    /// Get the GID of the user's primary group, if it is tracked
+    pub fn gid(&self) -> Option<unistd::Gid> {
+        self.gid
+    }
 }
 
 /// Tombstone of a user whose account octosync deleted (or is deleting). It keeps the
@@ -82,6 +113,10 @@ pub struct ArchivedUser {
     /// Linux user UID the account had, reserved for a rejoin
     #[serde(with = "uid_serde")]
     uid: unistd::Uid,
+    /// GID of the primary group the account had, reserved for a rejoin. `None` when
+    /// the user was archived before their GID was backfilled.
+    #[serde(default, with = "gid_serde", skip_serializing_if = "Option::is_none")]
+    gid: Option<unistd::Gid>,
     /// When the user was archived for deletion
     deleted_at: chrono::DateTime<chrono::Utc>,
     /// Path of the archived home directory, so a rejoin can later restore it
@@ -106,6 +141,11 @@ impl ArchivedUser {
         self.uid
     }
 
+    /// Get the GID of the primary group reserved for a rejoin, if it is tracked
+    pub fn gid(&self) -> Option<unistd::Gid> {
+        self.gid
+    }
+
     /// Get the time the user was archived for deletion
     pub fn deleted_at(&self) -> chrono::DateTime<chrono::Utc> {
         self.deleted_at
@@ -124,6 +164,7 @@ impl From<&ArchivedUser> for User {
             id: archived.id,
             name: archived.name.clone(),
             uid: archived.uid,
+            gid: archived.gid,
         }
     }
 }
@@ -206,6 +247,7 @@ impl UserStore {
                 id: user.id,
                 name: user.name,
                 uid: user.uid,
+                gid: user.gid,
                 deleted_at,
                 home_archive: None,
             },
@@ -339,6 +381,7 @@ mod tests {
             id: octocrab::models::UserId(12345),
             name: "testuser".to_string(),
             uid: unistd::Uid::from_raw(1000),
+            gid: Some(unistd::Gid::from_raw(1000)),
         }
     }
 
@@ -353,6 +396,7 @@ mod tests {
             id: octocrab::models::UserId(456),
             name: "bob".to_string(),
             uid: unistd::Uid::from_raw(1005),
+            gid: Some(unistd::Gid::from_raw(1005)),
             deleted_at: deleted_at(),
             home_archive: Some(path::PathBuf::from(
                 "/var/lib/octosync/home-archive/bob.tar.gz",
@@ -389,12 +433,26 @@ mod tests {
             let json = r#"{
                 "id": 12345,
                 "name": "testuser",
-                "uid": 1000
+                "uid": 1000,
+                "gid": 1000
             }"#;
             let expected_user = user();
 
             let user: User = serde_json::from_str(json).expect("Failed to deserialize user");
             assert_eq!(user, expected_user);
+        }
+
+        /// Entries migrated from a v1 file parse with no GID
+        #[test]
+        fn deserialization_without_gid() {
+            let json = r#"{
+                "id": 12345,
+                "name": "testuser",
+                "uid": 1000
+            }"#;
+
+            let user: User = serde_json::from_str(json).expect("Failed to deserialize user");
+            assert_eq!(user.gid, None);
         }
 
         #[test]
@@ -403,6 +461,7 @@ mod tests {
                 id: octocrab::models::UserId(99999),
                 name: "roundtripuser".to_string(),
                 uid: unistd::Uid::from_raw(2000),
+                gid: Some(unistd::Gid::from_raw(2000)),
             };
 
             let serialized = serde_json::to_string(&original).expect("Failed to serialize");
@@ -412,6 +471,17 @@ mod tests {
             assert_eq!(original.id, deserialized.id);
             assert_eq!(original.name, deserialized.name);
             assert_eq!(original.uid.as_raw(), deserialized.uid.as_raw());
+            assert_eq!(original.gid, deserialized.gid);
+        }
+
+        /// An untracked GID is omitted from the file instead of written as null
+        #[test]
+        fn missing_gid_is_omitted() {
+            let mut user = user();
+            user.gid = None;
+
+            let serialized = serde_json::to_string(&user).unwrap();
+            assert!(!serialized.contains("gid"));
         }
     }
 
@@ -454,6 +524,7 @@ mod tests {
             assert_eq!(user.id, archived.id);
             assert_eq!(user.name, archived.name);
             assert_eq!(user.uid, archived.uid);
+            assert_eq!(user.gid, archived.gid);
         }
     }
 
@@ -598,6 +669,7 @@ mod tests {
             let archived = &store.archived[&user.id];
             assert_eq!(archived.name, user.name);
             assert_eq!(archived.uid, user.uid);
+            assert_eq!(archived.gid, user.gid);
             assert_eq!(archived.deleted_at, deleted_at());
             assert_eq!(archived.home_archive, None);
         }
@@ -667,6 +739,7 @@ mod tests {
                     id: octocrab::models::UserId(1000 + i),
                     name: format!("user{}", i),
                     uid: unistd::Uid::from_raw(3000 + i as u32),
+                    gid: Some(unistd::Gid::from_raw(3000 + i as u32)),
                 };
                 store.users.insert(user.id, user);
             }
@@ -694,6 +767,7 @@ mod tests {
                 id: user.id,
                 name: user.name.clone(),
                 uid: user.uid,
+                gid: user.gid,
                 deleted_at: deleted_at(),
                 home_archive: None,
             }
