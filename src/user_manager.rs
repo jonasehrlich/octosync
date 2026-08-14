@@ -95,14 +95,17 @@ impl UserManager {
         }
     }
 
-    /// Sends [`CreateUser`] to the actor and awaits the created user.
+    /// Sends [`CreateUser`] to the actor and awaits the created user. `uid` is the
+    /// stored UID of a rejoining member, see [`CreateUser`].
     pub async fn create_user(
         &self,
         gh_user: &octocrab::models::Author,
+        uid: Option<nix::unistd::Uid>,
     ) -> anyhow::Result<store::User> {
         self.create_user
             .call(CreateUser {
                 gh_user: gh_user.clone(),
+                uid,
             })
             .await
             .context(ACTOR_ERROR)?
@@ -123,19 +126,20 @@ impl UserManager {
             .context(ACTOR_ERROR)?
     }
 
-    /// Deletes the platform user of `user`.
+    /// Deletes the platform user of `user`, returning the path of the created home
+    /// directory archive, or `None` when there was no account or nothing to archive.
     ///
     /// The actor prepares the deletion ([`PrepareUserDeletion`]) and removes the
     /// account ([`RemoveAccount`]); the disk- and CPU-heavy home directory archiving
     /// between the two runs here, outside the actor, so concurrent deletions only
     /// serialize on the account mutations themselves. A failed archive aborts the
-    /// deletion, the caller keeps the user in the store and retries on the next sync.
+    /// deletion, the caller keeps the user's tombstone and retries on the next sync.
     #[tracing::instrument(
         name = "UserManager::delete_user",
         skip_all,
         fields(user = %user.name(), uid = user.uid().as_raw())
     )]
-    pub async fn delete_user(&self, user: &store::User) -> anyhow::Result<()> {
+    pub async fn delete_user(&self, user: &store::User) -> anyhow::Result<Option<path::PathBuf>> {
         let preparation = self
             .prepare_user_deletion
             .call(PrepareUserDeletion { user: user.clone() })
@@ -143,13 +147,14 @@ impl UserManager {
             .context(ACTOR_ERROR)??;
 
         let DeletionPreparation::Prepared { home_dir } = preparation else {
-            return Ok(());
+            return Ok(None);
         };
 
         let receipt = crate::archiver::archive_home_dir(&self.home_archive_dir, user, &home_dir)
             .await
             .context("Home directory was not archived, not deleting user")?;
-        if let Some(archive_path) = receipt.archive_path() {
+        let archive_path = receipt.archive_path().map(path::Path::to_path_buf);
+        if let Some(archive_path) = &archive_path {
             tracing::info!(
                 home_dir = %home_dir.display(),
                 archive_path = %archive_path.display(),
@@ -163,7 +168,8 @@ impl UserManager {
                 receipt,
             })
             .await
-            .context(ACTOR_ERROR)?
+            .context(ACTOR_ERROR)??;
+        Ok(archive_path)
     }
 
     /// Sends [`SyncSupplementaryGroups`] to the actor and awaits the update.
@@ -450,7 +456,7 @@ mod tests {
                 let user = &user;
                 async move {
                     if i % 2 == 0 {
-                        manager.delete_user(user).await
+                        manager.delete_user(user).await.map(|_| ())
                     } else {
                         manager.sync_supplementary_groups(user, &[]).await
                     }

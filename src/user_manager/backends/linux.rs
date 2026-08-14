@@ -40,6 +40,19 @@ impl hannibal::Handler<CreateUser> for LinuxUserManager {
     ) -> anyhow::Result<store::User> {
         let user = &msg.gh_user;
         if let Ok(Some(existing_user)) = nix::unistd::User::from_name(&user.login) {
+            // Adopting an account whose UID differs from the stored one would silently
+            // recreate the ownership drift the stored UID exists to prevent
+            if let Some(uid) = msg.uid
+                && existing_user.uid != uid
+            {
+                anyhow::bail!(
+                    "User '{}' already exists with UID {} but the store expects UID {}, \
+                     refusing to adopt the account",
+                    user.login,
+                    existing_user.uid,
+                    uid
+                );
+            }
             tracing::info!(
                 user = user.login,
                 uid = existing_user.uid.as_raw(),
@@ -57,7 +70,7 @@ impl hannibal::Handler<CreateUser> for LinuxUserManager {
                 .build());
         }
 
-        let linux_user = add_account(&user.login, None).await?;
+        let linux_user = add_account(&user.login, msg.uid).await?;
         Ok(store::User::builder()
             .id(user.id)
             .uid(linux_user.uid)

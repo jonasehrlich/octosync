@@ -35,6 +35,17 @@
   home directory is archived. Syncing a user whose account survived a failed deletion lifts an
   expiry that is already in effect. A future expiry date set by an operator stays.
   ([#19](https://github.com/jonasehrlich/octosync/pull/19))
+- Store `users.json` in schema v2: users deleted by octosync are kept as tombstones under an
+  `archived` key, so a member who leaves and rejoins gets their old UID back. The v1 file is backed
+  up to `users-v1.json` once before the first v2 save.
+  ([#22](https://github.com/jonasehrlich/octosync/pull/22))
+- Save the tombstone before `userdel` runs and re-enqueue archived users whose account still exists
+  on every sync, so a deletion interrupted at any point is finished by a later sync instead of
+  orphaning a live account ([#22](https://github.com/jonasehrlich/octosync/pull/22))
+- Record the home directory archive path on the tombstone, so a rejoin can later restore it
+  ([#22](https://github.com/jonasehrlich/octosync/pull/22))
+- The `delete` command keeps the store file and writes tombstones instead of removing `users.json`,
+  preserving the UID memory of a full wipe ([#22](https://github.com/jonasehrlich/octosync/pull/22))
 
 ## v0.3.0
 

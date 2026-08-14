@@ -7,9 +7,14 @@ use crate::{archiver, public_keys, store};
 use std::path;
 
 /// Creates a platform user for the given GitHub user without a password.
+///
+/// `uid` is the stored UID of a rejoining member: the account is created with exactly
+/// this UID so file ownership survives the delete and re-create cycle. When the UID is
+/// taken, creation fails instead of falling back to a fresh UID.
 #[hannibal::message(response = anyhow::Result<store::User>)]
 pub struct CreateUser {
     pub gh_user: octocrab::models::Author,
+    pub uid: Option<nix::unistd::Uid>,
 }
 
 /// Renames the platform user of `available_user` (login and home directory) to the

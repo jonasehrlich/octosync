@@ -28,15 +28,21 @@ impl hannibal::Handler<CreateUser> for MockUserManager {
         _ctx: &mut hannibal::Context<Self>,
         msg: CreateUser,
     ) -> anyhow::Result<store::User> {
-        self.next_uid += 1;
+        let uid = match msg.uid {
+            Some(uid) => uid,
+            None => {
+                self.next_uid += 1;
+                nix::unistd::Uid::from_raw(self.next_uid as _)
+            }
+        };
         tracing::info!(
             "Mock creating user '{}' with UID {} (not actually creating users on non-Linux OS)",
             msg.gh_user.login,
-            self.next_uid
+            uid
         );
         Ok(store::User::builder()
             .name(msg.gh_user.login.clone())
-            .uid(nix::unistd::Uid::from_raw(self.next_uid as _))
+            .uid(uid)
             .id(msg.gh_user.id)
             .build())
     }
