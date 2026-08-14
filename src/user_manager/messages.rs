@@ -1,7 +1,4 @@
-//! The messages of the platform user manager contract.
-//!
-//! A platform backend is an actor handling the full message set. The messages carry
-//! owned data so they can cross the actor boundary.
+//! Owned messages forming the platform user manager contract.
 
 use crate::{public_keys, store};
 use std::collections;
@@ -16,88 +13,64 @@ pub struct CreateUser {
 /// UID and GID of the account [`CreateUser`] creates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccountIds {
-    /// The stored IDs of a rejoining member whose account is gone from the system
-    /// (purged, or removed by hand): the account is created with exactly this UID and
-    /// its private group with exactly this GID, so file ownership survives the removal
-    /// and re-create cycle. When either ID is taken, creation fails instead of falling
-    /// back to a fresh one. A tombstone migrated from v1 carries no GID and leaves the
-    /// private group to `useradd`.
+    /// Reuse a rejoining member's IDs. Fail if either is unavailable.
     Stored {
         uid: nix::unistd::Uid,
         gid: Option<nix::unistd::Gid>,
     },
-    /// System-allocated IDs for a brand-new member, avoiding the IDs reserved by
-    /// tombstones: shadow-utils allocates the highest ID in range plus one, so
-    /// purging the user with the highest UID frees exactly the next UID to be
-    /// allocated.
+    /// Allocate fresh IDs without spending those reserved by tombstones.
     Fresh {
         reserved_uids: collections::HashSet<nix::unistd::Uid>,
         reserved_gids: collections::HashSet<nix::unistd::Gid>,
     },
 }
 
-/// Renames the platform user of `available_user` (login and home directory) to the
-/// GitHub login of `gh_user`, re-creating the account with the stored name, UID and
-/// GID first when it no longer exists on the system. Refuses when the stored UID or
-/// name belongs to a different account.
+/// Reconcile a stored platform account with the current GitHub user.
+///
+/// This re-creates the account with the stored name, UID and GID first when the user no longer
+/// exists on the system. Refuses when the stored UID or name belongs to a different account.
 #[hannibal::message(response = anyhow::Result<store::User>)]
 pub struct UpdateUser {
     pub gh_user: octocrab::models::Author,
     pub available_user: store::User,
 }
 
-/// Expires the platform account of a departed user, replacing its deletion: verifies
-/// that the stored user still matches the platform account, expires it so no new
-/// session (password or pubkey SSH) can start, removes its scheduled work, ends the
-/// running sessions and strips the supplementary groups. The account, its home
-/// directory and its primary group stay on the machine as the durable departure
-/// record, so the departure is a reversible lockout that a rejoin heals, until the
-/// purge removes the account after the retention period.
+/// Reversibly expire a departed account and remove its active access.
 ///
-/// Idempotent, so an expiry interrupted at any point converges when a later sync
-/// retries it. The sync only sends it for a tombstone whose teardown has not completed
-/// yet, so the retry is driven by the store rather than by re-sending it every run.
+/// Verifies that the stored user matches the platform account and expires the account, which
+/// prevents logins and SSH key access. The account remains on the system and can be restored later.
 #[hannibal::message(response = anyhow::Result<()>)]
 pub struct ExpireAccount {
     pub user: store::User,
 }
 
-/// Permanently removes the expired platform account of a departed user with
-/// `userdel --remove`, deleting the home directory without an archive: the one
-/// deliberately irreversible operation left now that expiry replaced deletion.
-///
-/// The account-side half of the purge eligibility is verified here: the shadow expiry
-/// must be set and at most `expired_before`. It is the evidence on the machine itself
-/// that survives store damage and is cleared on any reactivation, so a wrongly
-/// resurrected tombstone can never purge a live account.
+/// Permanently remove a departed user's account and home directory once its shadow
+/// expiry meets the cutoff.
 #[hannibal::message(response = anyhow::Result<PurgeOutcome>)]
 pub struct PurgeAccount {
     pub user: store::User,
-    /// Latest shadow expiry, in days since the epoch, an account may have to be purged
+    /// Latest shadow-expiry day an account may have to be purged.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub expired_before: i64,
 }
 
-/// Outcome of [`PurgeAccount`]. Only the Linux backend can verify the account-side
-/// eligibility, the mock previews every purge as performed.
+/// Result of checking and applying a [`PurgeAccount`] operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PurgeOutcome {
-    /// The account and its home directory were removed
+    /// The account and home directory were removed.
     Purged,
-    /// No account for the user exists on the system, nothing was done
+    /// No matching account exists.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     NoAccount,
-    /// The account's shadow expiry is missing or newer than `expired_before`: the
-    /// account-side clock does not agree with the store's, nothing was done
+    /// The account expiry does not meet the cutoff.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     NotExpired,
 }
 
-/// Synchronizes the supplementary groups of a user.
+/// Replace a user's supplementary groups, excluding their primary group.
 ///
-/// octosync owns the supplementary groups of synced users: the user's memberships are
-/// replaced with `groups`, keeping only the primary group. Groups assigned through
-/// other channels are removed.
+/// All supplementary groups of synced users are managed by octosync. Any group not in the given
+/// list is removed from the user.
 #[hannibal::message(response = anyhow::Result<()>)]
 pub struct SyncSupplementaryGroups {
     pub user: store::User,
@@ -110,10 +83,8 @@ pub struct EnsureGroupsExist {
     pub groups: Vec<String>,
 }
 
-/// Replaces the octosync-managed key block in the user's authorized_keys file with the
-/// given keys, so a key revoked on GitHub is removed on the next sync. Lines outside
-/// the managed block are never touched, so keys installed through other channels stay
-/// intact.
+/// Replace the octosync-managed authorized_keys block with the current public keys of the given
+/// user.
 #[hannibal::message(response = anyhow::Result<()>)]
 pub struct UpdateAuthorizedKeys {
     pub user: store::User,

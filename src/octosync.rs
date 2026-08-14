@@ -1,24 +1,16 @@
 use crate::{
-    GlobalArgs, InstallationClientArgs, PurgeArgs, SyncArgs, groups, public_keys, store,
-    user_manager,
+    InstallationClientArgs, PurgeArgs, SyncArgs, groups, public_keys, store, user_manager,
 };
 use anyhow::Context as _;
 use futures::{StreamExt as _, stream};
-use std::{collections, path, sync, time};
+use std::{collections, path, time};
 use tokio::fs;
 
-/// Maximum number of users processed concurrently during a sync. Bounds the GitHub
-/// requests in flight at the same time. The platform operations of each user are
-/// serialized by the user manager actor.
+/// Bounds concurrency of GitHub requests
 const MAX_CONCURRENT_USER_SYNCS: usize = 8;
-
-/// Maximum number of items per page supported by the GitHub API
 pub(crate) const GITHUB_MAX_PER_PAGE: u8 = 100;
-
-/// Timeout for establishing a connection to the GitHub API
-const CONNECT_TIMEOUT: time::Duration = time::Duration::from_secs(10);
-/// Timeout for individual socket reads/writes, so a hung request cannot stall the sync forever
-const READ_WRITE_TIMEOUT: time::Duration = time::Duration::from_secs(30);
+const GITHUB_CONNECT_TIMEOUT: time::Duration = time::Duration::from_secs(10);
+const SOCKET_RW_TIMEOUT: time::Duration = time::Duration::from_secs(30);
 
 async fn org_client(args: &InstallationClientArgs) -> anyhow::Result<octocrab::Octocrab> {
     let private_key = fs::read(args.private_key.as_path())
@@ -33,9 +25,9 @@ async fn org_client(args: &InstallationClientArgs) -> anyhow::Result<octocrab::O
 
     let app_client = octocrab::Octocrab::builder()
         .app(args.app_id, jwt)
-        .set_connect_timeout(Some(CONNECT_TIMEOUT))
-        .set_read_timeout(Some(READ_WRITE_TIMEOUT))
-        .set_write_timeout(Some(READ_WRITE_TIMEOUT))
+        .set_connect_timeout(Some(GITHUB_CONNECT_TIMEOUT))
+        .set_read_timeout(Some(SOCKET_RW_TIMEOUT))
+        .set_write_timeout(Some(SOCKET_RW_TIMEOUT))
         .build()
         .with_context(|| {
             format!(
@@ -60,25 +52,21 @@ async fn org_client(args: &InstallationClientArgs) -> anyhow::Result<octocrab::O
 
 pub struct Octosync {
     data_dir: path::PathBuf,
-    /// Preview mode: platform operations go to the mock backend and every store is
-    /// created with saving disabled
+    /// Use the mock backend and disable store writes.
     dry_run: bool,
     user_manager: user_manager::UserManager,
 }
 
 impl Octosync {
-    pub async fn new(
-        global_config: sync::Arc<GlobalArgs>,
-        data_dir: &path::Path,
-    ) -> anyhow::Result<Self> {
+    pub fn new(dry_run: bool, data_dir: &path::Path) -> Self {
         let user_manager = user_manager::UserManager::builder()
-            .dry_run(global_config.dry_run)
+            .dry_run(dry_run)
             .build();
-        Ok(Self {
+        Self {
             data_dir: data_dir.to_path_buf(),
-            dry_run: global_config.dry_run,
+            dry_run,
             user_manager,
-        })
+        }
     }
 
     #[tracing::instrument(
@@ -94,7 +82,10 @@ impl Octosync {
         groups: &[String],
     ) -> anyhow::Result<store::User> {
         let new_user = match store.data().get(&gh_user.id) {
-            Some(user) => self.manage_existing_user(gh_user, user).await?,
+            Some(user) => {
+                tracing::debug!("User exists in store");
+                self.user_manager.update_user(gh_user, user).await?
+            }
             None => self.create_user(gh_user, store).await?,
         };
 
@@ -103,8 +94,7 @@ impl Octosync {
             .await
             .context("Failed to sync supplementary groups")?;
 
-        // A failed fetch must not fail processing the user: the authorized_keys file keeps its
-        // current keys and is refreshed on the next sync
+        // Keep existing keys when GitHub cannot refresh them.
         match public_keys::PublicKeys::fetch(octocrab, new_user.name()).await {
             Ok(keys) => {
                 if keys.is_empty() {
@@ -127,20 +117,18 @@ impl Octosync {
 
     /// Create the platform user, re-using the tombstoned IDs when the member rejoined.
     ///
-    /// A rejoin whose stored ID is taken fails loudly and is retried on the next
-    /// sync; falling back to fresh IDs would recreate exactly the ownership drift
-    /// the tombstones exist to prevent. A brand-new member must not be allocated an
-    /// ID a tombstone (departed or purged) reserves either, so the reserved IDs
-    /// travel with the creation.
+    /// A rejoin whose stored ID is taken fails and is retried on the next sync.
+    ///
+    /// Falling back to fresh IDs would create an ownership drift that should be prevented by the
+    /// tombstones. A brand-new member must not be allocated an ID that a tombstone (departed or
+    /// purged) reserves either, so the reserved IDs are propagated to the creation.
     async fn create_user(
         &self,
         gh_user: &octocrab::models::Author,
         store: &store::UserStore,
     ) -> anyhow::Result<store::User> {
-        // With expiry, departed accounts stay on the machine as adoptable-by-name. A
-        // leaver's GitHub login can be released and claimed by a different person;
-        // adopting the expired account would hand that person the previous owner's
-        // home directory and UID, so the collision is refused and left to an operator.
+        // Refuse a recycled login for a different GitHub account, rather than expose the departed
+        // member's account. This is something that needs to be solved by an operator.
         if let Some(tombstone) = store
             .departed()
             .values()
@@ -157,8 +145,7 @@ impl Octosync {
             );
         }
 
-        // A departed member rejoins into their expired account; a purged one gets a
-        // fresh account and home directory under their old IDs
+        // Departed members reuse their account, purged members reuse only its IDs.
         let stored_ids = store
             .departed()
             .get(&gh_user.id)
@@ -193,15 +180,6 @@ impl Octosync {
             },
         };
         self.user_manager.create_user(gh_user, ids).await
-    }
-
-    async fn manage_existing_user(
-        &self,
-        gh_user: &octocrab::models::Author,
-        user: &store::User,
-    ) -> anyhow::Result<store::User> {
-        tracing::debug!("User exists in store");
-        self.user_manager.update_user(gh_user, user).await
     }
 
     #[tracing::instrument(
@@ -275,16 +253,8 @@ impl Octosync {
             .await
     }
 
-    /// Purge departed users whose account has been expired for at least
-    /// `purge_after_days`, removing the account and its home directory permanently
-    /// and without an archive: the data is abandoned by policy.
-    ///
-    /// Eligibility requires the store-side and the account-side clock to agree: the
-    /// tombstone's departure timestamp must be at least the retention period old, and
-    /// the account's own shadow expiry (checked in the backend, where it is cleared by
-    /// any reactivation) must be as well. A member present in the fetched member list
-    /// is never purged. The tombstone survives the purge in the purged map, so a
-    /// member rejoining even later gets their old IDs back.
+    /// Permanently remove departed accounts once both the tombstone and account expiry
+    /// exceed the retention period. Current members are never purged.
     async fn purge_expired(
         &self,
         store: &mut store::UserStore,
@@ -293,7 +263,6 @@ impl Octosync {
     ) -> anyhow::Result<()> {
         let now = chrono::Utc::now();
         let cutoff = now - chrono::Duration::days(purge_after_days.into());
-        // The shadow expiry field counts days since the epoch
         let expired_before = cutoff.timestamp() / (24 * 60 * 60);
 
         let candidates: Vec<store::User> = store
@@ -315,8 +284,7 @@ impl Octosync {
                     );
                     store.mark_purged(&user.id(), now);
                 }
-                // The account is gone but only the purge may spend the tombstone, so
-                // it stays departed; an operator resolves how the account disappeared
+                // Keep the tombstone until a purge succeeds.
                 Ok(user_manager::PurgeOutcome::NoAccount) => tracing::warn!(
                     "No account for departed user '{}', not marking the tombstone purged",
                     user.name()
@@ -335,18 +303,10 @@ impl Octosync {
         store.save().await
     }
 
-    /// Record the given users as departed and tear down every departed account whose
-    /// teardown has not completed yet.
-    ///
-    /// The tombstones are saved before any account is torn down, so the departure
-    /// record survives a crash anywhere in the expiry window. A tombstone only carries
-    /// the completion timestamp once [`user_manager::ExpireAccount`] succeeded, so a
+    /// Persist new departures, then retry every unfinished account teardown. A tombstone only
+    /// carries the completion timestamp once [`user_manager::ExpireAccount`] succeeded, so a
     /// teardown that failed or was interrupted is retried by the next sync without
-    /// in-memory retry state, while a completed one is left alone instead of paying the
-    /// full teardown again on every sync of the retention period.
-    ///
-    /// The account of a departed member is therefore not reconciled continuously: an
-    /// expiry lifted by hand stays lifted until the member is synced again.
+    /// in-memory retry state
     async fn depart_and_expire(
         &self,
         store: &mut store::UserStore,
@@ -366,9 +326,7 @@ impl Octosync {
             .map(store::User::from)
             .collect();
 
-        // Failures are only logged: the tombstone keeps its empty completion timestamp,
-        // so the teardown is retried on the next sync. Sequential, the platform
-        // operations serialize on the user manager actor anyway.
+        // A failed teardown keeps its empty completion timestamp for the next sync.
         for user in pending {
             match self.user_manager.expire_user(&user).await {
                 Ok(()) => store.mark_expired(&user.id(), chrono::Utc::now()),
@@ -380,12 +338,7 @@ impl Octosync {
         store.save().await
     }
 
-    /// Process all org members concurrently and collect the successfully processed
-    /// users into a new store.
-    ///
-    /// A processing failure is logged and leaves the user out of the returned store.
-    /// It never signals that the user left the org; [`partition_stale_users`] alone
-    /// decides which users depart.
+    /// Process members concurrently and collect successful results into a new store.
     async fn process_members(
         &self,
         octocrab: &octocrab::Octocrab,
@@ -394,8 +347,6 @@ impl Octosync {
         assignments: &groups::GroupAssignments,
     ) -> anyhow::Result<store::UserStore> {
         let mut new_store = store::UserStore::new(&self.data_dir, self.dry_run).await?;
-        // Tombstones are carried over wholesale before any member is processed, so
-        // their survival never depends on per-user processing succeeding
         *new_store.departed_mut() = store.departed().clone();
         *new_store.purged_mut() = store.purged().clone();
         *new_store.data_mut() = stream::iter(org_members)
@@ -415,8 +366,7 @@ impl Octosync {
             .map(|user| (user.id(), user))
             .collect()
             .await;
-        // A tombstoned member that was processed has rejoined and their account is
-        // re-created, so the tombstone is spent
+        // Successful processing spends any tombstone for a rejoining member.
         new_store.prune_rejoined();
         Ok(new_store)
     }
@@ -436,9 +386,7 @@ impl Octosync {
         Ok(())
     }
 
-    /// The explicit counterpart of the purge pass at the end of every sync, for
-    /// running the one deliberately irreversible action with a human in the loop.
-    /// The member list is fetched so a rejoined member is never purged.
+    /// Explicitly purge eligible departed users, excluding current org members.
     #[tracing::instrument(
         name = "Octosync::purge",
         skip(self, args),
@@ -459,14 +407,8 @@ impl Octosync {
     }
 }
 
-/// Split the users of the previous store that are missing from the new store into
-/// users to keep for a retry and leavers whose account is expired.
-///
-/// Departure is decided solely by absence from the fetched org member list. A user
-/// that is still an org member but missing from the new store failed processing;
-/// expiring them would turn any correlated per-user failure (e.g. rate-limited key
-/// fetches) into a mass lockout, so they are kept unchanged and retried on the next
-/// sync.
+/// Separate failed current members, which remain for retry, from actual leavers based on the
+/// fetched org member list.
 fn partition_stale_users<'a>(
     old_users: &'a collections::HashMap<octocrab::models::UserId, store::User>,
     new_users: &collections::HashMap<octocrab::models::UserId, store::User>,
@@ -478,12 +420,7 @@ fn partition_stale_users<'a>(
         .partition(|user| org_member_map.contains_key(&user.id()))
 }
 
-/// Circuit breaker for [`Octosync::sync`]. True when the pending departures would
-/// empty a non-empty store.
-///
-/// A member list that no longer contains a single stored user is far more likely a
-/// mis-scoped installation, an org rename or an empty-but-successful API response than
-/// every member leaving at once, so such a sync must refuse to expire anyone.
+/// Refuse a sync that would expire every previously stored user.
 fn would_expire_all_users(
     old_users: &collections::HashMap<octocrab::models::UserId, store::User>,
     leavers: &[&store::User],

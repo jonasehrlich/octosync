@@ -1,15 +1,6 @@
-//! Management of authorized_keys files for system users.
-//!
-//! Works on any Unix platform. Fetched keys live in a marked, octosync-managed block that is
-//! replaced in place on every sync, so a key revoked on GitHub is removed from the block.
-//! Lines outside the block are preserved byte-for-byte at their position and never removed,
-//! so keys installed through other channels (or manually) stay intact.
-//!
-//! All operations run as root inside user-owned directories, so nothing here follows
-//! symlinks: files are opened with O_NOFOLLOW, replacements are staged by
-//! [`atomic_write_file`], and permissions and ownership are set through the opened file
-//! descriptor. Otherwise a user could, for example, symlink their authorized_keys to an
-//! arbitrary file and have root truncate, chown or disclose it.
+//! Maintains an octosync-managed block in each user's authorized_keys file while
+//! preserving all manual entries. Files are opened without following symlinks and
+//! replaced atomically because these operations run as root in user-owned directories.
 
 use crate::{public_keys, store};
 use anyhow::Context as _;
@@ -21,52 +12,37 @@ const SSH_DIR_MODE: u32 = 0o700;
 const AUTHORIZED_KEYS_MODE: u32 = 0o600;
 const AUTHORIZED_KEYS_FILE_NAME: &str = "authorized_keys";
 
-/// Marker line opening the octosync-managed block in an authorized_keys file
 const MANAGED_BLOCK_START: &str = "# >>> octosync managed keys - do not edit this block >>>";
-/// Marker line closing the octosync-managed block in an authorized_keys file
 const MANAGED_BLOCK_END: &str = "# <<< octosync managed keys - do not edit this block <<<";
 
-/// Manages the authorized_keys files of system users, resolving each account's actual home
-/// directory from the user database.
-#[derive(Clone, Debug, Default)]
-pub struct AuthorizedKeysManager;
+#[tracing::instrument(
+    name = "authorized_keys::update_authorized_keys",
+    skip_all,
+    fields(user = %user.name())
+)]
+pub async fn update_authorized_keys(
+    user: &store::User,
+    keys: &public_keys::PublicKeys,
+) -> anyhow::Result<()> {
+    let system_user = nix::unistd::User::from_uid(user.uid())
+        .context("Failed to look up user before updating authorized_keys")?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "User '{}' not found in system when updating authorized_keys",
+                user.name()
+            )
+        })?;
 
-impl AuthorizedKeysManager {
-    /// Replaces the octosync-managed key block in the user's authorized_keys file with
-    /// the given keys. Lines outside the managed block are never touched.
-    #[tracing::instrument(
-        name = "AuthorizedKeysManager::update_authorized_keys",
-        skip_all,
-        fields(user = %user.name())
-    )]
-    pub async fn update_authorized_keys(
-        &self,
-        user: &store::User,
-        keys: &public_keys::PublicKeys,
-    ) -> anyhow::Result<()> {
-        let system_user = nix::unistd::User::from_uid(user.uid())
-            .context("Failed to look up user before updating authorized_keys")?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "User '{}' not found in system when updating authorized_keys",
-                    user.name()
-                )
-            })?;
-
-        sync_authorized_keys(
-            &system_user.dir.join(".ssh"),
-            keys,
-            system_user.uid,
-            system_user.gid,
-        )
-        .await
-    }
+    sync_authorized_keys(
+        &system_user.dir.join(".ssh"),
+        keys,
+        system_user.uid,
+        system_user.gid,
+    )
+    .await
 }
 
-/// Replace the octosync-managed block in `<ssh_dir>/authorized_keys` with `keys`, creating the
-/// directory and file with the required permissions if they don't exist. Lines outside the
-/// managed block are preserved byte-for-byte. The file is replaced atomically, so an
-/// interrupted update cannot leave a truncated authorized_keys behind.
+/// Replace the managed block while preserving content outside it.
 async fn sync_authorized_keys(
     ssh_dir: &path::Path,
     keys: &public_keys::PublicKeys,

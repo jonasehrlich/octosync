@@ -3,7 +3,7 @@
 use anyhow::Context as _;
 use clap::Parser as _;
 use fs2::FileExt as _;
-use std::{fs, path, sync};
+use std::{fs, path};
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod authorized_keys;
@@ -196,7 +196,7 @@ async fn main() -> anyhow::Result<()> {
         .to_path_buf();
     let _process_lock = ProcessLock::acquire(&data_dir)?;
 
-    let app = octosync::Octosync::new(sync::Arc::new(args.global), &data_dir).await?;
+    let app = octosync::Octosync::new(args.global.dry_run, &data_dir);
 
     match args.command {
         Commands::Sync(a) => {

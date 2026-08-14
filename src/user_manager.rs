@@ -1,13 +1,10 @@
-//! Platform user management behind a message-passing actor.
+//! Serializes platform user management through a message-passing actor. This keeps
+//! concurrent syncs from racing shadow-utils' passwd and group file locks.
 //!
-//! The [`messages`] are the platform-neutral contract: every backend in [`backends`]
+//! The [`messages`] are the platform-neutral contract. Every backend in [`backends`]
 //! is an actor handling the full message set, and [`UserManager`] is a
-//! type-erased handle to one spawned backend. The actor processes one message at a
-//! time, which serializes all account mutations: shadow-utils commands (useradd,
-//! usermod, userdel, groupadd) fail with "cannot lock /etc/passwd" instead of waiting
-//! when another invocation holds the lock, so the concurrent per-user syncs must never
-//! run them in parallel.
-//!
+//! type-erased handle to one spawned backend.
+
 pub mod backends;
 mod messages;
 
@@ -20,10 +17,7 @@ use crate::{public_keys, store};
 use anyhow::Context as _;
 use std::collections;
 
-/// Handle to a spawned platform user manager actor.
-///
-/// Cloning the handle clones the callers; all clones address the same actor, so the
-/// one-message-at-a-time serialization holds across every user of the handle.
+/// Type-erased handle to a platform user manager actor.
 #[derive(Clone)]
 pub struct UserManager {
     create_user: hannibal::Caller<CreateUser>,
@@ -50,7 +44,7 @@ impl UserManager {
 
         #[cfg(target_os = "linux")]
         {
-            Self::from_actor(backends::linux::LinuxUserManager::new())
+            Self::from_actor(backends::linux::LinuxUserManager)
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -61,8 +55,6 @@ impl UserManager {
 }
 
 impl UserManager {
-    /// Spawn the actor and keep one caller per message type, erasing the concrete
-    /// actor type from the handle.
     fn from_actor<A>(actor: A) -> Self
     where
         A: hannibal::Handler<CreateUser>
@@ -86,9 +78,6 @@ impl UserManager {
         }
     }
 
-    /// Sends [`CreateUser`] to the actor and awaits the created user. `ids` chooses
-    /// between the stored IDs of a rejoining member and fresh allocation, see
-    /// [`AccountIds`].
     pub async fn create_user(
         &self,
         gh_user: &octocrab::models::Author,
@@ -103,7 +92,6 @@ impl UserManager {
             .context(ACTOR_ERROR)?
     }
 
-    /// Sends [`UpdateUser`] to the actor and awaits the updated user.
     pub async fn update_user(
         &self,
         gh_user: &octocrab::models::Author,
@@ -118,8 +106,6 @@ impl UserManager {
             .context(ACTOR_ERROR)?
     }
 
-    /// Sends [`ExpireAccount`] to the actor and awaits the expiry, the reversible
-    /// replacement for deleting the account.
     pub async fn expire_user(&self, user: &store::User) -> anyhow::Result<()> {
         self.expire_account
             .call(ExpireAccount { user: user.clone() })
@@ -127,8 +113,6 @@ impl UserManager {
             .context(ACTOR_ERROR)?
     }
 
-    /// Sends [`PurgeAccount`] to the actor and awaits the outcome. `expired_before` is
-    /// the account-side eligibility bound, see [`PurgeAccount`].
     pub async fn purge_user(
         &self,
         user: &store::User,
@@ -143,7 +127,6 @@ impl UserManager {
             .context(ACTOR_ERROR)?
     }
 
-    /// Sends [`SyncSupplementaryGroups`] to the actor and awaits the update.
     pub async fn sync_supplementary_groups(
         &self,
         user: &store::User,
@@ -158,7 +141,6 @@ impl UserManager {
             .context(ACTOR_ERROR)?
     }
 
-    /// Sends [`EnsureGroupsExist`] to the actor and awaits the group creation.
     pub async fn ensure_groups_exist(&self, groups: &[String]) -> anyhow::Result<()> {
         self.ensure_groups_exist
             .call(EnsureGroupsExist {
@@ -168,7 +150,6 @@ impl UserManager {
             .context(ACTOR_ERROR)?
     }
 
-    /// Sends [`UpdateAuthorizedKeys`] to the actor and awaits the key update.
     pub async fn update_authorized_keys(
         &self,
         user: &store::User,

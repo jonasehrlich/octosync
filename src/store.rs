@@ -11,8 +11,7 @@ mod uid_serde {
     where
         S: Serializer,
     {
-        // Use the public getter provided by the crate
-        // Cast to u32 to keep the JSON format stable across OSs
+        // Keep the JSON format stable across platforms.
         #[allow(clippy::unnecessary_cast)]
         (uid.as_raw() as u32).serialize(serializer)
     }
@@ -23,8 +22,6 @@ mod uid_serde {
     {
         let val = u32::deserialize(deserializer)?;
 
-        // Use the public constructor/factory provided by the crate
-        // The 'as _' handles the platform-specific uid_t conversion
         Ok(nix::unistd::Uid::from_raw(val as _))
     }
 }
@@ -36,7 +33,6 @@ mod gid_serde {
     where
         S: Serializer,
     {
-        // Cast to u32 to keep the JSON format stable across OSs
         #[allow(clippy::unnecessary_cast)]
         gid.map(|gid| gid.as_raw() as u32).serialize(serializer)
     }
@@ -50,8 +46,7 @@ mod gid_serde {
     }
 }
 
-/// Canonical representation of a user that exists both on GitHub and as a Linux user,
-/// with the necessary information to manage their Linux account and SSH keys.
+/// A GitHub member and their Linux account identity.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, bon::Builder)]
 pub struct User {
     /// GitHub user ID, used as the primary key for identifying users in the store
@@ -68,18 +63,7 @@ pub struct User {
     gid: Option<unistd::Gid>,
 }
 
-#[allow(unused)]
 impl User {
-    /// Get the home directory path for this user, typically "/home/{name}"
-    pub fn home_dir(&self) -> path::PathBuf {
-        path::PathBuf::from(format!("/home/{}", self.name))
-    }
-
-    /// Get the SSH directory path for this user, typically "/home/{name}/.ssh"
-    pub fn ssh_dir(&self) -> path::PathBuf {
-        self.home_dir().join(".ssh")
-    }
-
     /// Get the GitHub user ID
     pub fn id(&self) -> octocrab::models::UserId {
         self.id
@@ -95,7 +79,7 @@ impl User {
         self.uid
     }
 
-    /// Get the GID of the user's primary group, if it is tracked
+    /// Get the Linux user GID of the primary group
     pub fn gid(&self) -> Option<unistd::Gid> {
         self.gid
     }
@@ -173,9 +157,7 @@ impl From<&DepartedUser> for User {
     }
 }
 
-/// Tombstone of a departed user whose expired account and home directory were purged
-/// after the retention period. It keeps the IDs so a member rejoining even after the
-/// purge gets their old UID and GID back, with an empty home directory.
+/// A purged member whose IDs remain reserved for a rejoin.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, bon::Builder)]
 pub struct PurgedUser {
     /// GitHub user ID, used as the primary key for identifying users in the store
@@ -246,7 +228,6 @@ struct StoreData {
     purged: PurgedMap,
 }
 
-/// Borrowing counterpart of [`StoreData`] for serialization
 #[derive(Serialize)]
 struct StoreDataRef<'a> {
     version: u64,
@@ -274,8 +255,7 @@ pub struct UserStore {
 }
 
 impl UserStore {
-    /// Create a new store instance with the given directory, without loading any data.
-    /// A store created with `dry_run` never writes on save.
+    /// Create an empty store without loading data.
     pub async fn new(dir: &path::Path, dry_run: bool) -> anyhow::Result<Self> {
         fs::create_dir_all(&dir).await?;
         Ok(Self {
@@ -287,7 +267,7 @@ impl UserStore {
         })
     }
 
-    /// Create a new store loading data from the directory
+    /// Load a store from a directory.
     #[tracing::instrument(name = "Store::from_dir")]
     pub async fn from_dir(dir: &path::Path, dry_run: bool) -> anyhow::Result<Self> {
         let mut s = Self::new(dir, dry_run).await?;
@@ -335,8 +315,7 @@ impl UserStore {
         );
     }
 
-    /// Record that the account teardown of a departed user completed, so later syncs
-    /// leave the tombstone alone instead of tearing the account down again
+    /// Mark a departed user's account teardown as complete.
     pub fn mark_expired(
         &mut self,
         id: &octocrab::models::UserId,
@@ -347,8 +326,7 @@ impl UserStore {
         }
     }
 
-    /// Move a departed tombstone to the purged map, keeping its IDs for a rejoin even
-    /// after the purge
+    /// Move a departed tombstone to the purged map.
     pub fn mark_purged(
         &mut self,
         id: &octocrab::models::UserId,
@@ -369,20 +347,17 @@ impl UserStore {
         }
     }
 
-    /// Drop the tombstones of users that are active again, keeping every user in
-    /// exactly one of the three maps
+    /// Drop tombstones for active users.
     pub fn prune_rejoined(&mut self) {
         self.departed.retain(|id, _| !self.users.contains_key(id));
         self.purged.retain(|id, _| !self.users.contains_key(id));
     }
 
-    /// Get the file path for the users database file
     fn path(&self) -> path::PathBuf {
         self.dir.join(USERS_FILE_NAME)
     }
 
-    /// Load the store from the file system, starting empty if the file doesn't exist.
-    /// A v1 file is backed up once and migrated with empty tombstone maps.
+    /// Load the store, starting empty when no database exists.
     #[tracing::instrument(name = "Store::load", skip(self))]
     async fn load(&mut self) -> anyhow::Result<()> {
         let path = self.path();
@@ -408,7 +383,6 @@ impl UserStore {
             .with_context(|| format!("Failed to parse users database from '{}'", path.display()))?;
 
         let data = match value.get("version") {
-            // A v1 file is a bare user map without a version key
             None => {
                 let users: UserMap = serde_json::from_value(value).with_context(|| {
                     format!(
@@ -416,8 +390,7 @@ impl UserStore {
                         path.display()
                     )
                 })?;
-                // save() overwrites the file with v2, back it up first so rolling back
-                // to an older binary keeps working
+                // Preserve rollback compatibility before the next v2 save.
                 self.backup_v1_file().await?;
                 StoreData {
                     users,
@@ -430,7 +403,6 @@ impl UserStore {
                     format!("Failed to parse users database from '{}'", path.display())
                 })?
             }
-            // Refuse an unknown newer version instead of silently dropping its data
             Some(version) => anyhow::bail!(
                 "Unsupported users database version {version} in '{}', this binary supports version {STORE_VERSION}",
                 path.display()
@@ -459,9 +431,7 @@ impl UserStore {
         Ok(())
     }
 
-    /// Write the store to the users database file. A dry run never writes: the
-    /// preview must not persist invented mock IDs or tombstone changes that a later
-    /// real run would act on.
+    /// Persist the store unless this is a dry run.
     pub async fn save(&self) -> anyhow::Result<()> {
         if self.dry_run {
             tracing::info!("Dry run: not writing the users database");
@@ -474,8 +444,7 @@ impl UserStore {
             purged: &self.purged,
         })?;
         let path = self.path();
-        // Stage in a temporary file that atomically replaces the database on commit, so a
-        // failed write (e.g. on a full disk) can not truncate it
+        // Avoid truncating the database if the write fails.
         let dest = path.clone();
         tokio::task::spawn_blocking(move || {
             use std::io::Write as _;
@@ -536,18 +505,6 @@ mod tests {
 
     mod user {
         use super::*;
-
-        #[test]
-        fn home_dir() {
-            let user = user();
-            assert_eq!(user.home_dir(), path::PathBuf::from("/home/testuser"));
-        }
-
-        #[test]
-        fn ssh_dir() {
-            let user = user();
-            assert_eq!(user.ssh_dir(), path::PathBuf::from("/home/testuser/.ssh"));
-        }
 
         #[test]
         fn serialization() {
