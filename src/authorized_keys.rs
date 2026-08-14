@@ -11,7 +11,7 @@
 //! descriptor. Otherwise a user could, for example, symlink their authorized_keys to an
 //! arbitrary file and have root truncate, chown or disclose it.
 
-use crate::{public_keys, store, user_manager};
+use crate::{public_keys, store};
 use anyhow::Context as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path;
@@ -31,13 +31,15 @@ const MANAGED_BLOCK_END: &str = "# <<< octosync managed keys - do not edit this 
 #[derive(Clone, Debug, Default)]
 pub struct AuthorizedKeysManager;
 
-impl user_manager::ManageAuthorizedKeys for AuthorizedKeysManager {
+impl AuthorizedKeysManager {
+    /// Replaces the octosync-managed key block in the user's authorized_keys file with
+    /// the given keys. Lines outside the managed block are never touched.
     #[tracing::instrument(
         name = "AuthorizedKeysManager::update_authorized_keys",
         skip_all,
         fields(user = %user.name())
     )]
-    async fn update_authorized_keys(
+    pub async fn update_authorized_keys(
         &self,
         user: &store::User,
         keys: &public_keys::PublicKeys,

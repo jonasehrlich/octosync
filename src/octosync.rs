@@ -1,9 +1,5 @@
 use crate::{
-    GlobalArgs, InstallationClientArgs, SyncArgs, groups, public_keys, store,
-    user_manager::{
-        self, CreateUser as _, DeleteUser as _, ManageAuthorizedKeys as _,
-        ManageSupplementaryGroups as _, UpdateUser as _,
-    },
+    GlobalArgs, InstallationClientArgs, SyncArgs, groups, public_keys, store, user_manager,
 };
 use anyhow::Context as _;
 use futures::{StreamExt as _, stream};
@@ -11,11 +7,13 @@ use std::{collections, path, sync, time};
 use tokio::fs;
 
 /// Maximum number of user deletions that run concurrently. Each deletion archives the
-/// user's home directory, which is disk- and CPU-heavy, so it is not unbounded.
+/// user's home directory outside the user manager actor, which is disk- and CPU-heavy,
+/// so it is not unbounded. Account mutations serialize on the actor.
 const MAX_CONCURRENT_DELETES: usize = 4;
 
-/// Maximum number of users processed concurrently during a sync. Bounds the number of
-/// GitHub requests and user management commands in flight at the same time.
+/// Maximum number of users processed concurrently during a sync. Bounds the GitHub
+/// requests in flight at the same time. The platform operations of each user are
+/// serialized by the user manager actor.
 const MAX_CONCURRENT_USER_SYNCS: usize = 8;
 
 /// Maximum number of items per page supported by the GitHub API
@@ -66,7 +64,7 @@ async fn org_client(args: &InstallationClientArgs) -> anyhow::Result<octocrab::O
 
 pub struct Octosync {
     data_dir: path::PathBuf,
-    user_manager: user_manager::PlatformUserManager,
+    user_manager: user_manager::UserManager,
 }
 
 impl Octosync {
@@ -74,7 +72,7 @@ impl Octosync {
         global_config: sync::Arc<GlobalArgs>,
         data_dir: &path::Path,
     ) -> anyhow::Result<Self> {
-        let user_manager = user_manager::PlatformUserManager::builder()
+        let user_manager = user_manager::UserManager::builder()
             .dry_run(global_config.dry_run)
             .home_archive_dir(data_dir.join("home-archive"))
             .build();
@@ -175,7 +173,7 @@ impl Octosync {
         // Create the resolved groups before the users are processed, so the per-user
         // group sync can rely on every managed group existing
         self.user_manager
-            .ensure_groups_exists(&assignments.all_groups())
+            .ensure_groups_exist(&assignments.all_groups())
             .await?;
 
         let mut new_store = self
@@ -378,6 +376,217 @@ mod tests {
             .iter()
             .map(|u| (u.id(), u.name().to_string()))
             .collect()
+    }
+
+    mod orchestration {
+        use super::*;
+        use crate::user_manager::{
+            DeletionPreparation, UserManager, backends::testing::TestingUserManager,
+        };
+
+        /// A GitHub user as returned by the API. `Author` is non-exhaustive, so it can
+        /// only be built through deserialization.
+        fn author(id: u64, login: &str) -> octocrab::models::Author {
+            let url = "https://api.github.com/";
+            serde_json::from_value(serde_json::json!({
+                "login": login,
+                "id": id,
+                "node_id": "node",
+                "avatar_url": url,
+                "gravatar_id": "",
+                "url": url,
+                "html_url": url,
+                "followers_url": url,
+                "following_url": url,
+                "gists_url": url,
+                "starred_url": url,
+                "subscriptions_url": url,
+                "organizations_url": url,
+                "repos_url": url,
+                "events_url": url,
+                "received_events_url": url,
+                "type": "User",
+                "site_admin": false,
+            }))
+            .unwrap()
+        }
+
+        /// A client whose every request fails: it points at a local port that was
+        /// bound and released, so connections are refused
+        fn unreachable_octocrab() -> octocrab::Octocrab {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            octocrab::Octocrab::builder()
+                .base_uri(format!("http://127.0.0.1:{port}"))
+                .unwrap()
+                .build()
+                .unwrap()
+        }
+
+        /// An [`Octosync`] backed by the scripted user manager. The [`tempfile::TempDir`]
+        /// is its data directory and must outlive it.
+        fn octosync_with(actor: TestingUserManager) -> (Octosync, tempfile::TempDir) {
+            let data_dir = tempfile::tempdir().unwrap();
+            let octosync = Octosync {
+                data_dir: data_dir.path().to_path_buf(),
+                user_manager: UserManager::testing(actor, data_dir.path().join("home-archive")),
+            };
+            (octosync, data_dir)
+        }
+
+        #[tokio::test]
+        async fn process_user_creates_missing_user_and_tolerates_failed_key_fetch() {
+            let mut actor = TestingUserManager::default();
+            actor.create_user.push_back(Ok(user(1, "alice")));
+            actor.sync_supplementary_groups.push_back(Ok(()));
+            // No UpdateAuthorizedKeys response is scripted: the key fetch against the
+            // unreachable client fails, so the keys must be skipped, not synced
+            let (octosync, _data_dir) = octosync_with(actor);
+            let empty_store = store::UserStore::new(_data_dir.path()).await.unwrap();
+
+            let processed = octosync
+                .process_user(
+                    &unreachable_octocrab(),
+                    &author(1, "alice"),
+                    &empty_store,
+                    &[],
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(processed.name(), "alice");
+        }
+
+        #[tokio::test]
+        async fn process_user_updates_a_stored_user() {
+            let mut actor = TestingUserManager::default();
+            actor.update_user.push_back(Ok(user(1, "alice-renamed")));
+            actor.sync_supplementary_groups.push_back(Ok(()));
+            let (octosync, _data_dir) = octosync_with(actor);
+            let mut old_store = store::UserStore::new(_data_dir.path()).await.unwrap();
+            old_store
+                .data_mut()
+                .insert(octocrab::models::UserId(1), user(1, "alice"));
+
+            let processed = octosync
+                .process_user(
+                    &unreachable_octocrab(),
+                    &author(1, "alice-renamed"),
+                    &old_store,
+                    &[],
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(processed.name(), "alice-renamed");
+        }
+
+        #[tokio::test]
+        async fn process_user_fails_when_the_group_sync_fails() {
+            let mut actor = TestingUserManager::default();
+            actor.create_user.push_back(Ok(user(1, "alice")));
+            actor
+                .sync_supplementary_groups
+                .push_back(Err(anyhow::anyhow!("boom")));
+            let (octosync, _data_dir) = octosync_with(actor);
+            let empty_store = store::UserStore::new(_data_dir.path()).await.unwrap();
+
+            let err = octosync
+                .process_user(
+                    &unreachable_octocrab(),
+                    &author(1, "alice"),
+                    &empty_store,
+                    &[],
+                )
+                .await
+                .unwrap_err();
+
+            assert!(
+                err.to_string()
+                    .contains("Failed to sync supplementary groups")
+            );
+        }
+
+        /// A member whose processing fails must be left out of the new store, so
+        /// [`partition_stale_users`] keeps them for a retry instead of deleting them.
+        #[tokio::test]
+        async fn process_members_leaves_a_failed_member_out_of_the_new_store() {
+            let mut actor = TestingUserManager::default();
+            actor.create_user.push_back(Err(anyhow::anyhow!("boom")));
+            let (octosync, _data_dir) = octosync_with(actor);
+            let empty_store = store::UserStore::new(_data_dir.path()).await.unwrap();
+
+            let new_store = octosync
+                .process_members(
+                    &unreachable_octocrab(),
+                    &[author(1, "alice")],
+                    &empty_store,
+                    &groups::GroupAssignments::default(),
+                )
+                .await
+                .unwrap();
+
+            assert!(new_store.data().is_empty());
+        }
+
+        #[tokio::test]
+        async fn process_members_collects_a_processed_member_into_the_new_store() {
+            let mut actor = TestingUserManager::default();
+            actor.create_user.push_back(Ok(user(1, "alice")));
+            actor.sync_supplementary_groups.push_back(Ok(()));
+            let (octosync, _data_dir) = octosync_with(actor);
+            let empty_store = store::UserStore::new(_data_dir.path()).await.unwrap();
+
+            let new_store = octosync
+                .process_members(
+                    &unreachable_octocrab(),
+                    &[author(1, "alice")],
+                    &empty_store,
+                    &groups::GroupAssignments::default(),
+                )
+                .await
+                .unwrap();
+
+            let stored = new_store.data().get(&octocrab::models::UserId(1)).unwrap();
+            assert_eq!(stored.name(), "alice");
+        }
+
+        #[tokio::test]
+        async fn delete_users_returns_failed_users_for_retry() {
+            let mut actor = TestingUserManager::default();
+            actor
+                .prepare_user_deletion
+                .push_back(Err(anyhow::anyhow!("boom")));
+            actor
+                .prepare_user_deletion
+                .push_back(Err(anyhow::anyhow!("boom")));
+            let (octosync, _data_dir) = octosync_with(actor);
+            let users = [user(1, "alice"), user(2, "bob")];
+
+            let failed = octosync.delete_users(users.iter().collect()).await;
+
+            let mut failed_names: Vec<&str> = failed.iter().map(|u| u.name()).collect();
+            failed_names.sort_unstable();
+            assert_eq!(failed_names, ["alice", "bob"]);
+        }
+
+        #[tokio::test]
+        async fn delete_users_returns_nothing_when_all_deletions_succeed() {
+            let mut actor = TestingUserManager::default();
+            actor
+                .prepare_user_deletion
+                .push_back(Ok(DeletionPreparation::NothingToDo));
+            actor
+                .prepare_user_deletion
+                .push_back(Ok(DeletionPreparation::NothingToDo));
+            let (octosync, _data_dir) = octosync_with(actor);
+            let users = [user(1, "alice"), user(2, "bob")];
+
+            let failed = octosync.delete_users(users.iter().collect()).await;
+
+            assert!(failed.is_empty());
+        }
     }
 
     mod partition_stale_users {

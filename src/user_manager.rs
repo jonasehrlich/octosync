@@ -1,61 +1,50 @@
+//! Platform user management behind a message-passing actor.
+//!
+//! The [`messages`] are the platform-neutral contract: every backend in [`backends`]
+//! is an actor handling the full message set, and [`UserManager`] is a
+//! type-erased handle to one spawned backend. The actor processes one message at a
+//! time, which serializes all account mutations: shadow-utils commands (useradd,
+//! usermod, userdel, groupadd) fail with "cannot lock /etc/passwd" instead of waiting
+//! when another invocation holds the lock, so the concurrent per-user syncs must never
+//! run them in parallel.
+//!
+//! Deletion is split so the disk-heavy work stays concurrent: the actor prepares the
+//! deletion and removes the account, while the home directory archiving between the
+//! two runs outside the actor in the caller's task.
+
+pub mod backends;
+mod messages;
+
+pub use messages::{
+    CreateUser, DeletionPreparation, EnsureGroupsExist, PrepareUserDeletion, RemoveAccount,
+    SyncSupplementaryGroups, UpdateAuthorizedKeys, UpdateUser,
+};
+
 use crate::{public_keys, store};
+use anyhow::Context as _;
 use std::{collections, path};
 
-pub trait CreateUser {
-    /// Creates a platform user for the given GitHub user.
-    async fn create_user(&self, user: &octocrab::models::Author) -> anyhow::Result<store::User>;
+/// Handle to a spawned platform user manager actor.
+///
+/// Cloning the handle clones the callers; all clones address the same actor, so the
+/// one-message-at-a-time serialization holds across every user of the handle.
+#[derive(Clone)]
+pub struct UserManager {
+    /// Directory where home directories of deleted users are archived
+    home_archive_dir: path::PathBuf,
+    create_user: hannibal::Caller<CreateUser>,
+    update_user: hannibal::Caller<UpdateUser>,
+    prepare_user_deletion: hannibal::Caller<PrepareUserDeletion>,
+    remove_account: hannibal::Caller<RemoveAccount>,
+    sync_supplementary_groups: hannibal::Caller<SyncSupplementaryGroups>,
+    ensure_groups_exist: hannibal::Caller<EnsureGroupsExist>,
+    update_authorized_keys: hannibal::Caller<UpdateAuthorizedKeys>,
 }
 
-pub trait DeleteUser {
-    /// Deletes the platform user associated with the given GitHub user.
-    async fn delete_user(&self, user: &store::User) -> anyhow::Result<()>;
-}
-
-pub trait ManageAuthorizedKeys {
-    /// Replaces the octosync-managed key block in the user's authorized_keys file with the
-    /// given keys, so a key revoked on GitHub is removed on the next sync. Lines outside the
-    /// managed block are never touched, so keys installed through other channels stay intact.
-    async fn update_authorized_keys(
-        &self,
-        user: &store::User,
-        keys: &public_keys::PublicKeys,
-    ) -> anyhow::Result<()>;
-}
-
-pub trait ManageSupplementaryGroups {
-    /// Synchronizes supplementary groups for the given user.
-    ///
-    /// octosync owns the supplementary groups of synced users: the user's memberships
-    /// are replaced with `groups`, keeping only the primary group. Groups assigned
-    /// through other channels are removed.
-    async fn sync_supplementary_groups(
-        &self,
-        user: &store::User,
-        groups: &[String],
-    ) -> anyhow::Result<()>;
-
-    /// Ensure that a list of groups exists on the system, creating any that are missing.
-    async fn ensure_groups_exists(&self, groups: &[String]) -> anyhow::Result<()>;
-}
-
-pub trait UpdateUser {
-    /// Updates the user name and home
-    async fn update_user(
-        &self,
-        gh_user: &octocrab::models::Author,
-        available_user: &store::User,
-    ) -> anyhow::Result<store::User>;
-}
-
-#[derive(Clone, Debug)]
-pub enum PlatformUserManager {
-    #[cfg(target_os = "linux")]
-    Linux(linux::LinuxUserManager),
-    Mock(mock::MockUserManager),
-}
+const ACTOR_ERROR: &str = "User manager actor not available or failed to process the request";
 
 #[bon::bon]
-impl PlatformUserManager {
+impl UserManager {
     #[builder]
     pub fn new(
         /// Directory where home directories of deleted users are archived
@@ -64,89 +53,169 @@ impl PlatformUserManager {
         dry_run: bool,
     ) -> Self {
         if dry_run {
-            return Self::Mock(mock::MockUserManager::new(1000));
+            return Self::from_actor(backends::mock::MockUserManager::new(1000), home_archive_dir);
         }
 
         #[cfg(target_os = "linux")]
         {
-            Self::Linux(linux::LinuxUserManager::new(home_archive_dir))
+            Self::from_actor(backends::linux::LinuxUserManager::new(), home_archive_dir)
         }
 
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = home_archive_dir;
-            Self::Mock(mock::MockUserManager::new(1000))
+            Self::from_actor(backends::mock::MockUserManager::new(1000), home_archive_dir)
         }
     }
 }
 
-impl CreateUser for PlatformUserManager {
-    async fn create_user(&self, user: &octocrab::models::Author) -> anyhow::Result<store::User> {
-        match self {
-            #[cfg(target_os = "linux")]
-            Self::Linux(manager) => manager.create_user(user).await,
-            Self::Mock(manager) => manager.create_user(user).await,
+impl UserManager {
+    /// Spawn the actor and keep one caller per message type, erasing the concrete
+    /// actor type from the handle.
+    fn from_actor<A>(actor: A, home_archive_dir: path::PathBuf) -> Self
+    where
+        A: hannibal::Handler<CreateUser>
+            + hannibal::Handler<UpdateUser>
+            + hannibal::Handler<PrepareUserDeletion>
+            + hannibal::Handler<RemoveAccount>
+            + hannibal::Handler<SyncSupplementaryGroups>
+            + hannibal::Handler<EnsureGroupsExist>
+            + hannibal::Handler<UpdateAuthorizedKeys>,
+    {
+        use hannibal::spawnable::Spawnable as _;
+        let addr = actor.spawn();
+        Self {
+            home_archive_dir,
+            create_user: addr.caller(),
+            update_user: addr.caller(),
+            prepare_user_deletion: addr.caller(),
+            remove_account: addr.caller(),
+            sync_supplementary_groups: addr.caller(),
+            ensure_groups_exist: addr.caller(),
+            update_authorized_keys: addr.caller(),
         }
     }
-}
 
-impl DeleteUser for PlatformUserManager {
-    async fn delete_user(&self, user: &store::User) -> anyhow::Result<()> {
-        match self {
-            #[cfg(target_os = "linux")]
-            Self::Linux(manager) => manager.delete_user(user).await,
-            Self::Mock(manager) => manager.delete_user(user).await,
-        }
-    }
-}
-
-impl ManageAuthorizedKeys for PlatformUserManager {
-    async fn update_authorized_keys(
+    /// Sends [`CreateUser`] to the actor and awaits the created user.
+    pub async fn create_user(
         &self,
-        user: &store::User,
-        keys: &public_keys::PublicKeys,
-    ) -> anyhow::Result<()> {
-        match self {
-            #[cfg(target_os = "linux")]
-            Self::Linux(manager) => manager.update_authorized_keys(user, keys).await,
-            Self::Mock(manager) => manager.update_authorized_keys(user, keys).await,
-        }
-    }
-}
-
-impl ManageSupplementaryGroups for PlatformUserManager {
-    async fn sync_supplementary_groups(
-        &self,
-        user: &store::User,
-        groups: &[String],
-    ) -> anyhow::Result<()> {
-        match self {
-            #[cfg(target_os = "linux")]
-            Self::Linux(manager) => manager.sync_supplementary_groups(user, groups).await,
-            Self::Mock(manager) => manager.sync_supplementary_groups(user, groups).await,
-        }
+        gh_user: &octocrab::models::Author,
+    ) -> anyhow::Result<store::User> {
+        self.create_user
+            .call(CreateUser {
+                gh_user: gh_user.clone(),
+            })
+            .await
+            .context(ACTOR_ERROR)?
     }
 
-    async fn ensure_groups_exists(&self, groups: &[String]) -> anyhow::Result<()> {
-        match self {
-            #[cfg(target_os = "linux")]
-            Self::Linux(manager) => manager.ensure_groups_exists(groups).await,
-            Self::Mock(manager) => manager.ensure_groups_exists(groups).await,
-        }
-    }
-}
-
-impl UpdateUser for PlatformUserManager {
-    async fn update_user(
+    /// Sends [`UpdateUser`] to the actor and awaits the updated user.
+    pub async fn update_user(
         &self,
         gh_user: &octocrab::models::Author,
         available_user: &store::User,
     ) -> anyhow::Result<store::User> {
-        match self {
-            #[cfg(target_os = "linux")]
-            Self::Linux(manager) => manager.update_user(gh_user, available_user).await,
-            Self::Mock(manager) => manager.update_user(gh_user, available_user).await,
+        self.update_user
+            .call(UpdateUser {
+                gh_user: gh_user.clone(),
+                available_user: available_user.clone(),
+            })
+            .await
+            .context(ACTOR_ERROR)?
+    }
+
+    /// Deletes the platform user of `user`.
+    ///
+    /// The actor prepares the deletion ([`PrepareUserDeletion`]) and removes the
+    /// account ([`RemoveAccount`]); the disk- and CPU-heavy home directory archiving
+    /// between the two runs here, outside the actor, so concurrent deletions only
+    /// serialize on the account mutations themselves. A failed archive aborts the
+    /// deletion, the caller keeps the user in the store and retries on the next sync.
+    #[tracing::instrument(
+        name = "UserManager::delete_user",
+        skip_all,
+        fields(user = %user.name(), uid = user.uid().as_raw())
+    )]
+    pub async fn delete_user(&self, user: &store::User) -> anyhow::Result<()> {
+        let preparation = self
+            .prepare_user_deletion
+            .call(PrepareUserDeletion { user: user.clone() })
+            .await
+            .context(ACTOR_ERROR)??;
+
+        let DeletionPreparation::Prepared { home_dir } = preparation else {
+            return Ok(());
+        };
+
+        let receipt = crate::archiver::archive_home_dir(&self.home_archive_dir, user, &home_dir)
+            .await
+            .context("Home directory was not archived, not deleting user")?;
+        if let Some(archive_path) = receipt.archive_path() {
+            tracing::info!(
+                home_dir = %home_dir.display(),
+                archive_path = %archive_path.display(),
+                "Archived home directory",
+            );
         }
+
+        self.remove_account
+            .call(RemoveAccount {
+                user: user.clone(),
+                receipt,
+            })
+            .await
+            .context(ACTOR_ERROR)?
+    }
+
+    /// Sends [`SyncSupplementaryGroups`] to the actor and awaits the update.
+    pub async fn sync_supplementary_groups(
+        &self,
+        user: &store::User,
+        groups: &[String],
+    ) -> anyhow::Result<()> {
+        self.sync_supplementary_groups
+            .call(SyncSupplementaryGroups {
+                user: user.clone(),
+                groups: groups.to_vec(),
+            })
+            .await
+            .context(ACTOR_ERROR)?
+    }
+
+    /// Sends [`EnsureGroupsExist`] to the actor and awaits the group creation.
+    pub async fn ensure_groups_exist(&self, groups: &[String]) -> anyhow::Result<()> {
+        self.ensure_groups_exist
+            .call(EnsureGroupsExist {
+                groups: groups.to_vec(),
+            })
+            .await
+            .context(ACTOR_ERROR)?
+    }
+
+    /// Sends [`UpdateAuthorizedKeys`] to the actor and awaits the key update.
+    pub async fn update_authorized_keys(
+        &self,
+        user: &store::User,
+        keys: &public_keys::PublicKeys,
+    ) -> anyhow::Result<()> {
+        self.update_authorized_keys
+            .call(UpdateAuthorizedKeys {
+                user: user.clone(),
+                keys: keys.clone(),
+            })
+            .await
+            .context(ACTOR_ERROR)?
+    }
+}
+
+#[cfg(test)]
+impl UserManager {
+    /// Build a manager backed by a [`backends::testing::TestingUserManager`], so
+    /// tests can mock the response of every operation.
+    pub(crate) fn testing(
+        actor: backends::testing::TestingUserManager,
+        home_archive_dir: path::PathBuf,
+    ) -> Self {
+        Self::from_actor(actor, home_archive_dir)
     }
 }
 
@@ -172,517 +241,228 @@ fn supplementary_groups_update(
     Some(desired.into_iter().collect())
 }
 
-#[cfg(target_os = "linux")]
-mod linux {
-    use super::*;
-    use anyhow::Context as _;
-    use std::{collections, path};
-    use tokio::process;
-
-    #[derive(Clone, Debug)]
-    pub struct LinuxUserManager {
-        /// Directory where home directories of deleted users are archived
-        home_archive_dir: path::PathBuf,
-        authorized_keys: crate::authorized_keys::AuthorizedKeysManager,
-    }
-
-    impl LinuxUserManager {
-        pub fn new(home_archive_dir: path::PathBuf) -> Self {
-            Self {
-                home_archive_dir,
-                authorized_keys: crate::authorized_keys::AuthorizedKeysManager,
-            }
-        }
-    }
-
-    impl CreateUser for LinuxUserManager {
-        #[tracing::instrument(name = "UserManager::create_user", skip(self, user))]
-        async fn create_user(
-            &self,
-            user: &octocrab::models::Author,
-        ) -> anyhow::Result<store::User> {
-            if let Ok(Some(existing_user)) = nix::unistd::User::from_name(&user.login) {
-                tracing::info!(
-                    "User '{}' already exists with UID {}. Skipping creation.",
-                    user.login,
-                    existing_user.uid
-                );
-
-                return Ok(store::User::builder()
-                    .id(user.id)
-                    .uid(existing_user.uid)
-                    .name(user.login.clone())
-                    .build());
-            }
-
-            let mut command = process::Command::new("/usr/sbin/useradd");
-            command
-                .arg("--create-home")
-                .arg("--shell")
-                .arg("/bin/bash")
-                .arg("--password")
-                .arg("!")
-                .arg(&user.login);
-
-            let proc = command.output();
-            let o = proc
-                .await
-                .context("Failed to wait for useradd command to finish")?;
-
-            if o.status.success() {
-                tracing::info!("Created user");
-
-                let linux_user = nix::unistd::User::from_name(&user.login)
-                    .context("Failed to retrieve user info for newly created user ")?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "User '{}' was created but could not be found in the system",
-                            user.login
-                        )
-                    })?;
-
-                Ok(store::User::builder()
-                    .id(user.id)
-                    .uid(linux_user.uid)
-                    .name(user.login.clone())
-                    .build())
-            } else {
-                Err(anyhow::anyhow!(
-                    "Failed to create user: {}",
-                    String::from_utf8_lossy(&o.stderr)
-                ))
-            }
-        }
-    }
-
-    impl DeleteUser for LinuxUserManager {
-        #[tracing::instrument(name = "UserManager::delete_user", skip(self, user), fields(user = %user.name()))]
-        async fn delete_user(&self, user: &store::User) -> anyhow::Result<()> {
-            // userdel operates on the account name, so resolve the account the same way to
-            // guarantee the home directory that is archived is the one userdel --remove deletes
-            let Some(linux_user) = nix::unistd::User::from_name(user.name())? else {
-                // The account may exist under a different name, e.g. when a usermod rename
-                // succeeded but the store update was lost. Whether that is this user or an
-                // unrelated account that reuses the UID can not be decided here, refuse
-                // instead of orphaning the account or deleting a wrong one.
-                if let Some(other_user) = nix::unistd::User::from_uid(user.uid())? {
-                    anyhow::bail!(
-                        "No user named '{}' in the system, but UID {} belongs to '{}', refusing to delete",
-                        user.name(),
-                        user.uid(),
-                        other_user.name
-                    );
-                }
-                tracing::warn!("User not found in system when attempting to delete, nothing to do");
-                return Ok(());
-            };
-            if linux_user.uid != user.uid() {
-                anyhow::bail!(
-                    "User '{}' has UID {} in the system but UID {} in the store, refusing to delete",
-                    user.name(),
-                    linux_user.uid,
-                    user.uid()
-                );
-            }
-
-            // Before deleting the user, we need to kill all their processes to ensure there are no running processes that would prevent deletion
-            kill_processes_for_user(&linux_user).await?;
-
-            // Archive the home directory before userdel --remove deletes it. If archiving
-            // fails, bail out so the user stays in the store and deletion is retried later.
-            let receipt =
-                crate::archiver::archive_home_dir(&self.home_archive_dir, user, &linux_user.dir)
-                    .await
-                    .context("Home directory was not archived, not deleting user")?;
-            if let Some(archive_path) = receipt.archive_path() {
-                tracing::info!(
-                    "Archived home directory '{}' to '{}'",
-                    linux_user.dir.display(),
-                    archive_path.display()
-                );
-            }
-
-            remove_account(user, receipt).await
-        }
-    }
-
-    /// Remove the platform account of a user with `userdel --remove`. Taking an
-    /// [`crate::archiver::ArchiveReceipt`] forces the home directory to be archived before
-    /// the account and its home directory can be deleted.
-    async fn remove_account(
-        user: &store::User,
-        _archived: crate::archiver::ArchiveReceipt,
-    ) -> anyhow::Result<()> {
-        let proc = process::Command::new("/usr/sbin/userdel")
-            .arg("--remove")
-            .arg(user.name())
-            .output();
-
-        let o = proc
-            .await
-            .context("Failed to wait for userdel command to finish")?;
-
-        if o.status.success() {
-            tracing::info!("Deleted user");
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!(
-                "Failed to delete user '{}': {}",
-                user.name(),
-                String::from_utf8_lossy(&o.stderr)
-            ))
-        }
-    }
-
-    impl UpdateUser for LinuxUserManager {
-        #[tracing::instrument(
-            name = "UserManager::update_user",
-            skip(self, gh_user, available_user),
-            fields(from_uid = available_user.uid().as_raw(), from = %available_user.name(), to = %gh_user.login)
-        )]
-        async fn update_user(
-            &self,
-            gh_user: &octocrab::models::Author,
-            available_user: &store::User,
-        ) -> anyhow::Result<store::User> {
-            let linux_user =
-                nix::unistd::User::from_uid(available_user.uid())?.ok_or_else(|| {
-                    anyhow::anyhow!("User not found in system when attempting to update user",)
-                })?;
-
-            if gh_user.login == linux_user.name {
-                return Ok(available_user.clone());
-            }
-
-            kill_processes_for_user(&linux_user).await?;
-            let output = process::Command::new("/usr/sbin/usermod")
-                .arg("--home")
-                .arg(format!("/home/{}", gh_user.login))
-                .arg("--move-home")
-                .arg("--login")
-                .arg(&gh_user.login)
-                .arg(&linux_user.name)
-                .output()
-                .await
-                .context("Failed to execute usermod command")?;
-
-            if output.status.success() {
-                tracing::info!(
-                    "Updated username from '{}' to '{}'",
-                    linux_user.name,
-                    gh_user.login
-                );
-                Ok(store::User::builder()
-                    .id(available_user.id())
-                    .uid(available_user.uid())
-                    .name(gh_user.login.clone())
-                    .build())
-            } else {
-                tracing::error!(
-                    "Failed to update username: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                Err(anyhow::anyhow!(
-                    "Failed to update username for {}: {}",
-                    linux_user.name,
-                    String::from_utf8_lossy(&output.stderr)
-                ))
-            }
-        }
-    }
-
-    impl ManageSupplementaryGroups for LinuxUserManager {
-        #[tracing::instrument(name = "UserManager::sync_supplementary_groups", skip_all, fields(user = %user.name()))]
-        async fn sync_supplementary_groups(
-            &self,
-            user: &store::User,
-            groups: &[String],
-        ) -> anyhow::Result<()> {
-            let linux_user = nix::unistd::User::from_uid(user.uid())
-                .context("Failed to read user before syncing groups")?
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "User '{}' was not found while syncing supplementary groups",
-                        user.name()
-                    )
-                })?;
-
-            let primary_group_name = nix::unistd::Group::from_gid(linux_user.gid)
-                .context("Failed to read primary group while syncing groups")?
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Primary group for '{}' was not found while syncing groups",
-                        user.name()
-                    )
-                })?
-                .name;
-
-            let current_groups = current_supplementary_groups(&linux_user)
-                .with_context(|| format!("Failed to read current groups of '{}'", user.name()))?;
-
-            let Some(supplementary_groups) =
-                super::supplementary_groups_update(groups, &primary_group_name, &current_groups)
-            else {
-                tracing::debug!("Supplementary groups are already up to date");
-                return Ok(());
-            };
-            sync_user_supplementary_groups_by_name(&linux_user.name, &supplementary_groups).await
-        }
-
-        async fn ensure_groups_exists(&self, groups: &[String]) -> anyhow::Result<()> {
-            for group in groups {
-                if nix::unistd::Group::from_name(group)
-                    .with_context(|| format!("Failed to check if group '{}' exists", group))?
-                    .is_some()
-                {
-                    continue;
-                }
-
-                let output = process::Command::new("/usr/sbin/groupadd")
-                    .arg(group)
-                    .output()
-                    .await
-                    .with_context(|| format!("Failed to execute groupadd for '{}'", group))?;
-
-                if output.status.success() {
-                    tracing::info!(group, "Created missing group");
-                } else {
-                    return Err(anyhow::anyhow!(
-                        "Failed to create missing group '{}': {}",
-                        group,
-                        String::from_utf8_lossy(&output.stderr)
-                    ));
-                }
-            }
-
-            Ok(())
-        }
-    }
-
-    /// The names of the supplementary groups the user is currently a member of,
-    /// excluding the primary group
-    fn current_supplementary_groups(
-        user: &nix::unistd::User,
-    ) -> anyhow::Result<collections::BTreeSet<String>> {
-        let user_name = std::ffi::CString::new(user.name.as_str())
-            .context("User name contains an interior NUL byte")?;
-        let gids = nix::unistd::getgrouplist(&user_name, user.gid)
-            .context("Failed to list the user's groups")?;
-
-        let mut names = collections::BTreeSet::new();
-        for gid in gids {
-            if gid == user.gid {
-                continue;
-            }
-            // A group deleted since getgrouplist has no name to compare or pass to
-            // usermod, skip it
-            if let Some(group) = nix::unistd::Group::from_gid(gid)
-                .with_context(|| format!("Failed to resolve group with GID {gid}"))?
-            {
-                names.insert(group.name);
-            }
-        }
-        Ok(names)
-    }
-
-    /// Serializes group-modifying `usermod` invocations. `usermod` fails instead of
-    /// waiting when another process holds the lock on /etc/group, so the concurrent
-    /// per-user syncs must not run it in parallel.
-    static USERMOD_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    async fn sync_user_supplementary_groups_by_name(
-        user_name: &str,
-        supplementary_groups: &[String],
-    ) -> anyhow::Result<()> {
-        let _guard = USERMOD_LOCK.lock().await;
-        let output = process::Command::new("/usr/sbin/usermod")
-            .arg("--groups")
-            .arg(supplementary_groups.join(","))
-            .arg(user_name)
-            .output()
-            .await
-            .context("Failed to execute usermod command for group updates")?;
-
-        if output.status.success() {
-            tracing::info!(
-                user = user_name,
-                groups = ?supplementary_groups,
-                "Synchronized supplementary groups"
-            );
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!(
-                "Failed to update groups for user '{}': {}",
-                user_name,
-                String::from_utf8_lossy(&output.stderr)
-            ))
-        }
-    }
-
-    impl ManageAuthorizedKeys for LinuxUserManager {
-        async fn update_authorized_keys(
-            &self,
-            user: &store::User,
-            keys: &public_keys::PublicKeys,
-        ) -> anyhow::Result<()> {
-            self.authorized_keys
-                .update_authorized_keys(user, keys)
-                .await
-        }
-    }
-
-    #[tracing::instrument(name = "kill_processes", skip(user), fields(user = %user.name))]
-    pub async fn kill_processes_for_user(user: &nix::unistd::User) -> anyhow::Result<()> {
-        let uid = user.uid.as_raw();
-        tokio::task::spawn_blocking(move || {
-            if let Ok(procs) = procfs::process::all_processes() {
-                for proc in procs.flatten() {
-                    if let Ok(stat) = proc.status()
-                        && stat.ruid == uid
-                    {
-                        let pid = nix::unistd::Pid::from_raw(proc.pid);
-                        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
-
-                        tracing::debug!(pid = proc.pid, "Killed process");
-                    }
-                }
-            }
-        })
-        .await?;
-
-        Ok(())
-    }
-}
-
-mod mock {
-    use super::*;
-    use std::sync;
-
-    #[derive(Clone, Debug, bon::Builder)]
-    pub struct MockUserManager {
-        uid_generator: AsyncCounter,
-    }
-
-    impl MockUserManager {
-        pub fn new(base_uid: usize) -> Self {
-            Self {
-                uid_generator: AsyncCounter::new(base_uid),
-            }
-        }
-    }
-
-    impl CreateUser for MockUserManager {
-        async fn create_user(
-            &self,
-            user: &octocrab::models::Author,
-        ) -> anyhow::Result<store::User> {
-            let uid = self.uid_generator.get_next();
-            tracing::info!(
-                "Mock creating user '{}' with UID {} (not actually creating users on non-Linux OS)",
-                user.login,
-                uid
-            );
-            Ok(store::User::builder()
-                .name(user.login.clone())
-                .uid(nix::unistd::Uid::from_raw(uid as _))
-                .id(user.id)
-                .build())
-        }
-    }
-
-    impl DeleteUser for MockUserManager {
-        #[tracing::instrument(name = "UserManager::delete_user", skip(self, user), fields(user = %user.name()))]
-        async fn delete_user(&self, user: &store::User) -> anyhow::Result<()> {
-            tracing::info!("Would archive home directory and delete user");
-            Ok(())
-        }
-    }
-
-    impl ManageAuthorizedKeys for MockUserManager {
-        async fn update_authorized_keys(
-            &self,
-            user: &store::User,
-            _keys: &public_keys::PublicKeys,
-        ) -> anyhow::Result<()> {
-            tracing::info!(
-                "Mock updating authorized keys for user '{}' (not actually managing keys on non-Linux OS)",
-                user.name()
-            );
-            Ok(())
-        }
-    }
-
-    impl UpdateUser for MockUserManager {
-        async fn update_user(
-            &self,
-            gh_user: &octocrab::models::Author,
-            available_user: &store::User,
-        ) -> anyhow::Result<store::User> {
-            if gh_user.login != available_user.name() {
-                tracing::info!(
-                    "Mock updating username from '{}' to '{}' (not actually updating users on non-Linux OS)",
-                    available_user.name(),
-                    gh_user.login
-                );
-                Ok(store::User::builder()
-                    .id(available_user.id())
-                    .uid(available_user.uid())
-                    .name(gh_user.login.clone())
-                    .build())
-            } else {
-                Ok(available_user.clone())
-            }
-        }
-    }
-
-    impl ManageSupplementaryGroups for MockUserManager {
-        async fn sync_supplementary_groups(
-            &self,
-            user: &store::User,
-            groups: &[String],
-        ) -> anyhow::Result<()> {
-            tracing::info!(
-                user = %user.name(),
-                ?groups,
-                "Mock syncing supplementary groups (not actually managing groups on non-Linux OS)"
-            );
-            Ok(())
-        }
-
-        async fn ensure_groups_exists(&self, groups: &[String]) -> anyhow::Result<()> {
-            tracing::info!(
-                "Mock ensuring groups exist: {:?} (not actually managing groups on non-Linux OS)",
-                groups,
-            );
-            Ok(())
-        }
-    }
-
-    #[derive(Clone, Debug)]
-    pub struct AsyncCounter {
-        // Arc allows multiple tasks to own a reference to this same atomic value
-        inner: sync::Arc<sync::atomic::AtomicUsize>,
-    }
-
-    impl AsyncCounter {
-        pub fn new(start: usize) -> Self {
-            Self {
-                inner: sync::Arc::new(sync::atomic::AtomicUsize::new(start)),
-            }
-        }
-
-        // This function can be called from any task to get a unique, incremented number
-        pub fn get_next(&self) -> usize {
-            // fetch_add increments the value and returns the PREVIOUS value.
-            // We add 1 to the result to return the "new" incremented number.
-            self.inner.fetch_add(1, sync::atomic::Ordering::SeqCst) + 1
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_user(id: u64, name: &str) -> store::User {
+        store::User::builder()
+            .id(octocrab::models::UserId(id))
+            .name(name.to_string())
+            .uid(nix::unistd::Uid::from_raw(1000 + id as u32))
+            .build()
+    }
+
+    mod scripted_manager {
+        use super::*;
+
+        #[tokio::test]
+        async fn responses_are_returned_in_order() {
+            let mut actor = backends::testing::TestingUserManager::default();
+            actor
+                .prepare_user_deletion
+                .push_back(Ok(DeletionPreparation::NothingToDo));
+            actor
+                .prepare_user_deletion
+                .push_back(Err(anyhow::anyhow!("scripted failure")));
+            let manager = UserManager::testing(actor, path::PathBuf::new());
+
+            let user = test_user(1, "alice");
+            manager.delete_user(&user).await.unwrap();
+            let err = manager.delete_user(&user).await.unwrap_err();
+            assert!(err.to_string().contains("scripted failure"));
+        }
+
+        #[tokio::test]
+        async fn exhausted_script_fails_with_the_message_name() {
+            let manager = UserManager::testing(Default::default(), path::PathBuf::new());
+
+            let err = manager
+                .ensure_groups_exist(&["developers".to_string()])
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("EnsureGroupsExist"));
+        }
+    }
+
+    mod deletion_flow {
+        use super::*;
+
+        #[tokio::test]
+        async fn archives_the_home_directory_before_removing_the_account() {
+            let home_dir = tempfile::tempdir().unwrap();
+            std::fs::write(home_dir.path().join("notes.txt"), "important").unwrap();
+            let archive_dir = tempfile::tempdir().unwrap();
+
+            let mut actor = backends::testing::TestingUserManager::default();
+            actor
+                .prepare_user_deletion
+                .push_back(Ok(DeletionPreparation::Prepared {
+                    home_dir: home_dir.path().to_path_buf(),
+                }));
+            actor.remove_account.push_back(Ok(()));
+            let manager = UserManager::testing(actor, archive_dir.path().to_path_buf());
+
+            manager.delete_user(&test_user(1, "alice")).await.unwrap();
+
+            // RemoveAccount was consumed from the script, and the archive exists
+            let archives = std::fs::read_dir(archive_dir.path()).unwrap().count();
+            assert!(archives > 0, "expected an archive to be created");
+        }
+
+        #[tokio::test]
+        async fn failed_archive_aborts_the_deletion() {
+            // A home directory that is a plain file makes the archiver refuse
+            let bogus_home = tempfile::NamedTempFile::new().unwrap();
+            let archive_dir = tempfile::tempdir().unwrap();
+
+            let mut actor = backends::testing::TestingUserManager::default();
+            actor
+                .prepare_user_deletion
+                .push_back(Ok(DeletionPreparation::Prepared {
+                    home_dir: bogus_home.path().to_path_buf(),
+                }));
+            // No RemoveAccount response is scripted: reaching it would fail with
+            // "No scripted response left", so the assertion below proves it is never sent
+            let manager = UserManager::testing(actor, archive_dir.path().to_path_buf());
+
+            let err = manager
+                .delete_user(&test_user(1, "alice"))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("not deleting user"));
+        }
+    }
+
+    mod serialization {
+        use super::*;
+        use std::sync::{self, atomic};
+
+        /// Records how many of its handlers run at the same time.
+        struct OverlapProbe {
+            active: sync::Arc<atomic::AtomicUsize>,
+            max_active: sync::Arc<atomic::AtomicUsize>,
+        }
+
+        impl OverlapProbe {
+            async fn probe(&self) {
+                let active = self.active.fetch_add(1, atomic::Ordering::SeqCst) + 1;
+                self.max_active.fetch_max(active, atomic::Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                self.active.fetch_sub(1, atomic::Ordering::SeqCst);
+            }
+        }
+
+        impl hannibal::Actor for OverlapProbe {}
+
+        impl hannibal::Handler<PrepareUserDeletion> for OverlapProbe {
+            async fn handle(
+                &mut self,
+                _ctx: &mut hannibal::Context<Self>,
+                _msg: PrepareUserDeletion,
+            ) -> anyhow::Result<DeletionPreparation> {
+                self.probe().await;
+                Ok(DeletionPreparation::NothingToDo)
+            }
+        }
+
+        impl hannibal::Handler<SyncSupplementaryGroups> for OverlapProbe {
+            async fn handle(
+                &mut self,
+                _ctx: &mut hannibal::Context<Self>,
+                _msg: SyncSupplementaryGroups,
+            ) -> anyhow::Result<()> {
+                self.probe().await;
+                Ok(())
+            }
+        }
+
+        // The remaining messages are not exercised; the impls only complete the
+        // handler set `UserManager::from_actor` requires.
+        impl hannibal::Handler<CreateUser> for OverlapProbe {
+            async fn handle(
+                &mut self,
+                _ctx: &mut hannibal::Context<Self>,
+                _msg: CreateUser,
+            ) -> anyhow::Result<store::User> {
+                Err(anyhow::anyhow!("not exercised"))
+            }
+        }
+
+        impl hannibal::Handler<UpdateUser> for OverlapProbe {
+            async fn handle(
+                &mut self,
+                _ctx: &mut hannibal::Context<Self>,
+                _msg: UpdateUser,
+            ) -> anyhow::Result<store::User> {
+                Err(anyhow::anyhow!("not exercised"))
+            }
+        }
+
+        impl hannibal::Handler<RemoveAccount> for OverlapProbe {
+            async fn handle(
+                &mut self,
+                _ctx: &mut hannibal::Context<Self>,
+                _msg: RemoveAccount,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl hannibal::Handler<EnsureGroupsExist> for OverlapProbe {
+            async fn handle(
+                &mut self,
+                _ctx: &mut hannibal::Context<Self>,
+                _msg: EnsureGroupsExist,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl hannibal::Handler<UpdateAuthorizedKeys> for OverlapProbe {
+            async fn handle(
+                &mut self,
+                _ctx: &mut hannibal::Context<Self>,
+                _msg: UpdateAuthorizedKeys,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        /// Regression test for the flaky "cannot lock /etc/passwd" failures: however
+        /// many callers use the handle concurrently, the actor must run the platform
+        /// operations one at a time.
+        #[tokio::test]
+        async fn concurrent_operations_never_overlap() {
+            let active = sync::Arc::new(atomic::AtomicUsize::new(0));
+            let max_active = sync::Arc::new(atomic::AtomicUsize::new(0));
+            let manager = UserManager::from_actor(
+                OverlapProbe {
+                    active: active.clone(),
+                    max_active: max_active.clone(),
+                },
+                path::PathBuf::new(),
+            );
+
+            let user = test_user(1, "alice");
+            let calls = (0..8).map(|i| {
+                let manager = &manager;
+                let user = &user;
+                async move {
+                    if i % 2 == 0 {
+                        manager.delete_user(user).await
+                    } else {
+                        manager.sync_supplementary_groups(user, &[]).await
+                    }
+                }
+            });
+
+            for result in futures::future::join_all(calls).await {
+                result.unwrap();
+            }
+            assert_eq!(max_active.load(atomic::Ordering::SeqCst), 1);
+        }
+    }
 
     mod supplementary_groups_update {
         use super::*;
