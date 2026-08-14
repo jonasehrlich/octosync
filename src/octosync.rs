@@ -136,9 +136,6 @@ impl Octosync {
         user: &store::User,
     ) -> anyhow::Result<store::User> {
         tracing::debug!("User exists in store");
-
-        // TODO: re-create the user if it no longer exists on the platform
-
         self.user_manager.update_user(gh_user, user).await
     }
 

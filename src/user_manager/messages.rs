@@ -13,7 +13,9 @@ pub struct CreateUser {
 }
 
 /// Renames the platform user of `available_user` (login and home directory) to the
-/// GitHub login of `gh_user`.
+/// GitHub login of `gh_user`, re-creating the account with the stored name and UID
+/// first when it no longer exists on the system. Refuses when the stored UID or name
+/// belongs to a different account.
 #[hannibal::message(response = anyhow::Result<store::User>)]
 pub struct UpdateUser {
     pub gh_user: octocrab::models::Author,
@@ -21,8 +23,9 @@ pub struct UpdateUser {
 }
 
 /// Prepares the deletion of a platform user: verifies that the stored user still
-/// matches the platform account and stops everything that could block the deletion
-/// or keep writing to the home directory while it is archived.
+/// matches the platform account, expires the account so no new session can start,
+/// and stops everything that could block the deletion or keep writing to the home
+/// directory while it is archived.
 #[hannibal::message(response = anyhow::Result<DeletionPreparation>)]
 pub struct PrepareUserDeletion {
     pub user: store::User,
