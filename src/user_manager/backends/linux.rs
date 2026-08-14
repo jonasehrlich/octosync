@@ -387,7 +387,10 @@ impl hannibal::Handler<ExpireAccount> for LinuxUserManager {
         // Remove access granted through supplementary groups.
         let groups = strip_supplementary_groups(&linux_user).await;
 
-        scheduled_jobs.and(sweep).and(groups)
+        // Remove both fetched and manually configured SSH access.
+        let keys = crate::authorized_keys::remove_authorized_keys(&linux_user);
+
+        scheduled_jobs.and(sweep).and(groups).and(keys)
     }
 }
 

@@ -4,6 +4,10 @@
 
 use crate::public_keys;
 use anyhow::Context as _;
+use nix::errno::Errno;
+use nix::fcntl::{OFlag, open, openat};
+use nix::sys::stat::Mode;
+use nix::unistd::{UnlinkatFlags, fsync, unlinkat};
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path;
 use tokio::{fs, io};
@@ -31,6 +35,69 @@ pub async fn update_authorized_keys(
         system_user.gid,
     )
     .await
+}
+
+#[tracing::instrument(
+    name = "authorized_keys::remove_authorized_keys",
+    skip_all,
+    fields(user = %system_user.name)
+)]
+pub fn remove_authorized_keys(system_user: &nix::unistd::User) -> anyhow::Result<()> {
+    remove_authorized_keys_from(&system_user.dir)
+}
+
+/// Remove all SSH keys through an open `.ssh` directory descriptor so a concurrent
+/// directory replacement cannot redirect the deletion elsewhere.
+fn remove_authorized_keys_from(home_dir: &path::Path) -> anyhow::Result<()> {
+    let directory_flags =
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    let home = match open(home_dir, directory_flags, Mode::empty()) {
+        Ok(home) => home,
+        Err(Errno::ENOENT) => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("Failed to open home directory '{}'", home_dir.display())
+            });
+        }
+    };
+    let ssh_dir = match openat(&home, ".ssh", directory_flags, Mode::empty()) {
+        Ok(ssh_dir) => ssh_dir,
+        Err(Errno::ENOENT) => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to open '.ssh' in '{}'", home_dir.display()));
+        }
+    };
+
+    match unlinkat(
+        &ssh_dir,
+        AUTHORIZED_KEYS_FILE_NAME,
+        UnlinkatFlags::NoRemoveDir,
+    ) {
+        Ok(()) => {}
+        Err(Errno::ENOENT) => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "Failed to remove authorized_keys from '{}/.ssh'",
+                    home_dir.display()
+                )
+            });
+        }
+    }
+    fsync(&ssh_dir).with_context(|| {
+        format!(
+            "Failed to persist authorized_keys removal in '{}/.ssh'",
+            home_dir.display()
+        )
+    })?;
+
+    tracing::info!(
+        "Removed all authorized keys from '{}/.ssh/{}'",
+        home_dir.display(),
+        AUTHORIZED_KEYS_FILE_NAME
+    );
+    Ok(())
 }
 
 /// Replace the managed block while preserving content outside it.
@@ -552,5 +619,68 @@ mod tests {
         let result = sync_authorized_keys(&ssh_dir, &keys(&[KEY1]), uid, gid).await;
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn departure_removes_all_authorized_keys() {
+        let tmp = tempfile::TempDir::new().expect("Failed to create temp dir");
+        let ssh_dir = tmp.path().join(".ssh");
+        std::fs::create_dir(&ssh_dir).expect("mkdir failed");
+        let authorized_keys = ssh_dir.join(AUTHORIZED_KEYS_FILE_NAME);
+        std::fs::write(
+            &authorized_keys,
+            format!("ssh-rsa MANUAL manually@added\n{}", block(&[KEY1])),
+        )
+        .expect("write failed");
+
+        remove_authorized_keys_from(tmp.path()).expect("removal failed");
+
+        assert!(!authorized_keys.exists());
+    }
+
+    #[test]
+    fn departure_without_authorized_keys_is_a_noop() {
+        let tmp = tempfile::TempDir::new().expect("Failed to create temp dir");
+
+        remove_authorized_keys_from(tmp.path()).expect("missing .ssh should be accepted");
+        std::fs::create_dir(tmp.path().join(".ssh")).expect("mkdir failed");
+        remove_authorized_keys_from(tmp.path()).expect("missing file should be accepted");
+    }
+
+    #[test]
+    fn departure_refuses_symlinked_ssh_dir() {
+        let tmp = tempfile::TempDir::new().expect("Failed to create temp dir");
+        let target = tmp.path().join("target-dir");
+        std::fs::create_dir(&target).expect("mkdir failed");
+        let victim = target.join(AUTHORIZED_KEYS_FILE_NAME);
+        std::fs::write(&victim, "must remain").expect("write failed");
+        std::os::unix::fs::symlink(&target, tmp.path().join(".ssh")).expect("symlink failed");
+
+        let result = remove_authorized_keys_from(tmp.path());
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(victim).expect("read failed"),
+            "must remain"
+        );
+    }
+
+    #[test]
+    fn departure_unlinks_authorized_keys_symlink_without_following_it() {
+        let tmp = tempfile::TempDir::new().expect("Failed to create temp dir");
+        let ssh_dir = tmp.path().join(".ssh");
+        std::fs::create_dir(&ssh_dir).expect("mkdir failed");
+        let victim = tmp.path().join("victim");
+        std::fs::write(&victim, "must remain").expect("write failed");
+        let authorized_keys = ssh_dir.join(AUTHORIZED_KEYS_FILE_NAME);
+        std::os::unix::fs::symlink(&victim, &authorized_keys).expect("symlink failed");
+
+        remove_authorized_keys_from(tmp.path()).expect("removal failed");
+
+        assert!(!authorized_keys.exists());
+        assert_eq!(
+            std::fs::read_to_string(victim).expect("read failed"),
+            "must remain"
+        );
     }
 }
