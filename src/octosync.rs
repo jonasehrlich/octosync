@@ -335,14 +335,18 @@ impl Octosync {
         store.save().await
     }
 
-    /// Record the given users as departed and converge every departed account toward
-    /// its expiry.
+    /// Record the given users as departed and tear down every departed account whose
+    /// teardown has not completed yet.
     ///
-    /// The tombstones are saved before any account is expired, so the departure record
-    /// survives a crash anywhere in the expiry window. Every departed user is
-    /// re-expired on each sync: [`user_manager::ExpireAccount`] is idempotent, so an
-    /// expiry interrupted between the store save and the platform call is finished by
-    /// a later sync and a failed expiry needs no in-memory retry state.
+    /// The tombstones are saved before any account is torn down, so the departure
+    /// record survives a crash anywhere in the expiry window. A tombstone only carries
+    /// the completion timestamp once [`user_manager::ExpireAccount`] succeeded, so a
+    /// teardown that failed or was interrupted is retried by the next sync without
+    /// in-memory retry state, while a completed one is left alone instead of paying the
+    /// full teardown again on every sync of the retention period.
+    ///
+    /// The account of a departed member is therefore not reconciled continuously: an
+    /// expiry lifted by hand stays lifted until the member is synced again.
     async fn depart_and_expire(
         &self,
         store: &mut store::UserStore,
@@ -355,23 +359,25 @@ impl Octosync {
         }
         store.save().await?;
 
-        // Failures are only logged: the tombstone stays in the store, so the expiry is
-        // retried on every sync. Sequential, the platform operations serialize on the
-        // user manager actor anyway.
-        for departed_user in store.departed().values() {
-            if let Err(e) = self
-                .user_manager
-                .expire_user(&store::User::from(departed_user))
-                .await
-            {
-                tracing::error!(
-                    "Failed to expire the account of '{}': {:?}",
-                    departed_user.name(),
-                    e
-                );
+        let pending: Vec<store::User> = store
+            .departed()
+            .values()
+            .filter(|tombstone| tombstone.expired_at().is_none())
+            .map(store::User::from)
+            .collect();
+
+        // Failures are only logged: the tombstone keeps its empty completion timestamp,
+        // so the teardown is retried on the next sync. Sequential, the platform
+        // operations serialize on the user manager actor anyway.
+        for user in pending {
+            match self.user_manager.expire_user(&user).await {
+                Ok(()) => store.mark_expired(&user.id(), chrono::Utc::now()),
+                Err(e) => {
+                    tracing::error!("Failed to expire the account of '{}': {:?}", user.name(), e)
+                }
             }
         }
-        Ok(())
+        store.save().await
     }
 
     /// Process all org members concurrently and collect the successfully processed
@@ -878,13 +884,15 @@ mod tests {
                 .unwrap();
             let tombstone = &saved.departed()[&octocrab::models::UserId(1)];
             assert_eq!(tombstone.name(), "alice");
+            // No completion timestamp, so the next sync retries the teardown
+            assert!(tombstone.expired_at().is_none());
             assert!(saved.data().is_empty());
         }
 
-        /// A departed user is re-expired on every sync, so an expiry that failed or
-        /// was interrupted converges without in-memory retry state.
+        /// A tombstone whose teardown never completed is retried by a later sync, so a
+        /// failed or interrupted expiry converges without in-memory retry state.
         #[tokio::test]
-        async fn depart_and_expire_re_expires_existing_tombstones() {
+        async fn depart_and_expire_retries_an_unfinished_tombstone() {
             let mut actor = TestingUserManager::default();
             actor.expire_account.push_back(Ok(()));
             let expired_users = actor.expired_users.clone();
@@ -892,13 +900,41 @@ mod tests {
             let mut store = store::UserStore::new(data_dir.path(), false).await.unwrap();
             store.depart_user(user(1, "alice"), chrono::Utc::now());
 
-            // No leavers this sync, the existing tombstone alone drives the expiry
+            // No leavers this sync, the unfinished tombstone alone drives the teardown
             octosync
                 .depart_and_expire(&mut store, vec![])
                 .await
                 .unwrap();
 
             assert_eq!(*expired_users.lock().unwrap(), ["alice"]);
+            assert!(
+                store.departed()[&octocrab::models::UserId(1)]
+                    .expired_at()
+                    .is_some()
+            );
+        }
+
+        /// A tombstone whose teardown completed is left alone for the rest of the
+        /// retention period, instead of paying the full teardown on every sync.
+        #[tokio::test]
+        async fn depart_and_expire_skips_a_finished_tombstone() {
+            // No scripted response: reaching the actor would fail with "No scripted
+            // response left", which the loop only logs, so the assertion below is what
+            // proves the message is never sent
+            let actor = TestingUserManager::default();
+            let expired_users = actor.expired_users.clone();
+            let (octosync, data_dir) = octosync_with(actor);
+            let mut store = store::UserStore::new(data_dir.path(), false).await.unwrap();
+            let now = chrono::Utc::now();
+            store.depart_user(user(1, "alice"), now);
+            store.mark_expired(&octocrab::models::UserId(1), now);
+
+            octosync
+                .depart_and_expire(&mut store, vec![])
+                .await
+                .unwrap();
+
+            assert!(expired_users.lock().unwrap().is_empty());
         }
 
         /// The `delete` command tombstones every user instead of removing the store

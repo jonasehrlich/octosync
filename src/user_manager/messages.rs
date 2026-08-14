@@ -54,8 +54,9 @@ pub struct UpdateUser {
 /// record, so the departure is a reversible lockout that a rejoin heals, until the
 /// purge removes the account after the retention period.
 ///
-/// Idempotent, so the sync can send it for every departed user on every run and an
-/// expiry interrupted at any point converges.
+/// Idempotent, so an expiry interrupted at any point converges when a later sync
+/// retries it. The sync only sends it for a tombstone whose teardown has not completed
+/// yet, so the retry is driven by the store rather than by re-sending it every run.
 #[hannibal::message(response = anyhow::Result<()>)]
 pub struct ExpireAccount {
     pub user: store::User,

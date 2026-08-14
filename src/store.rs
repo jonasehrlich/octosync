@@ -119,6 +119,13 @@ pub struct DepartedUser {
     gid: Option<unistd::Gid>,
     /// When the member departed and their account was expired
     departed_at: chrono::DateTime<chrono::Utc>,
+    /// When the account teardown completed: the account expired, its scheduled work
+    /// removed, its sessions ended and its supplementary groups stripped. `None` while
+    /// the teardown has not run or did not finish, which is what makes the sync retry
+    /// it; a tombstone that carries the timestamp is left alone for the rest of the
+    /// retention period.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expired_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[allow(unused)]
@@ -146,6 +153,11 @@ impl DepartedUser {
     /// Get the time the member departed
     pub fn departed_at(&self) -> chrono::DateTime<chrono::Utc> {
         self.departed_at
+    }
+
+    /// Get the time the account teardown completed, `None` while it still has to run
+    pub fn expired_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.expired_at
     }
 }
 
@@ -318,8 +330,21 @@ impl UserStore {
                 uid: user.uid,
                 gid: user.gid,
                 departed_at,
+                expired_at: None,
             },
         );
+    }
+
+    /// Record that the account teardown of a departed user completed, so later syncs
+    /// leave the tombstone alone instead of tearing the account down again
+    pub fn mark_expired(
+        &mut self,
+        id: &octocrab::models::UserId,
+        expired_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        if let Some(departed) = self.departed.get_mut(id) {
+            departed.expired_at = Some(expired_at);
+        }
     }
 
     /// Move a departed tombstone to the purged map, keeping its IDs for a rejoin even
@@ -492,6 +517,7 @@ mod tests {
             uid: unistd::Uid::from_raw(1005),
             gid: Some(unistd::Gid::from_raw(1005)),
             departed_at: departed_at(),
+            expired_at: Some(departed_at()),
         }
     }
 
@@ -918,6 +944,7 @@ mod tests {
                 uid: user.uid,
                 gid: user.gid,
                 departed_at: departed_at(),
+                expired_at: None,
             }
         }
     }

@@ -408,20 +408,43 @@ impl hannibal::Handler<ExpireAccount> for LinuxUserManager {
         };
 
         // Expire first, so no new session (password or pubkey SSH) can start while
-        // the running ones are ended
+        // the running ones are ended. The one step whose failure aborts the teardown:
+        // without the expiry the account stays reachable and the rest is cosmetic.
         expire_account(&linux_user.name).await?;
 
+        // The steps below revoke different kinds of access and none of them is a
+        // precondition of another, so a failing one must not skip the others: a
+        // process stuck in uninterruptible I/O may not keep the departed member in
+        // their supplementary groups for the whole retention period. The first error
+        // is returned once all of them ran, so the tombstone-driven retry on the next
+        // sync still converges.
+        let mut error = None;
+
         // Before the sweep, so no scheduled job can spawn processes into the teardown
-        remove_scheduled_jobs(&linux_user).await?;
+        keep_first_error(&mut error, remove_scheduled_jobs(&linux_user).await);
 
         // logind first, then the sweep as the catch-all for processes outside logind's
         // session scopes and as the sole mechanism on systems without logind
         end_logind_sessions(&linux_user).await;
-        kill_processes_for_user(&linux_user).await?;
+        keep_first_error(&mut error, kill_processes_for_user(&linux_user).await);
 
         // octosync owns the supplementary groups of synced users, and a departed
         // member keeps no access granted through them
-        strip_supplementary_groups(&linux_user).await
+        keep_first_error(&mut error, strip_supplementary_groups(&linux_user).await);
+
+        error.map_or(Ok(()), Err)
+    }
+}
+
+/// Keep the first error of the independent teardown steps, so one failing step does
+/// not skip the following ones. Only the first is returned, so a later one is logged
+/// here instead of being lost.
+fn keep_first_error(first: &mut Option<anyhow::Error>, result: anyhow::Result<()>) {
+    if let Err(e) = result {
+        match first {
+            None => *first = Some(e),
+            Some(_) => tracing::error!("Another teardown step of the account failed: {e:#}"),
+        }
     }
 }
 
@@ -435,12 +458,19 @@ impl hannibal::Handler<ExpireAccount> for LinuxUserManager {
 /// machine, while a logind that answers and then refuses leaves session scopes and a
 /// lingering user manager behind that the sweep cannot clean up.
 async fn end_logind_sessions(user: &nix::unistd::User) {
-    let connection = match zbus::Connection::system().await {
-        Ok(connection) => connection,
+    let connection = match tokio::time::timeout(LOGIND_TIMEOUT, zbus::Connection::system()).await {
+        Ok(Ok(connection)) => connection,
         // A container or a machine without systemd: the process sweep is the whole
         // mechanism here, so this is an expected state rather than a failure
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::debug!("No system bus, ending sessions with the process sweep alone: {e}");
+            return;
+        }
+        Err(_) => {
+            tracing::error!(
+                "Connecting to the system bus timed out, ending sessions with the process \
+                 sweep alone"
+            );
             return;
         }
     };
@@ -449,16 +479,39 @@ async fn end_logind_sessions(user: &nix::unistd::User) {
     }
 }
 
+/// Deadline for a single logind D-Bus operation.
+///
+/// zbus applies no reply timeout of its own, and the bus does not enforce one on the
+/// method calls it forwards, so a wedged logind would never answer. The teardown runs
+/// inside the actor, which would leave every following platform operation waiting
+/// behind it for as long as logind stays wedged.
+const LOGIND_TIMEOUT: time::Duration = time::Duration::from_secs(5);
+
+/// Await a logind D-Bus operation, failing after [`LOGIND_TIMEOUT`] instead of waiting
+/// for a reply that may never come.
+async fn with_logind_timeout<T>(
+    operation: &str,
+    call: impl Future<Output = zbus::Result<T>>,
+) -> anyhow::Result<T> {
+    tokio::time::timeout(LOGIND_TIMEOUT, call)
+        .await
+        .with_context(|| format!("logind did not answer '{operation}' in time"))?
+        .with_context(|| format!("logind call '{operation}' failed"))
+}
+
 /// Disable linger for the user and terminate their sessions over logind's D-Bus API.
 ///
 /// `TerminateUser` returns once the stop jobs are queued rather than once the
 /// processes are gone, so the caller's sweep is what establishes that they exited.
 async fn terminate_logind_user(connection: &zbus::Connection, uid: u32) -> anyhow::Result<()> {
-    let manager = zbus::Proxy::new(
-        connection,
-        "org.freedesktop.login1",
-        "/org/freedesktop/login1",
-        "org.freedesktop.login1.Manager",
+    let manager = with_logind_timeout(
+        "Manager proxy",
+        zbus::Proxy::new(
+            connection,
+            "org.freedesktop.login1",
+            "/org/freedesktop/login1",
+            "org.freedesktop.login1.Manager",
+        ),
     )
     .await
     .context("Failed to create the logind manager proxy")?;
@@ -466,26 +519,36 @@ async fn terminate_logind_user(connection: &zbus::Connection, uid: u32) -> anyho
     // Disabling linger keeps a `user@.service` from restarting user services after the
     // termination, but it is the lesser half: a surviving login session matters more,
     // so a failure here must not skip the termination below
-    if let Err(e) = manager
-        .call::<_, _, ()>("SetUserLinger", &(uid, false, false))
-        .await
+    if let Err(e) = with_logind_timeout(
+        "SetUserLinger",
+        manager.call::<_, _, ()>("SetUserLinger", &(uid, false, false)),
+    )
+    .await
     {
-        tracing::warn!("Failed to disable linger, terminating the sessions anyway: {e}");
+        tracing::warn!("Failed to disable linger, terminating the sessions anyway: {e:#}");
     }
 
     // GetUser errors when the user neither has a session nor lingers, the usual state
-    // of a departed account that is re-expired by a later sync: nothing to terminate
-    if manager
-        .call::<_, _, zbus::zvariant::OwnedObjectPath>("GetUser", &uid)
-        .await
-        .is_err()
+    // of a departed account whose teardown is retried by a later sync: nothing to
+    // terminate.
+    // A timed-out GetUser lands here too, which is the right move: a logind that is
+    // not answering will not terminate anything either, so the sweep takes over
+    // instead of the teardown waiting out a second deadline.
+    if let Err(e) = with_logind_timeout(
+        "GetUser",
+        manager.call::<_, _, zbus::zvariant::OwnedObjectPath>("GetUser", &uid),
+    )
+    .await
     {
+        tracing::debug!("logind reports no user to terminate: {e:#}");
         return Ok(());
     }
-    manager
-        .call::<_, _, ()>("TerminateUser", &uid)
-        .await
-        .context("Failed to terminate the user's sessions")
+    with_logind_timeout(
+        "TerminateUser",
+        manager.call::<_, _, ()>("TerminateUser", &uid),
+    )
+    .await
+    .context("Failed to terminate the user's sessions")
 }
 
 /// Remove the departed user's scheduled work, which outlives their sessions: cron and
@@ -592,7 +655,7 @@ async fn optional_command(
 
 /// Remove the user from all supplementary groups, so a departed member keeps no
 /// access granted through them. The usermod is skipped when there is nothing to
-/// remove, keeping the re-expiry on every sync cheap.
+/// remove.
 async fn strip_supplementary_groups(user: &nix::unistd::User) -> anyhow::Result<()> {
     let current = current_supplementary_groups(user)
         .with_context(|| format!("Failed to read current groups of '{}'", user.name))?;
@@ -876,8 +939,8 @@ fn days_since_epoch() -> anyhow::Result<i64> {
 /// its date, so the departure day itself could keep logins open until midnight.
 async fn expire_account(name: &str) -> anyhow::Result<()> {
     let expire_days = days_since_epoch()? - 1;
-    // A departed account is re-expired on every sync; skip the usermod when the
-    // expiry is already in effect
+    // A teardown that is retried meets an account that is already expired; skip the
+    // usermod when the expiry is in effect
     if account_expire_days(name)?.is_some_and(|days| days <= expire_days) {
         return Ok(());
     }
