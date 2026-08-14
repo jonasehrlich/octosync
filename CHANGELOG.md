@@ -25,6 +25,8 @@
 - Kill a user's processes a second time right before `userdel`, so a process spawned while the home
   directory was archived cannot fail the deletion
   ([#19](https://github.com/jonasehrlich/octosync/pull/19))
+- Stop user processes gracefully: send SIGTERM first and SIGKILL only the processes still running
+  after a grace period ([#19](https://github.com/jonasehrlich/octosync/pull/19))
 
 ## v0.3.0
 

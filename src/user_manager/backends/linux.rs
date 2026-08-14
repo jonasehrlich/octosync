@@ -9,7 +9,7 @@ use crate::user_manager::{
     SyncSupplementaryGroups, UpdateAuthorizedKeys, UpdateUser, supplementary_groups_update,
 };
 use anyhow::Context as _;
-use std::collections;
+use std::{collections, time};
 use tokio::process;
 
 #[derive(Debug)]
@@ -416,24 +416,65 @@ async fn sync_user_supplementary_groups_by_name(
     }
 }
 
+/// Grace period a SIGTERM'd process gets to exit before it is killed
+const KILL_GRACE_PERIOD: time::Duration = time::Duration::from_secs(3);
+/// Poll interval while waiting for terminated processes to exit
+const KILL_POLL_INTERVAL: time::Duration = time::Duration::from_millis(200);
+
+/// Stop all processes of the user: SIGTERM first so they can shut down cleanly, then
+/// SIGKILL whatever is still running after [`KILL_GRACE_PERIOD`].
+///
+/// Runs inside the actor, so the grace period stalls other platform operations. It is
+/// only paid when the user actually has running processes.
 #[tracing::instrument(name = "kill_processes", skip(user), fields(user = %user.name))]
 async fn kill_processes_for_user(user: &nix::unistd::User) -> anyhow::Result<()> {
     let uid = user.uid.as_raw();
-    tokio::task::spawn_blocking(move || {
-        if let Ok(procs) = procfs::process::all_processes() {
-            for proc in procs.flatten() {
-                if let Ok(stat) = proc.status()
-                    && stat.ruid == uid
-                {
-                    let pid = nix::unistd::Pid::from_raw(proc.pid);
-                    let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+    let procs = processes_of_uid(uid).await?;
+    if procs.is_empty() {
+        return Ok(());
+    }
+    signal_processes(&procs, nix::sys::signal::Signal::SIGTERM);
 
-                    tracing::debug!(pid = proc.pid, "Killed process");
-                }
-            }
+    let deadline = tokio::time::Instant::now() + KILL_GRACE_PERIOD;
+    let remaining = loop {
+        tokio::time::sleep(KILL_POLL_INTERVAL).await;
+        let remaining = processes_of_uid(uid).await?;
+        if remaining.is_empty() {
+            tracing::debug!("All processes exited after SIGTERM");
+            return Ok(());
         }
-    })
-    .await?;
+        if tokio::time::Instant::now() >= deadline {
+            break remaining;
+        }
+    };
 
+    tracing::debug!(
+        count = remaining.len(),
+        "Processes still running after the grace period, killing them"
+    );
+    signal_processes(&remaining, nix::sys::signal::Signal::SIGKILL);
     Ok(())
+}
+
+/// PIDs of all processes whose real UID is `uid`
+async fn processes_of_uid(uid: u32) -> anyhow::Result<Vec<nix::unistd::Pid>> {
+    tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<nix::unistd::Pid>> {
+        let procs = procfs::process::all_processes().context("Failed to list processes")?;
+        // Processes that exit while being inspected are skipped
+        Ok(procs
+            .flatten()
+            .filter(|proc| proc.status().is_ok_and(|stat| stat.ruid == uid))
+            .map(|proc| nix::unistd::Pid::from_raw(proc.pid))
+            .collect())
+    })
+    .await
+    .context("Process listing task failed")?
+}
+
+/// Send `signal` to all `pids`. A process that is already gone is not an error.
+fn signal_processes(pids: &[nix::unistd::Pid], signal: nix::sys::signal::Signal) {
+    for &pid in pids {
+        let _ = nix::sys::signal::kill(pid, signal);
+        tracing::debug!(pid = pid.as_raw(), ?signal, "Signaled process");
+    }
 }
