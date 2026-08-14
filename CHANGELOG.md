@@ -55,6 +55,10 @@
 - A dry run no longer writes the users database: previously new members were persisted with invented
   mock UIDs and leavers were tombstoned for real, so a later real run acted on preview data.
   ([#25](https://github.com/jonasehrlich/octosync/pull/25))
+- Every mutating operation resolves the account through one shared name and UID cross-check. Syncing
+  supplementary groups previously trusted the stored UID alone, so a stale UID could strip the
+  supplementary groups (e.g. `sudo`) of an unrelated account that reuses it.
+  ([#25](https://github.com/jonasehrlich/octosync/pull/25))
 - Track the primary group GID in the store and re-create a rejoining member's private group with
   `groupadd --gid <stored>` before `useradd --gid <stored>`, so group ownership of files outside the
   home directory also survives a removal and re-create cycle. A GID that meanwhile belongs to

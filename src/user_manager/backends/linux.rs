@@ -328,24 +328,14 @@ impl hannibal::Handler<UpdateUser> for LinuxUserManager {
         msg: UpdateUser,
     ) -> anyhow::Result<store::User> {
         let (gh_user, available_user) = (&msg.gh_user, &msg.available_user);
-        let linux_user = match nix::unistd::User::from_uid(available_user.uid())? {
-            Some(linux_user) => linux_user,
+        // The GitHub login is accepted as an alternate name so a rename whose store
+        // update was lost is picked up instead of refused
+        let linux_user = match resolve_account(available_user, Some(&gh_user.login))? {
+            AccountResolution::Matches(linux_user) => linux_user,
             // The account is known in the store but gone from the system, e.g. deleted
             // by hand
-            None => recreate_account(gh_user, available_user).await?,
+            AccountResolution::Missing => recreate_account(gh_user, available_user).await?,
         };
-
-        // The stored UID may have been freed and recycled by an unrelated account. Only
-        // the stored name (the normal case) or the GitHub login (a rename whose store
-        // update was lost) prove this is the managed account.
-        if linux_user.name != available_user.name() && linux_user.name != gh_user.login {
-            anyhow::bail!(
-                "UID {} belongs to '{}', not to stored user '{}', refusing to update",
-                available_user.uid(),
-                linux_user.name,
-                available_user.name()
-            );
-        }
 
         // The account may carry an expiry that should no longer be in effect, e.g.
         // one set by an operator: octosync owns the lifecycle of synced users
@@ -412,7 +402,7 @@ impl hannibal::Handler<ExpireAccount> for LinuxUserManager {
         _ctx: &mut hannibal::Context<Self>,
         msg: ExpireAccount,
     ) -> anyhow::Result<()> {
-        let Some(linux_user) = resolve_account_checked(&msg.user)? else {
+        let AccountResolution::Matches(linux_user) = resolve_account(&msg.user, None)? else {
             tracing::warn!("User not found in system when attempting to expire, nothing to do");
             return Ok(());
         };
@@ -520,7 +510,7 @@ impl hannibal::Handler<PurgeAccount> for LinuxUserManager {
         _ctx: &mut hannibal::Context<Self>,
         msg: PurgeAccount,
     ) -> anyhow::Result<PurgeOutcome> {
-        let Some(linux_user) = resolve_account_checked(&msg.user)? else {
+        let AccountResolution::Matches(linux_user) = resolve_account(&msg.user, None)? else {
             return Ok(PurgeOutcome::NoAccount);
         };
 
@@ -571,14 +561,15 @@ impl hannibal::Handler<SyncSupplementaryGroups> for LinuxUserManager {
         msg: SyncSupplementaryGroups,
     ) -> anyhow::Result<()> {
         let user = &msg.user;
-        let linux_user = nix::unistd::User::from_uid(user.uid())
-            .context("Failed to read user before syncing groups")?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "User '{}' was not found while syncing supplementary groups",
-                    user.name()
-                )
-            })?;
+        // octosync owns the supplementary groups of synced users, so acting on a
+        // stale UID would strip the groups of an unrelated account
+        let linux_user = match resolve_account(user, None)? {
+            AccountResolution::Matches(linux_user) => linux_user,
+            AccountResolution::Missing => anyhow::bail!(
+                "User '{}' was not found while syncing supplementary groups",
+                user.name()
+            ),
+        };
 
         let primary_group_name = nix::unistd::Group::from_gid(linux_user.gid)
             .context("Failed to read primary group while syncing groups")?
@@ -656,18 +647,36 @@ impl hannibal::Handler<UpdateAuthorizedKeys> for LinuxUserManager {
     }
 }
 
-/// Resolve the platform account of a stored user for its expiry or purge, refusing
-/// when name and UID do not match. `Ok(None)` when no account with that name exists
-/// and the UID is unused.
-fn resolve_account_checked(user: &store::User) -> anyhow::Result<Option<nix::unistd::User>> {
-    // usermod and userdel operate on the account name, so resolve the account by name
-    // to guarantee the account acted on is the one the name addresses
+/// Result of [`resolve_account`]: the platform account of a stored user, or proof
+/// that none exists. A store that disagrees with the system is an error, never a
+/// variant, so no caller can act on a possibly wrong account.
+enum AccountResolution {
+    /// No account with the stored name exists and the stored UID is unused
+    Missing,
+    /// The account whose name and UID agree with the store
+    Matches(nix::unistd::User),
+}
+
+/// Resolve the platform account of a stored user, the one cross-check every mutating
+/// handler routes through: shadow-utils commands operate on the account name, so the
+/// name is authoritative and the stored UID must agree with it. Acting on a name
+/// whose UID moved on, or a UID whose name moved on, would mutate an unrelated
+/// account.
+///
+/// `renamed_to` accepts one alternate name for the account holding the stored UID:
+/// a usermod rename whose store update was lost leaves the account only findable by
+/// UID, and the caller knows which new name proves it is still the managed account.
+fn resolve_account(
+    user: &store::User,
+    renamed_to: Option<&str>,
+) -> anyhow::Result<AccountResolution> {
     let Some(linux_user) = nix::unistd::User::from_name(user.name())? else {
-        // The account may exist under a different name, e.g. when a usermod rename
-        // succeeded but the store update was lost. Whether that is this user or an
-        // unrelated account that reuses the UID can not be decided here, refuse
-        // instead of acting on a possibly wrong account.
         if let Some(other_user) = nix::unistd::User::from_uid(user.uid())? {
+            if renamed_to.is_some_and(|name| name == other_user.name) {
+                return Ok(AccountResolution::Matches(other_user));
+            }
+            // Whether this is the managed account under an unexpected name or an
+            // unrelated account that reuses the UID can not be decided here
             anyhow::bail!(
                 "No user named '{}' in the system, but UID {} belongs to '{}', refusing to act \
                  on the account",
@@ -676,7 +685,7 @@ fn resolve_account_checked(user: &store::User) -> anyhow::Result<Option<nix::uni
                 other_user.name
             );
         }
-        return Ok(None);
+        return Ok(AccountResolution::Missing);
     };
     if linux_user.uid != user.uid() {
         anyhow::bail!(
@@ -687,7 +696,7 @@ fn resolve_account_checked(user: &store::User) -> anyhow::Result<Option<nix::uni
             user.uid()
         );
     }
-    Ok(Some(linux_user))
+    Ok(AccountResolution::Matches(linux_user))
 }
 
 /// The names of the supplementary groups the user is currently a member of,
