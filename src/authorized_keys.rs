@@ -2,7 +2,7 @@
 //! preserving all manual entries. Files are opened without following symlinks and
 //! replaced atomically because these operations run as root in user-owned directories.
 
-use crate::{public_keys, store};
+use crate::public_keys;
 use anyhow::Context as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path;
@@ -18,21 +18,12 @@ const MANAGED_BLOCK_END: &str = "# <<< octosync managed keys - do not edit this 
 #[tracing::instrument(
     name = "authorized_keys::update_authorized_keys",
     skip_all,
-    fields(user = %user.name())
+    fields(user = %system_user.name)
 )]
 pub async fn update_authorized_keys(
-    user: &store::User,
+    system_user: &nix::unistd::User,
     keys: &public_keys::PublicKeys,
 ) -> anyhow::Result<()> {
-    let system_user = nix::unistd::User::from_uid(user.uid())
-        .context("Failed to look up user before updating authorized_keys")?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "User '{}' not found in system when updating authorized_keys",
-                user.name()
-            )
-        })?;
-
     sync_authorized_keys(
         &system_user.dir.join(".ssh"),
         keys,

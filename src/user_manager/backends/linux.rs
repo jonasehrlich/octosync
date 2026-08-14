@@ -698,7 +698,13 @@ impl hannibal::Handler<UpdateAuthorizedKeys> for LinuxUserManager {
         _ctx: &mut hannibal::Context<Self>,
         msg: UpdateAuthorizedKeys,
     ) -> anyhow::Result<()> {
-        crate::authorized_keys::update_authorized_keys(&msg.user, &msg.keys).await
+        let AccountResolution::Matches(linux_user) = resolve_account(&msg.user, None)? else {
+            anyhow::bail!(
+                "User '{}' was not found while updating authorized_keys",
+                msg.user.name()
+            );
+        };
+        crate::authorized_keys::update_authorized_keys(&linux_user, &msg.keys).await
     }
 }
 
