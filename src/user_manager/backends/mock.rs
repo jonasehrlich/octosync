@@ -48,6 +48,23 @@ impl hannibal::Handler<UpdateUser> for MockUserManager {
         _ctx: &mut hannibal::Context<Self>,
         msg: UpdateUser,
     ) -> anyhow::Result<store::User> {
+        // Read-only system lookup so a dry run previews the re-create path truthfully
+        if nix::unistd::User::from_uid(msg.available_user.uid())
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            tracing::info!(
+                user=%msg.gh_user.login,
+                uid=%msg.available_user.uid(),
+                "Mock re-creating account (not actually creating users on non-Linux OS)",
+            );
+            return Ok(store::User::builder()
+                .id(msg.available_user.id())
+                .uid(msg.available_user.uid())
+                .name(msg.gh_user.login.clone())
+                .build());
+        }
         if msg.gh_user.login != msg.available_user.name() {
             tracing::info!(
                 "Mock updating username from '{}' to '{}' (not actually updating users on non-Linux OS)",

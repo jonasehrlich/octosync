@@ -41,29 +41,34 @@ impl hannibal::Handler<CreateUser> for LinuxUserManager {
         let user = &msg.gh_user;
         if let Ok(Some(existing_user)) = nix::unistd::User::from_name(&user.login) {
             tracing::info!(
-                "User '{}' already exists with UID {}. Skipping creation.",
-                user.login,
-                existing_user.uid
+                user = user.login,
+                uid = existing_user.uid.as_raw(),
+                "User already exists. Skipping creation."
             );
 
             return Ok(store::User::builder()
                 .id(user.id)
                 .uid(existing_user.uid)
-                .name(user.login.clone())
+                .name(existing_user.name.clone())
                 .build());
         }
 
-        add_account(&user.login, user.id, None).await
+        let linux_user = add_account(&user.login, None).await?;
+        Ok(store::User::builder()
+            .id(user.id)
+            .uid(linux_user.uid)
+            .name(linux_user.name.clone())
+            .build())
     }
 }
 
-/// Create a platform account with `useradd`. Re-creating a previously deleted account
-/// with its stored UID keeps ownership of files outside the home directory intact.
+/// Create a platform account with `useradd` and return it. Re-creating a previously
+/// deleted account with its stored UID keeps ownership of files outside the home
+/// directory intact.
 async fn add_account(
     login: &str,
-    id: octocrab::models::UserId,
     uid: Option<nix::unistd::Uid>,
-) -> anyhow::Result<store::User> {
+) -> anyhow::Result<nix::unistd::User> {
     let mut command = process::Command::new("/usr/sbin/useradd");
     command
         .arg("--create-home")
@@ -89,17 +94,40 @@ async fn add_account(
     }
     tracing::info!("Created user");
 
-    let linux_user = nix::unistd::User::from_name(login)
+    nix::unistd::User::from_name(login)
         .context("Failed to retrieve user info for newly created user")?
         .ok_or_else(|| {
             anyhow::anyhow!("User '{login}' was created but could not be found in the system")
-        })?;
+        })
+}
 
-    Ok(store::User::builder()
-        .id(id)
-        .uid(linux_user.uid)
-        .name(login.to_string())
-        .build())
+/// Re-create the platform account of a stored user that is gone from the system, using
+/// the stored name and UID so file ownership and a home directory that survived the
+/// deletion stay intact. A changed GitHub login is applied afterwards by the regular
+/// rename path.
+async fn recreate_account(
+    gh_user: &octocrab::models::Author,
+    available_user: &store::User,
+) -> anyhow::Result<nix::unistd::User> {
+    // The account may have been re-created by hand under a new UID. Adopting it would
+    // silently accept the ownership drift the stored UID exists to prevent, so refuse
+    // and leave the resolution to an operator.
+    let colliding = match nix::unistd::User::from_name(available_user.name())? {
+        Some(existing) => Some(existing),
+        None => nix::unistd::User::from_name(&gh_user.login)?,
+    };
+    if let Some(existing) = colliding {
+        anyhow::bail!(
+            "No account with UID {}, but '{}' exists with UID {}, refusing to re-create '{}'",
+            available_user.uid(),
+            existing.name,
+            existing.uid,
+            available_user.name()
+        );
+    }
+
+    tracing::info!("User no longer exists in the system, re-creating with the stored UID");
+    add_account(available_user.name(), Some(available_user.uid())).await
 }
 
 impl hannibal::Handler<UpdateUser> for LinuxUserManager {
@@ -114,16 +142,34 @@ impl hannibal::Handler<UpdateUser> for LinuxUserManager {
         msg: UpdateUser,
     ) -> anyhow::Result<store::User> {
         let (gh_user, available_user) = (&msg.gh_user, &msg.available_user);
-        let Some(linux_user) = nix::unistd::User::from_uid(available_user.uid())? else {
-            // The account is known in the store but gone from the system, e.g. deleted by
-            // hand. Re-create it with the stored UID so files owned by the old account
-            // keep their owner.
-            tracing::info!("User no longer exists in the system, re-creating with stored UID");
-            return add_account(&gh_user.login, gh_user.id, Some(available_user.uid())).await;
+        let linux_user = match nix::unistd::User::from_uid(available_user.uid())? {
+            Some(linux_user) => linux_user,
+            // The account is known in the store but gone from the system, e.g. deleted
+            // by hand
+            None => recreate_account(gh_user, available_user).await?,
         };
 
+        // The stored UID may have been freed and recycled by an unrelated account. Only
+        // the stored name (the normal case) or the GitHub login (a rename whose store
+        // update was lost) prove this is the managed account.
+        if linux_user.name != available_user.name() && linux_user.name != gh_user.login {
+            anyhow::bail!(
+                "UID {} belongs to '{}', not to stored user '{}', refusing to update",
+                available_user.uid(),
+                linux_user.name,
+                available_user.name()
+            );
+        }
+
         if gh_user.login == linux_user.name {
-            return Ok(available_user.clone());
+            // Rebuild the entry from the system account, healing a stored name that a
+            // lost store update after a rename left stale
+
+            return Ok(store::User::builder()
+                .id(available_user.id())
+                .uid(linux_user.uid)
+                .name(linux_user.name.clone())
+                .build());
         }
 
         kill_processes_for_user(&linux_user).await?;
@@ -208,8 +254,13 @@ impl hannibal::Handler<RemoveAccount> for LinuxUserManager {
         };
 
         // A process spawned between the preparation sweep and here (archiving can take
-        // a while) would make userdel fail, so sweep again right before it
-        kill_processes_for_user(&linux_user).await?;
+        // a while) would make userdel fail, so sweep again right before it. The home
+        // directory is already archived, so nothing is left for a process to shut down
+        // cleanly into: kill hard without a grace period. userdel decides
+        // authoritatively whether the account is busy, so a failed sweep is only logged.
+        if let Err(e) = force_kill_processes_for_user(&linux_user).await {
+            tracing::warn!("Failed to sweep processes before userdel: {e:#}");
+        }
 
         let proc = process::Command::new("/usr/sbin/userdel")
             .arg("--remove")
@@ -420,9 +471,13 @@ async fn sync_user_supplementary_groups_by_name(
 const KILL_GRACE_PERIOD: time::Duration = time::Duration::from_secs(3);
 /// Poll interval while waiting for terminated processes to exit
 const KILL_POLL_INTERVAL: time::Duration = time::Duration::from_millis(200);
+/// Time SIGKILL'd processes get to disappear from the process table, so a following
+/// userdel cannot race a process that is still being torn down
+const SIGKILL_WAIT: time::Duration = time::Duration::from_secs(1);
 
 /// Stop all processes of the user: SIGTERM first so they can shut down cleanly, then
-/// SIGKILL whatever is still running after [`KILL_GRACE_PERIOD`].
+/// SIGKILL whatever is still running after [`KILL_GRACE_PERIOD`]. Errors when
+/// processes survive the SIGKILL, e.g. stuck in uninterruptible I/O.
 ///
 /// Runs inside the actor, so the grace period stalls other platform operations. It is
 /// only paid when the user actually has running processes.
@@ -435,35 +490,74 @@ async fn kill_processes_for_user(user: &nix::unistd::User) -> anyhow::Result<()>
     }
     signal_processes(&procs, nix::sys::signal::Signal::SIGTERM);
 
-    let deadline = tokio::time::Instant::now() + KILL_GRACE_PERIOD;
-    let remaining = loop {
-        tokio::time::sleep(KILL_POLL_INTERVAL).await;
-        let remaining = processes_of_uid(uid).await?;
-        if remaining.is_empty() {
-            tracing::debug!("All processes exited after SIGTERM");
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            break remaining;
-        }
-    };
+    let remaining = wait_for_processes_to_exit(uid, KILL_GRACE_PERIOD).await?;
+    if remaining.is_empty() {
+        tracing::debug!("All processes exited after SIGTERM");
+        return Ok(());
+    }
 
     tracing::debug!(
         count = remaining.len(),
         "Processes still running after the grace period, killing them"
     );
     signal_processes(&remaining, nix::sys::signal::Signal::SIGKILL);
-    Ok(())
+    ensure_processes_are_gone(uid, &user.name).await
 }
 
-/// PIDs of all processes whose real UID is `uid`
+/// SIGKILL all processes of the user without a grace period
+#[tracing::instrument(name = "force_kill_processes", skip(user), fields(user = %user.name))]
+async fn force_kill_processes_for_user(user: &nix::unistd::User) -> anyhow::Result<()> {
+    let uid = user.uid.as_raw();
+    let procs = processes_of_uid(uid).await?;
+    if procs.is_empty() {
+        return Ok(());
+    }
+    signal_processes(&procs, nix::sys::signal::Signal::SIGKILL);
+    ensure_processes_are_gone(uid, &user.name).await
+}
+
+/// Confirm that the SIGKILL'd processes are gone from the process table within
+/// [`SIGKILL_WAIT`]
+async fn ensure_processes_are_gone(uid: u32, name: &str) -> anyhow::Result<()> {
+    let survivors = wait_for_processes_to_exit(uid, SIGKILL_WAIT).await?;
+    if survivors.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{} processes of '{name}' still exist after SIGKILL",
+        survivors.len()
+    )
+}
+
+/// Poll until no process of `uid` is left or `timeout` elapses, returning the
+/// processes still running
+async fn wait_for_processes_to_exit(
+    uid: u32,
+    timeout: time::Duration,
+) -> anyhow::Result<Vec<nix::unistd::Pid>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = processes_of_uid(uid).await?;
+        if remaining.is_empty() || tokio::time::Instant::now() >= deadline {
+            return Ok(remaining);
+        }
+        tokio::time::sleep(KILL_POLL_INTERVAL).await;
+    }
+}
+
+/// PIDs of all live processes whose real UID is `uid`. Zombies are excluded: no signal
+/// removes them and only their parent reaping them does, so counting them would stall
+/// every wait for the full timeout.
 async fn processes_of_uid(uid: u32) -> anyhow::Result<Vec<nix::unistd::Pid>> {
     tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<nix::unistd::Pid>> {
         let procs = procfs::process::all_processes().context("Failed to list processes")?;
         // Processes that exit while being inspected are skipped
         Ok(procs
             .flatten()
-            .filter(|proc| proc.status().is_ok_and(|stat| stat.ruid == uid))
+            .filter(|proc| {
+                proc.status()
+                    .is_ok_and(|stat| stat.ruid == uid && !stat.state.starts_with('Z'))
+            })
             .map(|proc| nix::unistd::Pid::from_raw(proc.pid))
             .collect())
     })

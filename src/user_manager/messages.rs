@@ -13,8 +13,9 @@ pub struct CreateUser {
 }
 
 /// Renames the platform user of `available_user` (login and home directory) to the
-/// GitHub login of `gh_user`, re-creating the account with the stored UID when it no
-/// longer exists on the system.
+/// GitHub login of `gh_user`, re-creating the account with the stored name and UID
+/// first when it no longer exists on the system. Refuses when the stored UID or name
+/// belongs to a different account.
 #[hannibal::message(response = anyhow::Result<store::User>)]
 pub struct UpdateUser {
     pub gh_user: octocrab::models::Author,
