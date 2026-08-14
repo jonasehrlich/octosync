@@ -3,8 +3,8 @@
 
 use crate::store;
 use crate::user_manager::{
-    CreateUser, DeletionPreparation, EnsureGroupsExist, PrepareUserDeletion, RemoveAccount,
-    SyncSupplementaryGroups, UpdateAuthorizedKeys, UpdateUser,
+    AccountIds, CreateUser, DeletionPreparation, EnsureGroupsExist, PrepareUserDeletion,
+    RemoveAccount, SyncSupplementaryGroups, UpdateAuthorizedKeys, UpdateUser,
 };
 
 #[derive(Debug)]
@@ -28,15 +28,34 @@ impl hannibal::Handler<CreateUser> for MockUserManager {
         _ctx: &mut hannibal::Context<Self>,
         msg: CreateUser,
     ) -> anyhow::Result<store::User> {
-        self.next_uid += 1;
+        // Mimic the user-private group Linux creates: same numeric ID as the user
+        let (uid, gid) = match &msg.ids {
+            AccountIds::Stored { uid, gid } => (
+                *uid,
+                gid.unwrap_or_else(|| nix::unistd::Gid::from_raw(uid.as_raw())),
+            ),
+            AccountIds::Fresh {
+                reserved_uids,
+                reserved_gids,
+            } => loop {
+                self.next_uid += 1;
+                let uid = nix::unistd::Uid::from_raw(self.next_uid as _);
+                let gid = nix::unistd::Gid::from_raw(self.next_uid as _);
+                if !reserved_uids.contains(&uid) && !reserved_gids.contains(&gid) {
+                    break (uid, gid);
+                }
+            },
+        };
         tracing::info!(
-            "Mock creating user '{}' with UID {} (not actually creating users on non-Linux OS)",
+            "Mock creating user '{}' with UID {} and GID {} (not actually creating users on non-Linux OS)",
             msg.gh_user.login,
-            self.next_uid
+            uid,
+            gid
         );
         Ok(store::User::builder()
             .name(msg.gh_user.login.clone())
-            .uid(nix::unistd::Uid::from_raw(self.next_uid as _))
+            .uid(uid)
+            .gid(gid)
             .id(msg.gh_user.id)
             .build())
     }
@@ -62,6 +81,7 @@ impl hannibal::Handler<UpdateUser> for MockUserManager {
             return Ok(store::User::builder()
                 .id(msg.available_user.id())
                 .uid(msg.available_user.uid())
+                .maybe_gid(msg.available_user.gid())
                 .name(msg.gh_user.login.clone())
                 .build());
         }
@@ -74,6 +94,7 @@ impl hannibal::Handler<UpdateUser> for MockUserManager {
             Ok(store::User::builder()
                 .id(msg.available_user.id())
                 .uid(msg.available_user.uid())
+                .maybe_gid(msg.available_user.gid())
                 .name(msg.gh_user.login.clone())
                 .build())
         } else {

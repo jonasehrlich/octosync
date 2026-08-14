@@ -4,18 +4,41 @@
 //! owned data so they can cross the actor boundary.
 
 use crate::{archiver, public_keys, store};
-use std::path;
+use std::{collections, path};
 
 /// Creates a platform user for the given GitHub user without a password.
 #[hannibal::message(response = anyhow::Result<store::User>)]
 pub struct CreateUser {
     pub gh_user: octocrab::models::Author,
+    pub ids: AccountIds,
+}
+
+/// UID and GID of the account [`CreateUser`] creates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountIds {
+    /// The stored IDs of a rejoining member: the account is created with exactly this
+    /// UID and its private group with exactly this GID, so file ownership survives the
+    /// delete and re-create cycle. When either ID is taken, creation fails instead of
+    /// falling back to a fresh one. A tombstone migrated from v1 carries no GID and
+    /// leaves the private group to `useradd`.
+    Stored {
+        uid: nix::unistd::Uid,
+        gid: Option<nix::unistd::Gid>,
+    },
+    /// System-allocated IDs for a brand-new member, avoiding the IDs reserved by
+    /// tombstones: shadow-utils allocates the highest ID in range plus one, so
+    /// deleting the user with the highest UID frees exactly the next UID to be
+    /// allocated.
+    Fresh {
+        reserved_uids: collections::HashSet<nix::unistd::Uid>,
+        reserved_gids: collections::HashSet<nix::unistd::Gid>,
+    },
 }
 
 /// Renames the platform user of `available_user` (login and home directory) to the
-/// GitHub login of `gh_user`, re-creating the account with the stored name and UID
-/// first when it no longer exists on the system. Refuses when the stored UID or name
-/// belongs to a different account.
+/// GitHub login of `gh_user`, re-creating the account with the stored name, UID and
+/// GID first when it no longer exists on the system. Refuses when the stored UID or
+/// name belongs to a different account.
 #[hannibal::message(response = anyhow::Result<store::User>)]
 pub struct UpdateUser {
     pub gh_user: octocrab::models::Author,

@@ -5,8 +5,9 @@
 
 use crate::store;
 use crate::user_manager::{
-    CreateUser, DeletionPreparation, EnsureGroupsExist, PrepareUserDeletion, RemoveAccount,
-    SyncSupplementaryGroups, UpdateAuthorizedKeys, UpdateUser, supplementary_groups_update,
+    AccountIds, CreateUser, DeletionPreparation, EnsureGroupsExist, PrepareUserDeletion,
+    RemoveAccount, SyncSupplementaryGroups, UpdateAuthorizedKeys, UpdateUser,
+    supplementary_groups_update,
 };
 use anyhow::Context as _;
 use std::{collections, time};
@@ -40,6 +41,7 @@ impl hannibal::Handler<CreateUser> for LinuxUserManager {
     ) -> anyhow::Result<store::User> {
         let user = &msg.gh_user;
         if let Ok(Some(existing_user)) = nix::unistd::User::from_name(&user.login) {
+            verify_adoption(&existing_user, &msg.ids)?;
             tracing::info!(
                 user = user.login,
                 uid = existing_user.uid.as_raw(),
@@ -53,25 +55,159 @@ impl hannibal::Handler<CreateUser> for LinuxUserManager {
             return Ok(store::User::builder()
                 .id(user.id)
                 .uid(existing_user.uid)
+                .gid(existing_user.gid)
                 .name(existing_user.name.clone())
                 .build());
         }
 
-        let linux_user = add_account(&user.login, None).await?;
+        let linux_user = match &msg.ids {
+            AccountIds::Stored { uid, gid } => add_account(&user.login, Some(*uid), *gid).await?,
+            AccountIds::Fresh {
+                reserved_uids,
+                reserved_gids,
+            } => add_account_with_fresh_ids(&user.login, reserved_uids, reserved_gids).await?,
+        };
         Ok(store::User::builder()
             .id(user.id)
             .uid(linux_user.uid)
+            .gid(linux_user.gid)
             .name(linux_user.name.clone())
             .build())
     }
 }
 
+/// Check that a pre-existing account with the GitHub login may be adopted.
+///
+/// Adopting an account whose IDs differ from a rejoining member's stored ones, or
+/// whose IDs another user's tombstone reserves, would silently accept exactly the
+/// ownership drift the stored IDs exist to prevent.
+fn verify_adoption(existing: &nix::unistd::User, ids: &AccountIds) -> anyhow::Result<()> {
+    match ids {
+        AccountIds::Stored { uid, gid } => {
+            if existing.uid != *uid {
+                anyhow::bail!(
+                    "User '{}' already exists with UID {} but the store expects UID {}, \
+                     refusing to adopt the account",
+                    existing.name,
+                    existing.uid,
+                    uid
+                );
+            }
+            if let Some(gid) = gid
+                && existing.gid != *gid
+            {
+                anyhow::bail!(
+                    "User '{}' already exists with primary GID {} but the store expects GID {}, \
+                     refusing to adopt the account",
+                    existing.name,
+                    existing.gid,
+                    gid
+                );
+            }
+        }
+        AccountIds::Fresh {
+            reserved_uids,
+            reserved_gids,
+        } => {
+            if reserved_uids.contains(&existing.uid) || reserved_gids.contains(&existing.gid) {
+                anyhow::bail!(
+                    "User '{}' already exists with UID {} and GID {}, which a departed user's \
+                     tombstone reserves, refusing to adopt the account",
+                    existing.name,
+                    existing.uid,
+                    existing.gid
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Number of candidates to probe before giving up the search for a free ID
+const FREE_ID_ATTEMPTS: u32 = 10_000;
+
+/// Create an account with system-allocated IDs, re-creating it with explicitly chosen
+/// free IDs when the allocation hands out an ID a tombstone reserves.
+///
+/// shadow-utils allocates the highest ID in range plus one, so deleting the user with
+/// the highest UID frees exactly the next UID `useradd` hands out: without this check
+/// the next member to join would routinely receive the most recently departed user's
+/// UID and inherit ownership of their files outside the archived home directory.
+async fn add_account_with_fresh_ids(
+    login: &str,
+    reserved_uids: &collections::HashSet<nix::unistd::Uid>,
+    reserved_gids: &collections::HashSet<nix::unistd::Gid>,
+) -> anyhow::Result<nix::unistd::User> {
+    let linux_user = add_account(login, None, None).await?;
+    if !reserved_uids.contains(&linux_user.uid) && !reserved_gids.contains(&linux_user.gid) {
+        return Ok(linux_user);
+    }
+
+    tracing::info!(
+        uid = linux_user.uid.as_raw(),
+        gid = linux_user.gid.as_raw(),
+        "Allocated IDs are reserved for a departed user, re-creating with free IDs"
+    );
+    // The account was created moments ago and has never been returned to a caller, so
+    // nothing can have used it yet; remove it together with its fresh home directory
+    let o = process::Command::new("/usr/sbin/userdel")
+        .arg("--remove")
+        .arg(login)
+        .output()
+        .await
+        .context("Failed to wait for userdel command to finish")?;
+    if !o.status.success() {
+        anyhow::bail!(
+            "Failed to remove the account created with reserved IDs: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
+
+    let id = free_id_from(
+        linux_user.uid.as_raw().max(linux_user.gid.as_raw()) + 1,
+        reserved_uids,
+        reserved_gids,
+    )?;
+    add_account(
+        login,
+        Some(nix::unistd::Uid::from_raw(id)),
+        Some(nix::unistd::Gid::from_raw(id)),
+    )
+    .await
+}
+
+/// First ID at or above `start` that no tombstone reserves and no account or group
+/// uses. The value serves as both UID and GID, mirroring the user-private group of a
+/// regular `useradd`.
+fn free_id_from(
+    start: u32,
+    reserved_uids: &collections::HashSet<nix::unistd::Uid>,
+    reserved_gids: &collections::HashSet<nix::unistd::Gid>,
+) -> anyhow::Result<u32> {
+    let end = start.saturating_add(FREE_ID_ATTEMPTS);
+    for id in start..end {
+        let uid = nix::unistd::Uid::from_raw(id);
+        let gid = nix::unistd::Gid::from_raw(id);
+        if reserved_uids.contains(&uid) || reserved_gids.contains(&gid) {
+            continue;
+        }
+        if nix::unistd::User::from_uid(uid)?.is_some()
+            || nix::unistd::Group::from_gid(gid)?.is_some()
+        {
+            continue;
+        }
+        return Ok(id);
+    }
+    anyhow::bail!("No free UID/GID found in [{start}, {end})")
+}
+
 /// Create a platform account with `useradd` and return it. Re-creating a previously
-/// deleted account with its stored UID keeps ownership of files outside the home
-/// directory intact.
+/// deleted account with its stored UID and private-group GID keeps ownership of files
+/// outside the home directory intact.
 async fn add_account(
     login: &str,
     uid: Option<nix::unistd::Uid>,
+    gid: Option<nix::unistd::Gid>,
 ) -> anyhow::Result<nix::unistd::User> {
     let mut command = process::Command::new("/usr/sbin/useradd");
     command
@@ -82,6 +218,12 @@ async fn add_account(
         .arg("!");
     if let Some(uid) = uid {
         command.arg("--uid").arg(uid.to_string());
+    }
+    if let Some(gid) = gid {
+        // With --gid, useradd uses the given group as the primary group instead of
+        // creating a private one, so the group must exist with the stored GID first
+        ensure_private_group(login, gid).await?;
+        command.arg("--gid").arg(gid.to_string());
     }
     command.arg(login);
 
@@ -106,9 +248,9 @@ async fn add_account(
 }
 
 /// Re-create the platform account of a stored user that is gone from the system, using
-/// the stored name and UID so file ownership and a home directory that survived the
-/// deletion stay intact. A changed GitHub login is applied afterwards by the regular
-/// rename path.
+/// the stored name, UID and GID so file ownership and a home directory that survived
+/// the deletion stay intact. A changed GitHub login is applied afterwards by the
+/// regular rename path.
 async fn recreate_account(
     gh_user: &octocrab::models::Author,
     available_user: &store::User,
@@ -131,7 +273,48 @@ async fn recreate_account(
     }
 
     tracing::info!("User no longer exists in the system, re-creating with the stored UID");
-    add_account(available_user.name(), Some(available_user.uid())).await
+    add_account(
+        available_user.name(),
+        Some(available_user.uid()),
+        available_user.gid(),
+    )
+    .await
+}
+
+/// Ensure the user-private group of a re-created account exists as `login` with the
+/// stored GID, refusing when the GID meanwhile belongs to another group. Falling back
+/// to a fresh GID would leave files with the old GID group-owned by whichever group is
+/// allocated it next.
+async fn ensure_private_group(login: &str, gid: nix::unistd::Gid) -> anyhow::Result<()> {
+    if let Some(group) = nix::unistd::Group::from_gid(gid)
+        .with_context(|| format!("Failed to check whether GID {gid} is in use"))?
+    {
+        if group.name == login {
+            // Already re-created, e.g. by an attempt that failed after groupadd
+            return Ok(());
+        }
+        anyhow::bail!(
+            "GID {gid} already belongs to group '{}', refusing to re-create the private \
+             group of '{login}' with it",
+            group.name
+        );
+    }
+
+    let o = process::Command::new("/usr/sbin/groupadd")
+        .arg("--gid")
+        .arg(gid.to_string())
+        .arg(login)
+        .output()
+        .await
+        .context("Failed to wait for groupadd command to finish")?;
+    if !o.status.success() {
+        anyhow::bail!(
+            "Failed to re-create private group '{login}' with GID {gid}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
+    tracing::info!(gid = gid.as_raw(), "Re-created private group");
+    Ok(())
 }
 
 impl hannibal::Handler<UpdateUser> for LinuxUserManager {
@@ -171,11 +354,12 @@ impl hannibal::Handler<UpdateUser> for LinuxUserManager {
 
         if gh_user.login == linux_user.name {
             // Rebuild the entry from the system account, healing a stored name that a
-            // lost store update after a rename left stale
-
+            // lost store update after a rename left stale and backfilling the primary
+            // GID into entries migrated from a v1 store
             return Ok(store::User::builder()
                 .id(available_user.id())
                 .uid(linux_user.uid)
+                .gid(linux_user.gid)
                 .name(linux_user.name.clone())
                 .build());
         }
@@ -201,6 +385,7 @@ impl hannibal::Handler<UpdateUser> for LinuxUserManager {
             Ok(store::User::builder()
                 .id(available_user.id())
                 .uid(available_user.uid())
+                .gid(linux_user.gid)
                 .name(gh_user.login.clone())
                 .build())
         } else {

@@ -35,6 +35,27 @@
   home directory is archived. Syncing a user whose account survived a failed deletion lifts an
   expiry that is already in effect. A future expiry date set by an operator stays.
   ([#19](https://github.com/jonasehrlich/octosync/pull/19))
+- Store `users.json` in schema v2: users deleted by octosync are kept as tombstones under an
+  `archived` key, so a member who leaves and rejoins gets their old UID back. The v1 file is backed
+  up to `users-v1.json` once before the first v2 save.
+  ([#22](https://github.com/jonasehrlich/octosync/pull/22))
+- Save the tombstone before `userdel` runs and re-enqueue archived users whose account still exists
+  on every sync, so a deletion interrupted at any point is finished by a later sync instead of
+  orphaning a live account ([#22](https://github.com/jonasehrlich/octosync/pull/22))
+- Record the home directory archive path on the tombstone, so a rejoin can later restore it
+  ([#22](https://github.com/jonasehrlich/octosync/pull/22))
+- The `delete` command keeps the store file and writes tombstones instead of removing `users.json`,
+  preserving the UID memory of a full wipe ([#22](https://github.com/jonasehrlich/octosync/pull/22))
+- Track the primary group GID in the store and re-create a rejoining member's private group with
+  `groupadd --gid <stored>` before `useradd --gid <stored>`, so group ownership of files outside the
+  archived home directory also survives the delete and re-create cycle. A GID that meanwhile belongs
+  to another group fails the re-creation loudly instead of falling back to a fresh one. Entries
+  migrated from a v1 store carry no GID and are backfilled on their next update.
+  ([#22](https://github.com/jonasehrlich/octosync/pull/22))
+- Never allocate a departed user's UID or GID to a brand-new member: `useradd` hands out the highest
+  ID in range plus one, which is exactly what deleting the highest-UID user frees. A new account
+  whose auto-allocated IDs collide with a tombstone is removed while still empty and re-created with
+  explicitly chosen free IDs. ([#22](https://github.com/jonasehrlich/octosync/pull/22))
 
 ## v0.3.0
 
