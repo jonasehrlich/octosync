@@ -196,19 +196,21 @@ impl Octosync {
         )?;
         tracing::info!("Successfully retrieved {} members", org_members.len());
 
-        if org_members.is_empty() && !old_store.data().is_empty() {
-            anyhow::bail!(
-                "Refusing to sync: org '{}' returned no members while {} users are stored. \
-                 Run the 'delete' command to expire all users intentionally.",
-                args.octocrab.org,
-                old_store.data().len()
-            );
-        }
-
         let org_member_map: collections::HashMap<octocrab::models::UserId, String> =
             collections::HashMap::from_iter(
                 org_members.iter().map(|user| (user.id, user.login.clone())),
             );
+
+        if membership_has_no_stored_users(old_store.data(), &org_member_map) {
+            anyhow::bail!(
+                "Refusing to sync: none of the {} stored users is in the fetched member list \
+                 of org '{}' ({} members). Nothing was changed on the system. Run the 'delete' \
+                 command to expire all users intentionally.",
+                old_store.data().len(),
+                args.octocrab.org,
+                org_members.len()
+            );
+        }
 
         // Create the resolved groups before the users are processed, so the per-user
         // group sync can rely on every managed group existing
@@ -247,7 +249,8 @@ impl Octosync {
         }
 
         let leavers: Vec<store::User> = leavers.into_iter().cloned().collect();
-        self.depart_and_expire(&mut new_store, leavers).await?;
+        self.depart_and_expire(&mut new_store, leavers, &org_member_map)
+            .await?;
 
         self.purge_expired(&mut new_store, &org_member_map, args.purge_after_days)
             .await
@@ -261,6 +264,12 @@ impl Octosync {
         org_member_map: &collections::HashMap<octocrab::models::UserId, String>,
         purge_after_days: u32,
     ) -> anyhow::Result<()> {
+        if org_member_map.is_empty() {
+            anyhow::bail!(
+                "Refusing to purge with an empty organization member list; nothing was removed"
+            );
+        }
+
         let now = chrono::Utc::now();
         let cutoff = now - chrono::Duration::days(purge_after_days.into());
 
@@ -310,6 +319,7 @@ impl Octosync {
         &self,
         store: &mut store::UserStore,
         leavers: Vec<store::User>,
+        org_member_map: &collections::HashMap<octocrab::models::UserId, String>,
     ) -> anyhow::Result<()> {
         let departed_at = chrono::Utc::now();
         for user in leavers {
@@ -321,7 +331,9 @@ impl Octosync {
         let pending: Vec<store::User> = store
             .departed()
             .values()
-            .filter(|tombstone| tombstone.expired_at().is_none())
+            .filter(|departed| {
+                departed.expired_at().is_none() && !org_member_map.contains_key(&departed.id())
+            })
             .map(store::User::from)
             .collect();
 
@@ -377,7 +389,8 @@ impl Octosync {
         let count = users.len();
         // The store file is kept: the tombstones preserve every UID so members
         // re-created by a later sync get their old UID back
-        self.depart_and_expire(&mut store, users).await?;
+        self.depart_and_expire(&mut store, users, &collections::HashMap::new())
+            .await?;
         tracing::info!(
             "Recorded {count} departures and expired their accounts, keeping the tombstones \
              in the store"
@@ -417,6 +430,14 @@ fn partition_stale_users<'a>(
         .values()
         .filter(|user| !new_users.contains_key(&user.id()))
         .partition(|user| org_member_map.contains_key(&user.id()))
+}
+
+/// Whether no stored user appears in the fetched membership.
+fn membership_has_no_stored_users(
+    stored: &collections::HashMap<octocrab::models::UserId, store::User>,
+    org_member_map: &collections::HashMap<octocrab::models::UserId, String>,
+) -> bool {
+    !stored.is_empty() && !stored.keys().any(|id| org_member_map.contains_key(id))
 }
 
 /// Refuse a sync that would expire every previously stored user.
@@ -542,7 +563,7 @@ mod tests {
             let mut store = store::UserStore::new(data_dir.path(), true).await.unwrap();
 
             octosync
-                .depart_and_expire(&mut store, vec![user(1, "alice")])
+                .depart_and_expire(&mut store, vec![user(1, "alice")], &member_map(&[]))
                 .await
                 .unwrap();
 
@@ -811,7 +832,7 @@ mod tests {
             let mut store = store::UserStore::new(data_dir.path(), false).await.unwrap();
 
             octosync
-                .depart_and_expire(&mut store, vec![user(1, "alice")])
+                .depart_and_expire(&mut store, vec![user(1, "alice")], &member_map(&[]))
                 .await
                 .unwrap();
 
@@ -836,9 +857,9 @@ mod tests {
             let mut store = store::UserStore::new(data_dir.path(), false).await.unwrap();
             store.depart_user(user(1, "alice"), chrono::Utc::now());
 
-            // No leavers this sync, the unfinished tombstone alone drives the teardown
+            // No leavers this sync; the unfinished departure alone drives the account removal.
             octosync
-                .depart_and_expire(&mut store, vec![])
+                .depart_and_expire(&mut store, vec![], &member_map(&[]))
                 .await
                 .unwrap();
 
@@ -848,6 +869,24 @@ mod tests {
                     .expired_at()
                     .is_some()
             );
+        }
+
+        #[tokio::test]
+        async fn depart_and_expire_skips_unfinished_departure_for_current_member() {
+            let actor = TestingUserManager::default();
+            let expired_users = actor.expired_users.clone();
+            let (octosync, data_dir) = octosync_with(actor);
+            let mut store = store::UserStore::new(data_dir.path(), false).await.unwrap();
+            let alice = user(1, "alice");
+            store.depart_user(alice.clone(), chrono::Utc::now());
+
+            octosync
+                .depart_and_expire(&mut store, vec![], &member_map(&[alice]))
+                .await
+                .unwrap();
+
+            assert!(expired_users.lock().unwrap().is_empty());
+            assert!(store.departed().contains_key(&octocrab::models::UserId(1)));
         }
 
         /// A tombstone whose teardown completed is left alone for the rest of the
@@ -866,7 +905,7 @@ mod tests {
             store.mark_expired(&octocrab::models::UserId(1), now);
 
             octosync
-                .depart_and_expire(&mut store, vec![])
+                .depart_and_expire(&mut store, vec![], &member_map(&[]))
                 .await
                 .unwrap();
 
@@ -911,6 +950,10 @@ mod tests {
             chrono::Utc::now() - chrono::Duration::days(RETENTION_DAYS as i64 + 30)
         }
 
+        fn unrelated_member() -> store::User {
+            user(99, "zoe")
+        }
+
         #[tokio::test]
         async fn purges_a_tombstone_older_than_the_retention_period() {
             let mut actor = TestingUserManager::default();
@@ -920,7 +963,11 @@ mod tests {
             store.depart_user(user(1, "alice"), old_departure());
 
             octosync
-                .purge_expired(&mut store, &member_map(&[]), RETENTION_DAYS)
+                .purge_expired(
+                    &mut store,
+                    &member_map(&[unrelated_member()]),
+                    RETENTION_DAYS,
+                )
                 .await
                 .unwrap();
 
@@ -945,7 +992,11 @@ mod tests {
             store.depart_user(user(1, "alice"), chrono::Utc::now());
 
             octosync
-                .purge_expired(&mut store, &member_map(&[]), RETENTION_DAYS)
+                .purge_expired(
+                    &mut store,
+                    &member_map(&[unrelated_member()]),
+                    RETENTION_DAYS,
+                )
                 .await
                 .unwrap();
 
@@ -986,7 +1037,11 @@ mod tests {
             store.depart_user(user(2, "bob"), old_departure());
 
             octosync
-                .purge_expired(&mut store, &member_map(&[]), RETENTION_DAYS)
+                .purge_expired(
+                    &mut store,
+                    &member_map(&[unrelated_member()]),
+                    RETENTION_DAYS,
+                )
                 .await
                 .unwrap();
 
@@ -1005,12 +1060,30 @@ mod tests {
             store.depart_user(user(1, "alice"), old_departure());
 
             octosync
-                .purge_expired(&mut store, &member_map(&[]), RETENTION_DAYS)
+                .purge_expired(
+                    &mut store,
+                    &member_map(&[unrelated_member()]),
+                    RETENTION_DAYS,
+                )
                 .await
                 .unwrap();
 
             assert!(store.departed().contains_key(&octocrab::models::UserId(1)));
             assert!(store.purged().is_empty());
+        }
+
+        #[tokio::test]
+        async fn empty_member_list_refuses_the_purge() {
+            let (octosync, data_dir) = octosync_with(TestingUserManager::default());
+            let mut store = store::UserStore::new(data_dir.path(), false).await.unwrap();
+            store.depart_user(user(1, "alice"), old_departure());
+
+            let result = octosync
+                .purge_expired(&mut store, &member_map(&[]), RETENTION_DAYS)
+                .await;
+
+            assert!(result.is_err());
+            assert!(store.departed().contains_key(&octocrab::models::UserId(1)));
         }
 
         /// A purged tombstone is left alone by the expiry reconciliation: the two
@@ -1025,7 +1098,7 @@ mod tests {
             store.mark_purged(&octocrab::models::UserId(1), chrono::Utc::now());
 
             octosync
-                .depart_and_expire(&mut store, vec![])
+                .depart_and_expire(&mut store, vec![], &member_map(&[]))
                 .await
                 .unwrap();
 
@@ -1121,6 +1194,46 @@ mod tests {
 
             assert!(retry.is_empty());
             assert!(leavers.is_empty());
+        }
+    }
+
+    mod membership_has_no_stored_users {
+        use super::*;
+
+        #[test]
+        fn empty_member_list_contains_no_stored_users() {
+            let stored = user_map(&[user(1, "a"), user(2, "b")]);
+
+            assert!(membership_has_no_stored_users(&stored, &member_map(&[])));
+        }
+
+        #[test]
+        fn membership_with_only_unrelated_users_contains_no_stored_users() {
+            let stored = user_map(&[user(1, "a")]);
+
+            assert!(membership_has_no_stored_users(
+                &stored,
+                &member_map(&[user(2, "b")])
+            ));
+        }
+
+        #[test]
+        fn membership_with_a_stored_user_is_accepted() {
+            let kept = user(1, "a");
+            let stored = user_map(&[kept.clone(), user(2, "b")]);
+
+            assert!(!membership_has_no_stored_users(
+                &stored,
+                &member_map(&[kept])
+            ));
+        }
+
+        #[test]
+        fn empty_store_does_not_trigger_guard() {
+            assert!(!membership_has_no_stored_users(
+                &user_map(&[]),
+                &member_map(&[])
+            ));
         }
     }
 
