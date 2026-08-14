@@ -34,6 +34,10 @@
   with files, UID and GID intact. Expiry is re-applied on every sync, so an interrupted departure
   converges. A future expiry date set by an operator stays.
   ([#25](https://github.com/jonasehrlich/octosync/pull/25))
+- Remove a departed member's scheduled work along with their sessions: their crontab and queued `at`
+  jobs are deleted, since cron and at run without a login and would otherwise keep executing code
+  under the departed account. A machine without cron or at installed is not a failure.
+  ([#25](https://github.com/jonasehrlich/octosync/pull/25))
 - Purge accounts that have been expired for longer than the retention period (180 days by default,
   `--purge-after-days`) at the end of each sync and through the new `purge` command: the account and
   home directory are removed permanently and without an archive. A purge requires the tombstone's

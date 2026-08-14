@@ -115,7 +115,8 @@ impl hannibal::Handler<ExpireAccount> for MockUserManager {
         msg: ExpireAccount,
     ) -> anyhow::Result<()> {
         tracing::info!(
-            "Would expire the account, end its sessions and strip its supplementary groups"
+            "Would expire the account, remove its scheduled work, end its sessions and strip \
+             its supplementary groups"
         );
         Ok(())
     }

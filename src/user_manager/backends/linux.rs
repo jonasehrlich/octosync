@@ -411,10 +411,11 @@ impl hannibal::Handler<ExpireAccount> for LinuxUserManager {
         // the running ones are ended
         expire_account(&linux_user.name).await?;
 
-        // logind first: it logs the user out cleanly, closing the PAM sessions and
-        // tearing down the session scopes and the user manager instead of only
-        // signaling PIDs. The sweep afterwards is the catch-all for processes outside
-        // logind's session scopes, and the sole mechanism on systems without logind.
+        // Before the sweep, so no scheduled job can spawn processes into the teardown
+        remove_scheduled_jobs(&linux_user).await?;
+
+        // logind first, then the sweep as the catch-all for processes outside logind's
+        // session scopes and as the sole mechanism on systems without logind
         end_logind_sessions(&linux_user).await;
         kill_processes_for_user(&linux_user).await?;
 
@@ -485,6 +486,108 @@ async fn terminate_logind_user(connection: &zbus::Connection, uid: u32) -> anyho
         .call::<_, _, ()>("TerminateUser", &uid)
         .await
         .context("Failed to terminate the user's sessions")
+}
+
+/// Remove the departed user's scheduled work, which outlives their sessions: cron and
+/// at run jobs without a login, so ending the sessions alone would leave the account
+/// executing code after its departure.
+///
+/// Expiring the account already blocks the PAM account check cron and at perform, so
+/// this is the second half of that guarantee rather than the only one, and it also
+/// covers a machine whose cron does not consult PAM.
+async fn remove_scheduled_jobs(user: &nix::unistd::User) -> anyhow::Result<()> {
+    remove_crontab(&user.name).await?;
+    remove_at_jobs(&user.name).await
+}
+
+/// Drop the user's crontab with `crontab -r`, which removes the spool file and makes
+/// cron pick up the change.
+///
+/// Listing first keeps this quiet in the common case of a user without a crontab:
+/// `crontab -r` reports that as a failure, and telling it apart from a real one would
+/// mean matching its message.
+async fn remove_crontab(name: &str) -> anyhow::Result<()> {
+    let Some(list) = optional_command("/usr/bin/crontab", &["-l", "-u", name]).await? else {
+        return Ok(());
+    };
+    if !list.status.success() {
+        return Ok(());
+    }
+
+    let output = process::Command::new("/usr/bin/crontab")
+        .args(["-r", "-u", name])
+        .output()
+        .await
+        .context("Failed to wait for crontab command to finish")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to remove the crontab of '{name}': {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    tracing::info!("Removed the crontab of the departed user");
+    Ok(())
+}
+
+/// Remove the user's queued `at` jobs. Running as root, `atq` lists the jobs of every
+/// user with the owner in the last field, which is the only way to select one user's
+/// jobs for `atrm`.
+async fn remove_at_jobs(name: &str) -> anyhow::Result<()> {
+    let Some(queue) = optional_command("/usr/bin/atq", &[]).await? else {
+        return Ok(());
+    };
+    if !queue.status.success() {
+        anyhow::bail!(
+            "Failed to list the at jobs of '{name}': {}",
+            String::from_utf8_lossy(&queue.stderr)
+        );
+    }
+
+    let job_ids: Vec<String> = String::from_utf8_lossy(&queue.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let job_id = fields.next()?;
+            (fields.last()? == name).then(|| job_id.to_string())
+        })
+        .collect();
+    if job_ids.is_empty() {
+        return Ok(());
+    }
+
+    let output = process::Command::new("/usr/bin/atrm")
+        .args(&job_ids)
+        .output()
+        .await
+        .context("Failed to wait for atrm command to finish")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to remove the at jobs of '{name}': {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    tracing::info!(
+        jobs = job_ids.len(),
+        "Removed the at jobs of the departed user"
+    );
+    Ok(())
+}
+
+/// Run a command that only exists when the service behind it is installed. `Ok(None)`
+/// when the binary is missing, so a machine without cron or at has no scheduled work
+/// to remove rather than a failing departure.
+async fn optional_command(
+    program: &str,
+    args: &[&str],
+) -> anyhow::Result<Option<std::process::Output>> {
+    match process::Command::new(program).args(args).output().await {
+        Ok(output) => Ok(Some(output)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!("'{program}' is not installed, no scheduled work to remove with it");
+            Ok(None)
+        }
+        Err(e) => Err(e).with_context(|| format!("Failed to run '{program}'")),
+    }
 }
 
 /// Remove the user from all supplementary groups, so a departed member keeps no

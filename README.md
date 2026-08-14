@@ -52,10 +52,14 @@ are removed.
 ### Departures: expiry instead of deletion
 
 When a member leaves the org, their account is not deleted. It is expired instead, which blocks both
-password and pubkey SSH logins, running sessions are ended and the supplementary groups are removed.
-The account and home directory stay on the machine as the durable departure record, so a wrong
-departure decision is a reversible lockout: a member who rejoins is synced back into their account
-with their files, UID and GID intact.
+password and pubkey SSH logins, running sessions are ended, their crontab and queued `at` jobs are
+removed and the supplementary groups are stripped. The account and home directory stay on the
+machine as the durable departure record, so a wrong departure decision is a reversible lockout: a
+member who rejoins is synced back into their account with their files, UID and GID intact.
+
+Sessions are ended through logind, which logs the user out cleanly and tears down their session
+scopes. On a machine without logind, such as a container, the SIGTERM/SIGKILL process sweep is the
+whole mechanism and the missing system bus is not reported as an error.
 
 Accounts that have been expired for longer than the retention period (180 days by default,
 configurable with `--purge-after-days`) are purged at the end of each sync: the account and its home

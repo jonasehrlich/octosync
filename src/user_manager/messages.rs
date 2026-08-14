@@ -48,11 +48,11 @@ pub struct UpdateUser {
 
 /// Expires the platform account of a departed user, replacing its deletion: verifies
 /// that the stored user still matches the platform account, expires it so no new
-/// session (password or pubkey SSH) can start, ends the running sessions and strips
-/// the supplementary groups. The account, its home directory and its primary group
-/// stay on the machine as the durable departure record, so the departure is a
-/// reversible lockout that a rejoin heals, until the purge removes the account after
-/// the retention period.
+/// session (password or pubkey SSH) can start, removes its scheduled work, ends the
+/// running sessions and strips the supplementary groups. The account, its home
+/// directory and its primary group stay on the machine as the durable departure
+/// record, so the departure is a reversible lockout that a rejoin heals, until the
+/// purge removes the account after the retention period.
 ///
 /// Idempotent, so the sync can send it for every departed user on every run and an
 /// expiry interrupted at any point converges.
