@@ -3,8 +3,8 @@
 
 use crate::store;
 use crate::user_manager::{
-    AccountIds, CreateUser, DeletionPreparation, EnsureGroupsExist, PrepareUserDeletion,
-    RemoveAccount, SyncSupplementaryGroups, UpdateAuthorizedKeys, UpdateUser,
+    AccountIds, CreateUser, EnsureGroupsExist, ExpireAccount, PurgeAccount, PurgeOutcome,
+    SyncSupplementaryGroups, UpdateAuthorizedKeys, UpdateUser,
 };
 
 #[derive(Debug)]
@@ -103,40 +103,40 @@ impl hannibal::Handler<UpdateUser> for MockUserManager {
     }
 }
 
-impl hannibal::Handler<PrepareUserDeletion> for MockUserManager {
+impl hannibal::Handler<ExpireAccount> for MockUserManager {
     #[tracing::instrument(
-        name = "UserManager::prepare_user_deletion",
+        name = "UserManager::expire_account",
         skip_all,
         fields(user = %msg.user.name(), uid = msg.user.uid().as_raw())
     )]
     async fn handle(
         &mut self,
         _ctx: &mut hannibal::Context<Self>,
-        msg: PrepareUserDeletion,
-    ) -> anyhow::Result<DeletionPreparation> {
-        tracing::info!("Would expire the account, archive the home directory and delete the user");
-        Ok(DeletionPreparation::NothingToDo)
+        msg: ExpireAccount,
+    ) -> anyhow::Result<()> {
+        tracing::info!(
+            "Would expire the account, remove its scheduled work, end its sessions and strip \
+             its supplementary groups"
+        );
+        Ok(())
     }
 }
 
-impl hannibal::Handler<RemoveAccount> for MockUserManager {
-    // Unreachable through the mock flow, since the preparation never reports an
-    // account to remove, but the contract requires handling the full message set
+impl hannibal::Handler<PurgeAccount> for MockUserManager {
     #[tracing::instrument(
-        name = "UserManager::remove_account",
+        name = "UserManager::purge_account",
         skip_all,
         fields(user = %msg.user.name(), uid = msg.user.uid().as_raw())
     )]
     async fn handle(
         &mut self,
         _ctx: &mut hannibal::Context<Self>,
-        msg: RemoveAccount,
-    ) -> anyhow::Result<()> {
-        tracing::info!(
-            archive = ?msg.receipt.archive_path(),
-            "Mock removing account (not actually deleting users on non-Linux OS)"
-        );
-        Ok(())
+        msg: PurgeAccount,
+    ) -> anyhow::Result<PurgeOutcome> {
+        // The account-side shadow-expiry check needs a real account, so the preview
+        // reports the purge the store-side eligibility selected
+        tracing::info!("Would purge the expired account and its home directory");
+        Ok(PurgeOutcome::Purged)
     }
 }
 

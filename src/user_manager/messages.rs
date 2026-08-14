@@ -1,10 +1,7 @@
-//! The messages of the platform user manager contract.
-//!
-//! A platform backend is an actor handling the full message set. The messages carry
-//! owned data so they can cross the actor boundary.
+//! Owned messages forming the platform user manager contract.
 
-use crate::{archiver, public_keys, store};
-use std::{collections, path};
+use crate::{public_keys, store};
+use std::collections;
 
 /// Creates a platform user for the given GitHub user without a password.
 #[hannibal::message(response = anyhow::Result<store::User>)]
@@ -16,68 +13,64 @@ pub struct CreateUser {
 /// UID and GID of the account [`CreateUser`] creates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccountIds {
-    /// The stored IDs of a rejoining member: the account is created with exactly this
-    /// UID and its private group with exactly this GID, so file ownership survives the
-    /// delete and re-create cycle. When either ID is taken, creation fails instead of
-    /// falling back to a fresh one. A tombstone migrated from v1 carries no GID and
-    /// leaves the private group to `useradd`.
+    /// Reuse a rejoining member's IDs. Fail if either is unavailable.
     Stored {
         uid: nix::unistd::Uid,
         gid: Option<nix::unistd::Gid>,
     },
-    /// System-allocated IDs for a brand-new member, avoiding the IDs reserved by
-    /// tombstones: shadow-utils allocates the highest ID in range plus one, so
-    /// deleting the user with the highest UID frees exactly the next UID to be
-    /// allocated.
+    /// Allocate fresh IDs without spending those reserved by tombstones.
     Fresh {
         reserved_uids: collections::HashSet<nix::unistd::Uid>,
         reserved_gids: collections::HashSet<nix::unistd::Gid>,
     },
 }
 
-/// Renames the platform user of `available_user` (login and home directory) to the
-/// GitHub login of `gh_user`, re-creating the account with the stored name, UID and
-/// GID first when it no longer exists on the system. Refuses when the stored UID or
-/// name belongs to a different account.
+/// Reconcile a stored platform account with the current GitHub user.
+///
+/// This re-creates the account with the stored name, UID and GID first when the user no longer
+/// exists on the system. Refuses when the stored UID or name belongs to a different account.
 #[hannibal::message(response = anyhow::Result<store::User>)]
 pub struct UpdateUser {
     pub gh_user: octocrab::models::Author,
     pub available_user: store::User,
 }
 
-/// Prepares the deletion of a platform user: verifies that the stored user still
-/// matches the platform account, expires the account so no new session can start,
-/// and stops everything that could block the deletion or keep writing to the home
-/// directory while it is archived.
-#[hannibal::message(response = anyhow::Result<DeletionPreparation>)]
-pub struct PrepareUserDeletion {
-    pub user: store::User,
-}
-
-/// Outcome of [`PrepareUserDeletion`].
-#[derive(Debug)]
-pub enum DeletionPreparation {
-    /// No platform account for the user exists, there is nothing to delete.
-    NothingToDo,
-    /// The account can be removed once its home directory is archived.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    Prepared { home_dir: path::PathBuf },
-}
-
-/// Removes the platform account of a prepared user. Taking an
-/// [`archiver::ArchiveReceipt`] forces the home directory to be archived before the
-/// account and its files can be deleted.
-#[hannibal::message(response = anyhow::Result<()>)]
-pub struct RemoveAccount {
-    pub user: store::User,
-    pub receipt: archiver::ArchiveReceipt,
-}
-
-/// Synchronizes the supplementary groups of a user.
+/// Reversibly expire a departed account and remove its active access.
 ///
-/// octosync owns the supplementary groups of synced users: the user's memberships are
-/// replaced with `groups`, keeping only the primary group. Groups assigned through
-/// other channels are removed.
+/// Verifies that the stored user matches the platform account and expires the account, which
+/// prevents logins and SSH key access. The account remains on the system and can be restored later.
+#[hannibal::message(response = anyhow::Result<()>)]
+pub struct ExpireAccount {
+    pub user: store::User,
+}
+
+/// Permanently remove a departed user's account and home directory once its shadow
+/// expiry meets the cutoff.
+#[hannibal::message(response = anyhow::Result<PurgeOutcome>)]
+pub struct PurgeAccount {
+    pub user: store::User,
+    /// Purge the account if it has been expired since before this timestamp.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub expired_before: chrono::DateTime<chrono::Utc>,
+}
+
+/// Result of checking and applying a [`PurgeAccount`] operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PurgeOutcome {
+    /// The account and home directory were removed.
+    Purged,
+    /// No matching account exists.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    NoAccount,
+    /// The account expiry does not meet the cutoff.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    NotExpired,
+}
+
+/// Replace a user's supplementary groups, excluding their primary group.
+///
+/// All supplementary groups of synced users are managed by octosync. Any group not in the given
+/// list is removed from the user.
 #[hannibal::message(response = anyhow::Result<()>)]
 pub struct SyncSupplementaryGroups {
     pub user: store::User,
@@ -90,10 +83,8 @@ pub struct EnsureGroupsExist {
     pub groups: Vec<String>,
 }
 
-/// Replaces the octosync-managed key block in the user's authorized_keys file with the
-/// given keys, so a key revoked on GitHub is removed on the next sync. Lines outside
-/// the managed block are never touched, so keys installed through other channels stay
-/// intact.
+/// Replace the octosync-managed authorized_keys block with the current public keys of the given
+/// user.
 #[hannibal::message(response = anyhow::Result<()>)]
 pub struct UpdateAuthorizedKeys {
     pub user: store::User,

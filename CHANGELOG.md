@@ -2,60 +2,36 @@
 
 ## Unreleased
 
-- Archive home directories of deleted users in the data directory
-  ([#9](https://github.com/jonasehrlich/octosync/pull/9))
-- Only delete users whose GitHub ID is missing from the fetched org member list. Users whose
-  processing failed stay in the store unchanged.
+- Departed members are now locked out instead of immediately deleted: octosync expires their
+  account, ends their sessions, removes their crontab and queued `at` jobs, and strips supplementary
+  groups while keeping the account and home directory intact. Rejoining reverses the expiry and
+  restores access to the same files and IDs. The `delete` command now follows this reversible
+  departure flow as well. ([#25](https://github.com/jonasehrlich/octosync/pull/25))
+- Expired accounts are permanently purged after a configurable retention period (180 days by
+  default), either during sync or with the new `purge` command. Purging removes the home directory
+  without an archive, but reserves the departed member's UID and GID for a later rejoin.
+  ([#25](https://github.com/jonasehrlich/octosync/pull/25))
+- Sync no longer offboards members because their processing or key fetch failed, and refuses a sync
+  that would expire every stored user. Dry runs no longer write preview state to `users.json`.
+  ([#15](https://github.com/jonasehrlich/octosync/pull/15),
+  [#17](https://github.com/jonasehrlich/octosync/pull/17),
+  [#25](https://github.com/jonasehrlich/octosync/pull/25))
+- Account identity is preserved across departures, manual account removal and rejoins. octosync
+  restores stored UIDs and GIDs, prevents their reuse by other members, and refuses unsafe login or
+  ID collisions rather than modifying the wrong account.
+  ([#19](https://github.com/jonasehrlich/octosync/pull/19),
+  [#22](https://github.com/jonasehrlich/octosync/pull/22),
+  [#25](https://github.com/jonasehrlich/octosync/pull/25))
+- GitHub SSH keys are now fetched through the authenticated client and updated inside an
+  octosync-managed block, preserving manually managed keys. Existing keys survive fetch failures,
+  and updates are atomic and protected against unsafe permissions and symlinks.
   ([#15](https://github.com/jonasehrlich/octosync/pull/15))
-- A failed authorized keys fetch no longer fails user processing which could lead to the deletion of
-  users whose keys could not be fetched. ([#15](https://github.com/jonasehrlich/octosync/pull/15))
-- Fetch public keys through the authenticated GitHub client instead of the anonymous, rate-limited
-  endpoint ([#15](https://github.com/jonasehrlich/octosync/pull/15))
-- Manage SSH fetched keys in a marked, octosync-managed block inside `authorized_keys`
-  ([#15](https://github.com/jonasehrlich/octosync/pull/15))
-- Write `authorized_keys` atomically, never follow symlinks and enforce exact permissions on `.ssh`
-  and `authorized_keys` ([#15](https://github.com/jonasehrlich/octosync/pull/15))
-- Refuse a sync that would delete every stored user
-  ([#17](https://github.com/jonasehrlich/octosync/pull/17))
-- Implement mapping GitHub teams to Linux groups with `--group <gh-team-slug>:<linux-group>`
+- GitHub teams can now be mapped to Linux groups with `--group <gh-team-slug>:<linux-group>`.
   ([#20](https://github.com/jonasehrlich/octosync/pull/20))
-- Re-create stored users whose account disappeared from the system, passing the stored name and UID
-  to `useradd` so file ownership survives a delete and re-create cycle
-  ([#19](https://github.com/jonasehrlich/octosync/pull/19))
-- Refuse to update a user whose stored UID or name belongs to a different account, instead of
-  renaming that account and handing it the GitHub user's SSH keys
-  ([#19](https://github.com/jonasehrlich/octosync/pull/19))
-- Kill a user's processes a second time right before `userdel`, so a process spawned while the home
-  directory was archived cannot fail the deletion
-  ([#19](https://github.com/jonasehrlich/octosync/pull/19))
-- Stop user processes gracefully: send SIGTERM first and SIGKILL only the processes still running
-  after a grace period, then wait for the killed processes to leave the process table
-  ([#19](https://github.com/jonasehrlich/octosync/pull/19))
-- Expire an account at the day before its deletion starts, so no new SSH session can begin while the
-  home directory is archived. Syncing a user whose account survived a failed deletion lifts an
-  expiry that is already in effect. A future expiry date set by an operator stays.
-  ([#19](https://github.com/jonasehrlich/octosync/pull/19))
-- Store `users.json` in schema v2: users deleted by octosync are kept as tombstones under an
-  `archived` key, so a member who leaves and rejoins gets their old UID back. The v1 file is backed
-  up to `users-v1.json` once before the first v2 save.
-  ([#22](https://github.com/jonasehrlich/octosync/pull/22))
-- Save the tombstone before `userdel` runs and re-enqueue archived users whose account still exists
-  on every sync, so a deletion interrupted at any point is finished by a later sync instead of
-  orphaning a live account ([#22](https://github.com/jonasehrlich/octosync/pull/22))
-- Record the home directory archive path on the tombstone, so a rejoin can later restore it
-  ([#22](https://github.com/jonasehrlich/octosync/pull/22))
-- The `delete` command keeps the store file and writes tombstones instead of removing `users.json`,
-  preserving the UID memory of a full wipe ([#22](https://github.com/jonasehrlich/octosync/pull/22))
-- Track the primary group GID in the store and re-create a rejoining member's private group with
-  `groupadd --gid <stored>` before `useradd --gid <stored>`, so group ownership of files outside the
-  archived home directory also survives the delete and re-create cycle. A GID that meanwhile belongs
-  to another group fails the re-creation loudly instead of falling back to a fresh one. Entries
-  migrated from a v1 store carry no GID and are backfilled on their next update.
-  ([#22](https://github.com/jonasehrlich/octosync/pull/22))
-- Never allocate a departed user's UID or GID to a brand-new member: `useradd` hands out the highest
-  ID in range plus one, which is exactly what deleting the highest-UID user frees. A new account
-  whose auto-allocated IDs collide with a tombstone is removed while still empty and re-created with
-  explicitly chosen free IDs. ([#22](https://github.com/jonasehrlich/octosync/pull/22))
+- `users.json` is automatically migrated to a versioned v2 format that records departed and purged
+  members. The original v1 file is backed up once as `users-v1.json`.
+  ([#22](https://github.com/jonasehrlich/octosync/pull/22),
+  [#25](https://github.com/jonasehrlich/octosync/pull/25))
 
 ## v0.3.0
 

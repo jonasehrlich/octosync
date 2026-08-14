@@ -1,30 +1,16 @@
-//! Linux backend running the shadow-utils commands (useradd, usermod, userdel,
-//! groupadd). It only ever runs as an actor: the commands fail instead of waiting when
-//! another invocation holds the lock on /etc/passwd or /etc/group, so the actor's
-//! one-message-at-a-time processing is what keeps them from racing each other.
+//! Actor-serialized Linux user management through shadow-utils.
 
 use crate::store;
 use crate::user_manager::{
-    AccountIds, CreateUser, DeletionPreparation, EnsureGroupsExist, PrepareUserDeletion,
-    RemoveAccount, SyncSupplementaryGroups, UpdateAuthorizedKeys, UpdateUser,
-    supplementary_groups_update,
+    AccountIds, CreateUser, EnsureGroupsExist, ExpireAccount, PurgeAccount, PurgeOutcome,
+    SyncSupplementaryGroups, UpdateAuthorizedKeys, UpdateUser, supplementary_groups_update,
 };
 use anyhow::Context as _;
 use std::{collections, time};
 use tokio::process;
 
 #[derive(Debug)]
-pub struct LinuxUserManager {
-    authorized_keys: crate::authorized_keys::AuthorizedKeysManager,
-}
-
-impl LinuxUserManager {
-    pub fn new() -> Self {
-        Self {
-            authorized_keys: crate::authorized_keys::AuthorizedKeysManager,
-        }
-    }
-}
+pub struct LinuxUserManager;
 
 impl hannibal::Actor for LinuxUserManager {}
 
@@ -48,9 +34,8 @@ impl hannibal::Handler<CreateUser> for LinuxUserManager {
                 "User already exists. Skipping creation."
             );
 
-            // The adopted account may carry the expiry of a failed deletion whose
-            // store entry is gone, e.g. after the delete command wiped the store
-            clear_deletion_expiry(&existing_user.name).await?;
+            // Reactivate an adopted account for a rejoining member.
+            clear_departure_expiry(&existing_user.name).await?;
 
             return Ok(store::User::builder()
                 .id(user.id)
@@ -79,8 +64,7 @@ impl hannibal::Handler<CreateUser> for LinuxUserManager {
 /// Check that a pre-existing account with the GitHub login may be adopted.
 ///
 /// Adopting an account whose IDs differ from a rejoining member's stored ones, or
-/// whose IDs another user's tombstone reserves, would silently accept exactly the
-/// ownership drift the stored IDs exist to prevent.
+/// whose IDs another user's tombstone reserves, would create an ownership drift between the users.
 fn verify_adoption(existing: &nix::unistd::User, ids: &AccountIds) -> anyhow::Result<()> {
     match ids {
         AccountIds::Stored { uid, gid } => {
@@ -126,13 +110,11 @@ fn verify_adoption(existing: &nix::unistd::User, ids: &AccountIds) -> anyhow::Re
 /// Number of candidates to probe before giving up the search for a free ID
 const FREE_ID_ATTEMPTS: u32 = 10_000;
 
-/// Create an account with system-allocated IDs, re-creating it with explicitly chosen
-/// free IDs when the allocation hands out an ID a tombstone reserves.
+/// Create an account without re-using IDs reserved by tombstones.
 ///
-/// shadow-utils allocates the highest ID in range plus one, so deleting the user with
-/// the highest UID frees exactly the next UID `useradd` hands out: without this check
-/// the next member to join would routinely receive the most recently departed user's
-/// UID and inherit ownership of their files outside the archived home directory.
+/// If an account is created with a UID or GID that a departed user's tombstone reserves, the
+/// new account may own files and directories that the departed user should still control.
+/// Thus the account is deleted and the function searches for a free UID / GID pair.
 async fn add_account_with_fresh_ids(
     login: &str,
     reserved_uids: &collections::HashSet<nix::unistd::Uid>,
@@ -148,8 +130,7 @@ async fn add_account_with_fresh_ids(
         gid = linux_user.gid.as_raw(),
         "Allocated IDs are reserved for a departed user, re-creating with free IDs"
     );
-    // The account was created moments ago and has never been returned to a caller, so
-    // nothing can have used it yet; remove it together with its fresh home directory
+    // The new account has not escaped, so it is safe to recreate with explicit IDs.
     let o = process::Command::new("/usr/sbin/userdel")
         .arg("--remove")
         .arg(login)
@@ -176,9 +157,7 @@ async fn add_account_with_fresh_ids(
     .await
 }
 
-/// First ID at or above `start` that no tombstone reserves and no account or group
-/// uses. The value serves as both UID and GID, mirroring the user-private group of a
-/// regular `useradd`.
+/// Find a free ID usable as both UID and private-group GID.
 fn free_id_from(
     start: u32,
     reserved_uids: &collections::HashSet<nix::unistd::Uid>,
@@ -201,9 +180,7 @@ fn free_id_from(
     anyhow::bail!("No free UID/GID found in [{start}, {end})")
 }
 
-/// Create a platform account with `useradd` and return it. Re-creating a previously
-/// deleted account with its stored UID and private-group GID keeps ownership of files
-/// outside the home directory intact.
+/// Create a platform account with `useradd` and return it.
 async fn add_account(
     login: &str,
     uid: Option<nix::unistd::Uid>,
@@ -247,17 +224,12 @@ async fn add_account(
         })
 }
 
-/// Re-create the platform account of a stored user that is gone from the system, using
-/// the stored name, UID and GID so file ownership and a home directory that survived
-/// the deletion stay intact. A changed GitHub login is applied afterwards by the
-/// regular rename path.
+/// Recreate a missing stored account with its original identity.
 async fn recreate_account(
     gh_user: &octocrab::models::Author,
     available_user: &store::User,
 ) -> anyhow::Result<nix::unistd::User> {
-    // The account may have been re-created by hand under a new UID. Adopting it would
-    // silently accept the ownership drift the stored UID exists to prevent, so refuse
-    // and leave the resolution to an operator.
+    // Refuse a manually recreated account with a different identity.
     let colliding = match nix::unistd::User::from_name(available_user.name())? {
         Some(existing) => Some(existing),
         None => nix::unistd::User::from_name(&gh_user.login)?,
@@ -281,16 +253,13 @@ async fn recreate_account(
     .await
 }
 
-/// Ensure the user-private group of a re-created account exists as `login` with the
-/// stored GID, refusing when the GID meanwhile belongs to another group. Falling back
-/// to a fresh GID would leave files with the old GID group-owned by whichever group is
-/// allocated it next.
+/// Recreate the private group, refusing conflicting names or GIDs.
 async fn ensure_private_group(login: &str, gid: nix::unistd::Gid) -> anyhow::Result<()> {
     if let Some(group) = nix::unistd::Group::from_gid(gid)
         .with_context(|| format!("Failed to check whether GID {gid} is in use"))?
     {
         if group.name == login {
-            // Already re-created, e.g. by an attempt that failed after groupadd
+            // A previous attempt may have failed after groupadd.
             return Ok(());
         }
         anyhow::bail!(
@@ -329,33 +298,18 @@ impl hannibal::Handler<UpdateUser> for LinuxUserManager {
         msg: UpdateUser,
     ) -> anyhow::Result<store::User> {
         let (gh_user, available_user) = (&msg.gh_user, &msg.available_user);
-        let linux_user = match nix::unistd::User::from_uid(available_user.uid())? {
-            Some(linux_user) => linux_user,
-            // The account is known in the store but gone from the system, e.g. deleted
-            // by hand
-            None => recreate_account(gh_user, available_user).await?,
+        // Accept the GitHub login after a rename whose store update was lost.
+        let linux_user = match resolve_account(available_user, Some(&gh_user.login))? {
+            AccountResolution::Matches(linux_user) => linux_user,
+            // Recreate an account removed outside octosync.
+            AccountResolution::Missing => recreate_account(gh_user, available_user).await?,
         };
 
-        // The stored UID may have been freed and recycled by an unrelated account. Only
-        // the stored name (the normal case) or the GitHub login (a rename whose store
-        // update was lost) prove this is the managed account.
-        if linux_user.name != available_user.name() && linux_user.name != gh_user.login {
-            anyhow::bail!(
-                "UID {} belongs to '{}', not to stored user '{}', refusing to update",
-                available_user.uid(),
-                linux_user.name,
-                available_user.name()
-            );
-        }
-
-        // The account may still carry the expiry of a deletion that failed after
-        // PrepareUserDeletion, e.g. when the user left and rejoined within one window
-        clear_deletion_expiry(&linux_user.name).await?;
+        // Active org members must not retain an effective expiry.
+        clear_departure_expiry(&linux_user.name).await?;
 
         if gh_user.login == linux_user.name {
-            // Rebuild the entry from the system account, healing a stored name that a
-            // lost store update after a rename left stale and backfilling the primary
-            // GID into entries migrated from a v1 store
+            // Heal stale names and backfill GIDs missing from v1 stores.
             return Ok(store::User::builder()
                 .id(available_user.id())
                 .uid(linux_user.uid)
@@ -402,83 +356,255 @@ impl hannibal::Handler<UpdateUser> for LinuxUserManager {
     }
 }
 
-impl hannibal::Handler<PrepareUserDeletion> for LinuxUserManager {
+impl hannibal::Handler<ExpireAccount> for LinuxUserManager {
     #[tracing::instrument(
-        name = "UserManager::prepare_user_deletion",
+        name = "UserManager::expire_account",
         skip_all,
         fields(user = %msg.user.name(), uid = msg.user.uid().as_raw())
     )]
     async fn handle(
         &mut self,
         _ctx: &mut hannibal::Context<Self>,
-        msg: PrepareUserDeletion,
-    ) -> anyhow::Result<DeletionPreparation> {
-        let Some(linux_user) = resolve_account_checked(&msg.user)? else {
-            tracing::warn!("User not found in system when attempting to delete, nothing to do");
-            return Ok(DeletionPreparation::NothingToDo);
-        };
-
-        // The password is locked, but pubkey SSH keeps working while the home directory
-        // is archived. Expire the account before the sweep so no new session can start
-        // anywhere in the deletion window.
-        expire_account(&linux_user.name).await?;
-
-        // Kill all of the user's processes so none can block the deletion or keep
-        // writing to the home directory while it is archived
-        kill_processes_for_user(&linux_user).await?;
-
-        Ok(DeletionPreparation::Prepared {
-            home_dir: linux_user.dir,
-        })
-    }
-}
-
-impl hannibal::Handler<RemoveAccount> for LinuxUserManager {
-    #[tracing::instrument(
-        name = "UserManager::remove_account",
-        skip_all,
-        fields(user = %msg.user.name(), uid = msg.user.uid().as_raw())
-    )]
-    async fn handle(
-        &mut self,
-        _ctx: &mut hannibal::Context<Self>,
-        msg: RemoveAccount,
+        msg: ExpireAccount,
     ) -> anyhow::Result<()> {
-        // The actor handles other messages between preparation and removal, so verify
-        // again that the name still belongs to the stored user before userdel
-        let Some(linux_user) = resolve_account_checked(&msg.user)? else {
-            tracing::warn!("User disappeared after deletion was prepared, nothing to do");
+        let AccountResolution::Matches(linux_user) = resolve_account(&msg.user, None)? else {
+            tracing::warn!("User not found in system when attempting to expire, nothing to do");
             return Ok(());
         };
 
-        // A process spawned between the preparation sweep and here (archiving can take
-        // a while) would make userdel fail, so sweep again right before it. The home
-        // directory is already archived, so nothing is left for a process to shut down
-        // cleanly into: kill hard without a grace period. userdel decides
-        // authoritatively whether the account is busy, so a failed sweep is only logged.
+        // Block new sessions before tearing down existing work.
+        expire_account(&linux_user.name).await?;
+
+        // Run independent cleanup steps before returning the first error.
+
+        // Remove schedulers before sweeping processes.
+        let scheduled_jobs = remove_scheduled_jobs(&linux_user).await;
+
+        // Sweep anything outside logind, or everything on systems without it.
+        end_logind_sessions(&linux_user).await;
+        let sweep = kill_processes_for_user(&linux_user).await;
+
+        // Remove access granted through supplementary groups.
+        let groups = strip_supplementary_groups(&linux_user).await;
+
+        scheduled_jobs.and(sweep).and(groups)
+    }
+}
+
+/// End the user's login sessions through logind, which logs them out cleanly. It
+/// closes the PAM sessions and tears down the session scopes and the user manager
+/// through the cgroup hierarchy instead of only signaling PIDs, so nothing escapes by
+/// forking.
+async fn end_logind_sessions(user: &nix::unistd::User) {
+    let connection = match tokio::time::timeout(LOGIND_TIMEOUT, zbus::Connection::system()).await {
+        Ok(Ok(connection)) => connection,
+        // Containers and non-systemd hosts rely on the process sweep.
+        Ok(Err(e)) => {
+            tracing::debug!("No system bus, ending sessions with the process sweep alone: {e}");
+            return;
+        }
+        Err(_) => {
+            tracing::error!("System bus did not answer in time, leaving the sessions to the sweep");
+            return;
+        }
+    };
+
+    // Bound D-Bus calls so a stuck logind cannot stall the actor.
+    let uid = user.uid.as_raw();
+    match tokio::time::timeout(LOGIND_TIMEOUT, terminate_logind_user(&connection, uid)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::error!("logind is available but did not end the sessions: {e:#}"),
+        Err(_) => {
+            tracing::error!("logind did not answer in time, leaving the sessions to the sweep")
+        }
+    }
+}
+
+const LOGIND_TIMEOUT: time::Duration = time::Duration::from_secs(5);
+
+/// Disable linger and ask logind to terminate the user's sessions.
+async fn terminate_logind_user(connection: &zbus::Connection, uid: u32) -> anyhow::Result<()> {
+    let manager = zbus::Proxy::new(
+        connection,
+        "org.freedesktop.login1",
+        "/org/freedesktop/login1",
+        "org.freedesktop.login1.Manager",
+    )
+    .await
+    .context("Failed to create the logind manager proxy")?;
+
+    // Disabling linger keeps a `user@.service` from restarting user services after the
+    // termination, but a surviving login session matters more, so a failure here must not skip the
+    // termination below
+    if let Err(e) = manager
+        .call::<_, _, ()>("SetUserLinger", &(uid, false, false))
+        .await
+    {
+        tracing::warn!("Failed to disable linger, terminating the sessions anyway: {e}");
+    }
+
+    // GetUser fails when there is no session or lingering user manager.
+    if manager
+        .call::<_, _, zbus::zvariant::OwnedObjectPath>("GetUser", &uid)
+        .await
+        .is_err()
+    {
+        return Ok(());
+    }
+    manager
+        .call::<_, _, ()>("TerminateUser", &uid)
+        .await
+        .context("Failed to terminate the user's sessions")
+}
+
+/// Remove `cron` and `at` jobs that can outlive login sessions.
+///
+/// Expiring the account already blocks the PAM account check `cron` and `at` perform, so
+/// this is the second half of that guarantee rather than the only one, and it also
+/// covers a machine whose `cron` does not consult PAM.
+async fn remove_scheduled_jobs(user: &nix::unistd::User) -> anyhow::Result<()> {
+    remove_crontab(&user.name).await?;
+    remove_at_jobs(&user.name).await
+}
+
+/// Remove the user's `crontab`
+///
+/// List the `crontab` first to avoid treating absence as an error.
+async fn remove_crontab(name: &str) -> anyhow::Result<()> {
+    let Some(list) = optional_command("/usr/bin/crontab", &["-l", "-u", name]).await? else {
+        return Ok(());
+    };
+    if !list.status.success() {
+        return Ok(());
+    }
+
+    let output = process::Command::new("/usr/bin/crontab")
+        .args(["-r", "-u", name])
+        .output()
+        .await
+        .context("Failed to wait for crontab command to finish")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to remove the crontab of '{name}': {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    tracing::info!("Removed the crontab of the departed user");
+    Ok(())
+}
+
+/// Remove the user's queued `at` jobs from root's global listing.
+///
+/// `atq` lists the jobs of every user with the owner in the last field, which is the only way to
+/// select one user's jobs for `atrm`.
+async fn remove_at_jobs(name: &str) -> anyhow::Result<()> {
+    let Some(queue) = optional_command("/usr/bin/atq", &[]).await? else {
+        return Ok(());
+    };
+    if !queue.status.success() {
+        anyhow::bail!(
+            "Failed to list the at jobs of '{name}': {}",
+            String::from_utf8_lossy(&queue.stderr)
+        );
+    }
+
+    let job_ids: Vec<String> = String::from_utf8_lossy(&queue.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let job_id = fields.next()?;
+            (fields.last()? == name).then(|| job_id.to_string())
+        })
+        .collect();
+    if job_ids.is_empty() {
+        return Ok(());
+    }
+
+    let output = process::Command::new("/usr/bin/atrm")
+        .args(&job_ids)
+        .output()
+        .await
+        .context("Failed to wait for atrm command to finish")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to remove the at jobs of '{name}': {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    tracing::info!(
+        jobs = job_ids.len(),
+        "Removed the at jobs of the departed user"
+    );
+    Ok(())
+}
+
+/// Treat a missing optional command as no work to do.
+async fn optional_command(
+    program: &str,
+    args: &[&str],
+) -> anyhow::Result<Option<std::process::Output>> {
+    match process::Command::new(program).args(args).output().await {
+        Ok(output) => Ok(Some(output)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!("'{program}' is not installed");
+            Ok(None)
+        }
+        Err(e) => Err(e).with_context(|| format!("Failed to run '{program}'")),
+    }
+}
+
+/// Remove all supplementary groups, skipping `usermod` when none exist.
+async fn strip_supplementary_groups(user: &nix::unistd::User) -> anyhow::Result<()> {
+    let current = current_supplementary_groups(user)
+        .with_context(|| format!("Failed to read current groups of '{}'", user.name))?;
+    if current.is_empty() {
+        return Ok(());
+    }
+    sync_user_supplementary_groups_by_name(&user.name, &[]).await
+}
+
+impl hannibal::Handler<PurgeAccount> for LinuxUserManager {
+    #[tracing::instrument(
+        name = "UserManager::purge_account",
+        skip_all,
+        fields(user = %msg.user.name(), uid = msg.user.uid().as_raw())
+    )]
+    async fn handle(
+        &mut self,
+        _ctx: &mut hannibal::Context<Self>,
+        msg: PurgeAccount,
+    ) -> anyhow::Result<PurgeOutcome> {
+        let AccountResolution::Matches(linux_user) = resolve_account(&msg.user, None)? else {
+            return Ok(PurgeOutcome::NoAccount);
+        };
+
+        // Reactivation clears the shadow expiry, preventing a live account from being purged.
+        if !account_is_expired(&linux_user.name, msg.expired_before)? {
+            return Ok(PurgeOutcome::NotExpired);
+        }
+
+        // The account has been expired for the whole retention period, so nothing is
+        // left to shut down cleanly into. userdel decides whether the account is busy,
+        // so a failed sweep is only logged.
         if let Err(e) = force_kill_processes_for_user(&linux_user).await {
             tracing::warn!("Failed to sweep processes before userdel: {e:#}");
         }
 
-        let proc = process::Command::new("/usr/sbin/userdel")
+        let o = process::Command::new("/usr/sbin/userdel")
             .arg("--remove")
-            .arg(msg.user.name())
-            .output();
-
-        let o = proc
+            .arg(&linux_user.name)
+            .output()
             .await
             .context("Failed to wait for userdel command to finish")?;
-
-        if o.status.success() {
-            tracing::info!(archive = ?msg.receipt.archive_path(), "Deleted user");
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!(
-                "Failed to delete user '{}': {}",
-                msg.user.name(),
+        if !o.status.success() {
+            anyhow::bail!(
+                "Failed to purge user '{}': {}",
+                linux_user.name,
                 String::from_utf8_lossy(&o.stderr)
-            ))
+            );
         }
+        tracing::info!("Purged the expired account and its home directory");
+        Ok(PurgeOutcome::Purged)
     }
 }
 
@@ -494,14 +620,13 @@ impl hannibal::Handler<SyncSupplementaryGroups> for LinuxUserManager {
         msg: SyncSupplementaryGroups,
     ) -> anyhow::Result<()> {
         let user = &msg.user;
-        let linux_user = nix::unistd::User::from_uid(user.uid())
-            .context("Failed to read user before syncing groups")?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "User '{}' was not found while syncing supplementary groups",
-                    user.name()
-                )
-            })?;
+        let linux_user = match resolve_account(user, None)? {
+            AccountResolution::Matches(linux_user) => linux_user,
+            AccountResolution::Missing => anyhow::bail!(
+                "User '{}' was not found while syncing supplementary groups",
+                user.name()
+            ),
+        };
 
         let primary_group_name = nix::unistd::Group::from_gid(linux_user.gid)
             .context("Failed to read primary group while syncing groups")?
@@ -573,46 +698,62 @@ impl hannibal::Handler<UpdateAuthorizedKeys> for LinuxUserManager {
         _ctx: &mut hannibal::Context<Self>,
         msg: UpdateAuthorizedKeys,
     ) -> anyhow::Result<()> {
-        self.authorized_keys
-            .update_authorized_keys(&msg.user, &msg.keys)
-            .await
+        crate::authorized_keys::update_authorized_keys(&msg.user, &msg.keys).await
     }
 }
 
-/// Resolve the platform account of a stored user for deletion, refusing when name and
-/// UID do not match. `Ok(None)` when no account with that name exists and the UID is
-/// unused.
-fn resolve_account_checked(user: &store::User) -> anyhow::Result<Option<nix::unistd::User>> {
-    // userdel operates on the account name, so resolve the account by name to
-    // guarantee the home directory that is archived is the one userdel --remove deletes
+/// A matching platform account or proof that neither its name nor UID exists.
+enum AccountResolution {
+    /// No account with the stored name exists and the stored UID is unused
+    Missing,
+    /// The account whose name and UID agree with the store
+    Matches(nix::unistd::User),
+}
+
+/// Resolve the platform account of a stored user
+///
+/// This is a crucial check used by every mutating handler, because `shadow-utils` commands operate
+/// on the account name, so the name is authoritative and the stored UID must agree with it.
+///
+/// Acting on a name whose UID changed on the system, or a UID whose name moved on the system, would
+/// mutate an unrelated account.
+///
+/// `renamed_to` accepts one alternate name for the account holding the stored UID: a usermod
+/// rename whose store update was lost leaves the account only findable by
+/// UID, and the caller knows which new name proves it is still the managed account.
+fn resolve_account(
+    user: &store::User,
+    renamed_to: Option<&str>,
+) -> anyhow::Result<AccountResolution> {
     let Some(linux_user) = nix::unistd::User::from_name(user.name())? else {
-        // The account may exist under a different name, e.g. when a usermod rename
-        // succeeded but the store update was lost. Whether that is this user or an
-        // unrelated account that reuses the UID can not be decided here, refuse
-        // instead of orphaning the account or deleting a wrong one.
         if let Some(other_user) = nix::unistd::User::from_uid(user.uid())? {
+            if renamed_to.is_some_and(|name| name == other_user.name) {
+                return Ok(AccountResolution::Matches(other_user));
+            }
+            // An unexpected name cannot safely be distinguished from UID reuse.
             anyhow::bail!(
-                "No user named '{}' in the system, but UID {} belongs to '{}', refusing to delete",
+                "No user named '{}' in the system, but UID {} belongs to '{}', refusing to act \
+                 on the account",
                 user.name(),
                 user.uid(),
                 other_user.name
             );
         }
-        return Ok(None);
+        return Ok(AccountResolution::Missing);
     };
     if linux_user.uid != user.uid() {
         anyhow::bail!(
-            "User '{}' has UID {} in the system but UID {} in the store, refusing to delete",
+            "User '{}' has UID {} in the system but UID {} in the store, refusing to act on \
+             the account",
             user.name(),
             linux_user.uid,
             user.uid()
         );
     }
-    Ok(Some(linux_user))
+    Ok(AccountResolution::Matches(linux_user))
 }
 
-/// The names of the supplementary groups the user is currently a member of,
-/// excluding the primary group
+/// Supplementary group names, excluding the primary group.
 fn current_supplementary_groups(
     user: &nix::unistd::User,
 ) -> anyhow::Result<collections::BTreeSet<String>> {
@@ -626,8 +767,7 @@ fn current_supplementary_groups(
         if gid == user.gid {
             continue;
         }
-        // A group deleted since getgrouplist has no name to compare or pass to
-        // usermod, skip it
+        // Skip groups deleted after getgrouplist.
         if let Some(group) = nix::unistd::Group::from_gid(gid)
             .with_context(|| format!("Failed to resolve group with GID {gid}"))?
         {
@@ -665,31 +805,18 @@ async fn sync_user_supplementary_groups_by_name(
     }
 }
 
-const SECONDS_PER_DAY: u64 = 86_400;
+const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
 
-/// Today as the day number since the epoch, the unit of the shadow expiry field
-fn days_since_epoch() -> anyhow::Result<i64> {
-    let days = time::SystemTime::now()
-        .duration_since(time::UNIX_EPOCH)
-        .context("System time is before the epoch")?
-        .as_secs()
-        / SECONDS_PER_DAY;
-    Ok(days as i64)
-}
-
-/// Expire the account so no new session (password or pubkey SSH) can start while its
-/// deletion is in progress. Sessions already running are handled by the process sweep.
-///
-/// The expiry is set to the day before the deletion: the shadow field has day
-/// granularity and some login paths treat an account as expired only strictly after
-/// its date, so the deletion day itself could keep logins open until midnight.
+/// Expire the account as of yesterday; existing sessions are handled separately.
 async fn expire_account(name: &str) -> anyhow::Result<()> {
-    let expire_days = days_since_epoch()? - 1;
+    let expire_at = chrono::Utc::now() - chrono::Duration::days(1);
+    if account_is_expired(name, expire_at)? {
+        return Ok(());
+    }
     let output = process::Command::new("/usr/sbin/usermod")
         .arg("--expiredate")
-        // shadow parses a plain number as days since the epoch, which sidesteps the
-        // timezone interpretation of a YYYY-MM-DD date. chage displays it as a date.
-        .arg(expire_days.to_string())
+        // Use epoch days to avoid YYYY-MM-DD timezone interpretation.
+        .arg(shadow_days(expire_at).to_string())
         .arg(name)
         .output()
         .await
@@ -702,22 +829,13 @@ async fn expire_account(name: &str) -> anyhow::Result<()> {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    tracing::info!("Expired account so no new session can start during deletion");
+    tracing::info!("Expired account so no new session can start");
     Ok(())
 }
 
-/// Lift an expiry that is already in effect, so a user whose account survived a failed
-/// deletion and who is synced again is not locked out silently. An expiry in the
-/// future is an operator's scheduled offboarding and stays.
-///
-/// octosync owns the account lifecycle of synced users, so a past expiry set by an
-/// operator does not survive a sync either. Suspending a member is done by removing
-/// them from the org.
-async fn clear_deletion_expiry(name: &str) -> anyhow::Result<()> {
-    let Some(expire_days) = account_expire_days(name)? else {
-        return Ok(());
-    };
-    if expire_days > days_since_epoch()? {
+/// Clear an effective expiry while preserving a future scheduled expiry.
+async fn clear_departure_expiry(name: &str) -> anyhow::Result<()> {
+    if !account_is_expired(name, chrono::Utc::now())? {
         return Ok(());
     }
 
@@ -736,12 +854,20 @@ async fn clear_deletion_expiry(name: &str) -> anyhow::Result<()> {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    tracing::info!("Cleared the expiry of the re-activated account");
+    tracing::info!("Cleared the expiry of the reactivated account");
     Ok(())
 }
 
-/// The account's expiry as days since the epoch, `None` when no expiry is set, read
-/// through the same NSS lookup the passwd queries of this module use.
+/// Whether the shadow expiry is on or before `as_of`.
+fn account_is_expired(name: &str, as_of: chrono::DateTime<chrono::Utc>) -> anyhow::Result<bool> {
+    Ok(account_expire_days(name)?.is_some_and(|expire_days| expire_days <= shadow_days(as_of)))
+}
+
+fn shadow_days(timestamp: chrono::DateTime<chrono::Utc>) -> i64 {
+    timestamp.timestamp().div_euclid(SECONDS_PER_DAY)
+}
+
+/// Read the shadow expiry as days since the epoch through libc's `getspnam`.
 fn account_expire_days(name: &str) -> anyhow::Result<Option<i64>> {
     let c_name = std::ffi::CString::new(name).context("User name contains an interior NUL byte")?;
     // SAFETY: getspnam returns a pointer into static storage, which is only unsound
@@ -749,7 +875,6 @@ fn account_expire_days(name: &str) -> anyhow::Result<Option<i64>> {
     // manager actor, which processes one message at a time.
     let entry = unsafe { libc::getspnam(c_name.as_ptr()) };
     if entry.is_null() {
-        // No shadow entry means no expiry to consider
         return Ok(None);
     }
     // SAFETY: checked to be non-null above, and the field is copied out before any
@@ -759,20 +884,14 @@ fn account_expire_days(name: &str) -> anyhow::Result<Option<i64>> {
     Ok((expire_days >= 0).then_some(expire_days))
 }
 
-/// Grace period a SIGTERM'd process gets to exit before it is killed
 const KILL_GRACE_PERIOD: time::Duration = time::Duration::from_secs(3);
-/// Poll interval while waiting for terminated processes to exit
 const KILL_POLL_INTERVAL: time::Duration = time::Duration::from_millis(200);
-/// Time SIGKILL'd processes get to disappear from the process table, so a following
-/// userdel cannot race a process that is still being torn down
 const SIGKILL_WAIT: time::Duration = time::Duration::from_secs(1);
 
-/// Stop all processes of the user: SIGTERM first so they can shut down cleanly, then
-/// SIGKILL whatever is still running after [`KILL_GRACE_PERIOD`]. Errors when
-/// processes survive the SIGKILL, e.g. stuck in uninterruptible I/O.
+/// Stop all processes for a user with SIGTERM, so they can shutdown cleanly.
+/// After [`KILL_GRACE_PERIOD`], `SIGKILL` is sent to the remaining processes.
 ///
-/// Runs inside the actor, so the grace period stalls other platform operations. It is
-/// only paid when the user actually has running processes.
+/// Errors are returned if any processes remain after [`SIGKILL_WAIT`].
 #[tracing::instrument(name = "kill_processes", skip(user), fields(user = %user.name))]
 async fn kill_processes_for_user(user: &nix::unistd::User) -> anyhow::Result<()> {
     let uid = user.uid.as_raw();
@@ -796,7 +915,7 @@ async fn kill_processes_for_user(user: &nix::unistd::User) -> anyhow::Result<()>
     ensure_processes_are_gone(uid, &user.name).await
 }
 
-/// SIGKILL all processes of the user without a grace period
+/// Kill all user processes without a grace period.
 #[tracing::instrument(name = "force_kill_processes", skip(user), fields(user = %user.name))]
 async fn force_kill_processes_for_user(user: &nix::unistd::User) -> anyhow::Result<()> {
     let uid = user.uid.as_raw();
@@ -808,8 +927,7 @@ async fn force_kill_processes_for_user(user: &nix::unistd::User) -> anyhow::Resu
     ensure_processes_are_gone(uid, &user.name).await
 }
 
-/// Confirm that the SIGKILL'd processes are gone from the process table within
-/// [`SIGKILL_WAIT`]
+/// Confirm killed processes leave the process table.
 async fn ensure_processes_are_gone(uid: u32, name: &str) -> anyhow::Result<()> {
     let survivors = wait_for_processes_to_exit(uid, SIGKILL_WAIT).await?;
     if survivors.is_empty() {
@@ -821,8 +939,7 @@ async fn ensure_processes_are_gone(uid: u32, name: &str) -> anyhow::Result<()> {
     )
 }
 
-/// Poll until no process of `uid` is left or `timeout` elapses, returning the
-/// processes still running
+/// Wait for a UID's processes to exit, returning any survivors.
 async fn wait_for_processes_to_exit(
     uid: u32,
     timeout: time::Duration,
@@ -837,13 +954,11 @@ async fn wait_for_processes_to_exit(
     }
 }
 
-/// PIDs of all live processes whose real UID is `uid`. Zombies are excluded: no signal
-/// removes them and only their parent reaping them does, so counting them would stall
-/// every wait for the full timeout.
+/// Live non-zombie processes whose real UID matches `uid`.
 async fn processes_of_uid(uid: u32) -> anyhow::Result<Vec<nix::unistd::Pid>> {
     tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<nix::unistd::Pid>> {
         let procs = procfs::process::all_processes().context("Failed to list processes")?;
-        // Processes that exit while being inspected are skipped
+        // Ignore processes that exit during inspection.
         Ok(procs
             .flatten()
             .filter(|proc| {
@@ -857,7 +972,7 @@ async fn processes_of_uid(uid: u32) -> anyhow::Result<Vec<nix::unistd::Pid>> {
     .context("Process listing task failed")?
 }
 
-/// Send `signal` to all `pids`. A process that is already gone is not an error.
+/// Signal every PID, ignoring processes that already exited.
 fn signal_processes(pids: &[nix::unistd::Pid], signal: nix::sys::signal::Signal) {
     for &pid in pids {
         let _ = nix::sys::signal::kill(pid, signal);

@@ -1,14 +1,12 @@
-//! Resolution of `--group` CLI arguments into per-user Linux group assignments
+//! Resolves `--group` arguments into per-user Linux group assignments.
 
 use anyhow::Context as _;
 use futures::{StreamExt as _, TryStreamExt as _, stream};
 use std::{collections, str};
 
-/// Maximum number of team member fetches in flight at the same time
 const MAX_CONCURRENT_TEAM_FETCHES: usize = 8;
 
-/// A single `--group` argument. Either a Linux group for every synced user or a
-/// mapping from a GitHub team to a Linux group.
+/// A global Linux group or a GitHub-team-to-Linux-group mapping.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroupMapping {
     AddGroup(String),
@@ -94,12 +92,7 @@ pub struct GroupAssignments {
 }
 
 impl GroupAssignments {
-    /// Resolve the CLI mappings by fetching the members of every mapped GitHub team.
-    ///
-    /// Mapped teams are checked against the org's team list, so a missing team is a
-    /// confirmed fact rather than a guess from an ambiguous response. Mappings whose
-    /// team does not exist are skipped with a warning: the Linux group is not created
-    /// and no longer assigned to any user. Any API error fails the resolution.
+    /// Resolve mappings after checking mapped teams against the org's team list.
     pub async fn resolve(
         octocrab: &octocrab::Octocrab,
         org: &str,
@@ -109,8 +102,6 @@ impl GroupAssignments {
         Ok(Self::from_mappings(mappings, &team_members))
     }
 
-    /// Combine the CLI mappings with the fetched team memberships, skipping mappings
-    /// whose GitHub team is missing from `team_members` (see [`Self::resolve`])
     fn from_mappings(
         mappings: &[GroupMapping],
         team_members: &collections::HashMap<String, Vec<octocrab::models::UserId>>,
@@ -153,8 +144,8 @@ impl GroupAssignments {
         groups.into_iter().cloned().collect()
     }
 
-    /// The supplementary groups for a single user: the global groups plus the groups
-    /// of the GitHub teams the user is a member of
+    /// The supplementary groups for a single user. This consists of the global groups plus the
+    /// groups of the GitHub teams the user is a member of
     pub fn user_groups(&self, id: octocrab::models::UserId) -> Vec<String> {
         let mut groups: collections::BTreeSet<&String> = self.global.iter().collect();
         if let Some(team_groups) = self.per_user.get(&id) {
@@ -165,11 +156,6 @@ impl GroupAssignments {
 }
 
 /// Fetch the member IDs of every GitHub team referenced by a team mapping.
-///
-/// The org's team list is the source of truth for which teams exist: mapped teams
-/// missing from it are left out of the returned map, and members are only fetched for
-/// teams it confirms. This keeps a transient member-fetch failure from ever being
-/// mistaken for a missing team; any API error is returned instead.
 async fn get_members_of_mapped_teams(
     octocrab: &octocrab::Octocrab,
     org: &str,
@@ -222,7 +208,6 @@ async fn get_org_team_slugs(
     Ok(teams.into_iter().map(|team| team.slug).collect())
 }
 
-/// List the member IDs of a team that is known to exist in the org
 async fn get_team_members(
     octocrab: &octocrab::Octocrab,
     org: &str,
