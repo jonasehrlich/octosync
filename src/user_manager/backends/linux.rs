@@ -5,9 +5,8 @@
 
 use crate::store;
 use crate::user_manager::{
-    AccountIds, CreateUser, DeletionPreparation, EnsureGroupsExist, PrepareUserDeletion,
-    RemoveAccount, SyncSupplementaryGroups, UpdateAuthorizedKeys, UpdateUser,
-    supplementary_groups_update,
+    AccountIds, CreateUser, EnsureGroupsExist, ExpireAccount, PurgeAccount, PurgeOutcome,
+    SyncSupplementaryGroups, UpdateAuthorizedKeys, UpdateUser, supplementary_groups_update,
 };
 use anyhow::Context as _;
 use std::{collections, time};
@@ -48,9 +47,9 @@ impl hannibal::Handler<CreateUser> for LinuxUserManager {
                 "User already exists. Skipping creation."
             );
 
-            // The adopted account may carry the expiry of a failed deletion whose
-            // store entry is gone, e.g. after the delete command wiped the store
-            clear_deletion_expiry(&existing_user.name).await?;
+            // The adopted account is usually a rejoining member's expired account:
+            // lifting the expiry is what turns the departure back into an active user
+            clear_departure_expiry(&existing_user.name).await?;
 
             return Ok(store::User::builder()
                 .id(user.id)
@@ -129,10 +128,10 @@ const FREE_ID_ATTEMPTS: u32 = 10_000;
 /// Create an account with system-allocated IDs, re-creating it with explicitly chosen
 /// free IDs when the allocation hands out an ID a tombstone reserves.
 ///
-/// shadow-utils allocates the highest ID in range plus one, so deleting the user with
+/// shadow-utils allocates the highest ID in range plus one, so purging the user with
 /// the highest UID frees exactly the next UID `useradd` hands out: without this check
-/// the next member to join would routinely receive the most recently departed user's
-/// UID and inherit ownership of their files outside the archived home directory.
+/// the next member to join would routinely receive the most recently purged user's
+/// UID and inherit ownership of their files outside the removed home directory.
 async fn add_account_with_fresh_ids(
     login: &str,
     reserved_uids: &collections::HashSet<nix::unistd::Uid>,
@@ -202,7 +201,7 @@ fn free_id_from(
 }
 
 /// Create a platform account with `useradd` and return it. Re-creating a previously
-/// deleted account with its stored UID and private-group GID keeps ownership of files
+/// removed account with its stored UID and private-group GID keeps ownership of files
 /// outside the home directory intact.
 async fn add_account(
     login: &str,
@@ -249,8 +248,8 @@ async fn add_account(
 
 /// Re-create the platform account of a stored user that is gone from the system, using
 /// the stored name, UID and GID so file ownership and a home directory that survived
-/// the deletion stay intact. A changed GitHub login is applied afterwards by the
-/// regular rename path.
+/// the account's removal stay intact. A changed GitHub login is applied afterwards by
+/// the regular rename path.
 async fn recreate_account(
     gh_user: &octocrab::models::Author,
     available_user: &store::User,
@@ -348,9 +347,9 @@ impl hannibal::Handler<UpdateUser> for LinuxUserManager {
             );
         }
 
-        // The account may still carry the expiry of a deletion that failed after
-        // PrepareUserDeletion, e.g. when the user left and rejoined within one window
-        clear_deletion_expiry(&linux_user.name).await?;
+        // The account may carry an expiry that should no longer be in effect, e.g.
+        // one set by an operator: octosync owns the lifecycle of synced users
+        clear_departure_expiry(&linux_user.name).await?;
 
         if gh_user.login == linux_user.name {
             // Rebuild the entry from the system account, healing a stored name that a
@@ -402,83 +401,161 @@ impl hannibal::Handler<UpdateUser> for LinuxUserManager {
     }
 }
 
-impl hannibal::Handler<PrepareUserDeletion> for LinuxUserManager {
+impl hannibal::Handler<ExpireAccount> for LinuxUserManager {
     #[tracing::instrument(
-        name = "UserManager::prepare_user_deletion",
+        name = "UserManager::expire_account",
         skip_all,
         fields(user = %msg.user.name(), uid = msg.user.uid().as_raw())
     )]
     async fn handle(
         &mut self,
         _ctx: &mut hannibal::Context<Self>,
-        msg: PrepareUserDeletion,
-    ) -> anyhow::Result<DeletionPreparation> {
-        let Some(linux_user) = resolve_account_checked(&msg.user)? else {
-            tracing::warn!("User not found in system when attempting to delete, nothing to do");
-            return Ok(DeletionPreparation::NothingToDo);
-        };
-
-        // The password is locked, but pubkey SSH keeps working while the home directory
-        // is archived. Expire the account before the sweep so no new session can start
-        // anywhere in the deletion window.
-        expire_account(&linux_user.name).await?;
-
-        // Kill all of the user's processes so none can block the deletion or keep
-        // writing to the home directory while it is archived
-        kill_processes_for_user(&linux_user).await?;
-
-        Ok(DeletionPreparation::Prepared {
-            home_dir: linux_user.dir,
-        })
-    }
-}
-
-impl hannibal::Handler<RemoveAccount> for LinuxUserManager {
-    #[tracing::instrument(
-        name = "UserManager::remove_account",
-        skip_all,
-        fields(user = %msg.user.name(), uid = msg.user.uid().as_raw())
-    )]
-    async fn handle(
-        &mut self,
-        _ctx: &mut hannibal::Context<Self>,
-        msg: RemoveAccount,
+        msg: ExpireAccount,
     ) -> anyhow::Result<()> {
-        // The actor handles other messages between preparation and removal, so verify
-        // again that the name still belongs to the stored user before userdel
         let Some(linux_user) = resolve_account_checked(&msg.user)? else {
-            tracing::warn!("User disappeared after deletion was prepared, nothing to do");
+            tracing::warn!("User not found in system when attempting to expire, nothing to do");
             return Ok(());
         };
 
-        // A process spawned between the preparation sweep and here (archiving can take
-        // a while) would make userdel fail, so sweep again right before it. The home
-        // directory is already archived, so nothing is left for a process to shut down
-        // cleanly into: kill hard without a grace period. userdel decides
-        // authoritatively whether the account is busy, so a failed sweep is only logged.
+        // Expire first, so no new session (password or pubkey SSH) can start while
+        // the running ones are ended
+        expire_account(&linux_user.name).await?;
+
+        // logind first: it logs the user out cleanly, closing the PAM sessions and
+        // tearing down the session scopes and the user manager instead of only
+        // signaling PIDs. The sweep afterwards is the catch-all for processes outside
+        // logind's session scopes, and the sole mechanism on systems without logind.
+        end_logind_sessions(&linux_user).await;
+        kill_processes_for_user(&linux_user).await?;
+
+        // octosync owns the supplementary groups of synced users, and a departed
+        // member keeps no access granted through them
+        strip_supplementary_groups(&linux_user).await
+    }
+}
+
+/// End the user's login sessions through logind, which logs them out cleanly: it
+/// closes the PAM sessions and tears down the session scopes and the user manager
+/// through the cgroup hierarchy instead of only signaling PIDs, so nothing escapes by
+/// forking. Never fatal, the following process sweep is the catch-all.
+///
+/// Reaching logind at all is what separates the two failure modes, so they are logged
+/// differently: no system bus means no logind and hence no logind sessions on this
+/// machine, while a logind that answers and then refuses leaves session scopes and a
+/// lingering user manager behind that the sweep cannot clean up.
+async fn end_logind_sessions(user: &nix::unistd::User) {
+    let connection = match zbus::Connection::system().await {
+        Ok(connection) => connection,
+        // A container or a machine without systemd: the process sweep is the whole
+        // mechanism here, so this is an expected state rather than a failure
+        Err(e) => {
+            tracing::debug!("No system bus, ending sessions with the process sweep alone: {e}");
+            return;
+        }
+    };
+    if let Err(e) = terminate_logind_user(&connection, user.uid.as_raw()).await {
+        tracing::error!("logind is available but did not end the user's sessions: {e:#}");
+    }
+}
+
+/// Disable linger for the user and terminate their sessions over logind's D-Bus API.
+///
+/// `TerminateUser` returns once the stop jobs are queued rather than once the
+/// processes are gone, so the caller's sweep is what establishes that they exited.
+async fn terminate_logind_user(connection: &zbus::Connection, uid: u32) -> anyhow::Result<()> {
+    let manager = zbus::Proxy::new(
+        connection,
+        "org.freedesktop.login1",
+        "/org/freedesktop/login1",
+        "org.freedesktop.login1.Manager",
+    )
+    .await
+    .context("Failed to create the logind manager proxy")?;
+
+    // Disabling linger keeps a `user@.service` from restarting user services after the
+    // termination, but it is the lesser half: a surviving login session matters more,
+    // so a failure here must not skip the termination below
+    if let Err(e) = manager
+        .call::<_, _, ()>("SetUserLinger", &(uid, false, false))
+        .await
+    {
+        tracing::warn!("Failed to disable linger, terminating the sessions anyway: {e}");
+    }
+
+    // GetUser errors when the user neither has a session nor lingers, the usual state
+    // of a departed account that is re-expired by a later sync: nothing to terminate
+    if manager
+        .call::<_, _, zbus::zvariant::OwnedObjectPath>("GetUser", &uid)
+        .await
+        .is_err()
+    {
+        return Ok(());
+    }
+    manager
+        .call::<_, _, ()>("TerminateUser", &uid)
+        .await
+        .context("Failed to terminate the user's sessions")
+}
+
+/// Remove the user from all supplementary groups, so a departed member keeps no
+/// access granted through them. The usermod is skipped when there is nothing to
+/// remove, keeping the re-expiry on every sync cheap.
+async fn strip_supplementary_groups(user: &nix::unistd::User) -> anyhow::Result<()> {
+    let current = current_supplementary_groups(user)
+        .with_context(|| format!("Failed to read current groups of '{}'", user.name))?;
+    if current.is_empty() {
+        return Ok(());
+    }
+    sync_user_supplementary_groups_by_name(&user.name, &[]).await
+}
+
+impl hannibal::Handler<PurgeAccount> for LinuxUserManager {
+    #[tracing::instrument(
+        name = "UserManager::purge_account",
+        skip_all,
+        fields(user = %msg.user.name(), uid = msg.user.uid().as_raw())
+    )]
+    async fn handle(
+        &mut self,
+        _ctx: &mut hannibal::Context<Self>,
+        msg: PurgeAccount,
+    ) -> anyhow::Result<PurgeOutcome> {
+        let Some(linux_user) = resolve_account_checked(&msg.user)? else {
+            return Ok(PurgeOutcome::NoAccount);
+        };
+
+        // The account-side eligibility: only an account whose own shadow expiry has
+        // been in effect for the retention period may be purged. Any reactivation
+        // clears the expiry, so a live account can never pass this gate.
+        if !account_expire_days(&linux_user.name)?
+            .is_some_and(|expire_days| expire_days <= msg.expired_before)
+        {
+            return Ok(PurgeOutcome::NotExpired);
+        }
+
+        // The account has been expired for the whole retention period, so nothing is
+        // left to shut down cleanly into: kill hard without a grace period. userdel
+        // decides authoritatively whether the account is busy, so a failed sweep is
+        // only logged.
         if let Err(e) = force_kill_processes_for_user(&linux_user).await {
             tracing::warn!("Failed to sweep processes before userdel: {e:#}");
         }
 
-        let proc = process::Command::new("/usr/sbin/userdel")
+        let o = process::Command::new("/usr/sbin/userdel")
             .arg("--remove")
-            .arg(msg.user.name())
-            .output();
-
-        let o = proc
+            .arg(&linux_user.name)
+            .output()
             .await
             .context("Failed to wait for userdel command to finish")?;
-
-        if o.status.success() {
-            tracing::info!(archive = ?msg.receipt.archive_path(), "Deleted user");
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!(
-                "Failed to delete user '{}': {}",
-                msg.user.name(),
+        if !o.status.success() {
+            anyhow::bail!(
+                "Failed to purge user '{}': {}",
+                linux_user.name,
                 String::from_utf8_lossy(&o.stderr)
-            ))
+            );
         }
+        tracing::info!("Purged the expired account and its home directory");
+        Ok(PurgeOutcome::Purged)
     }
 }
 
@@ -579,20 +656,21 @@ impl hannibal::Handler<UpdateAuthorizedKeys> for LinuxUserManager {
     }
 }
 
-/// Resolve the platform account of a stored user for deletion, refusing when name and
-/// UID do not match. `Ok(None)` when no account with that name exists and the UID is
-/// unused.
+/// Resolve the platform account of a stored user for its expiry or purge, refusing
+/// when name and UID do not match. `Ok(None)` when no account with that name exists
+/// and the UID is unused.
 fn resolve_account_checked(user: &store::User) -> anyhow::Result<Option<nix::unistd::User>> {
-    // userdel operates on the account name, so resolve the account by name to
-    // guarantee the home directory that is archived is the one userdel --remove deletes
+    // usermod and userdel operate on the account name, so resolve the account by name
+    // to guarantee the account acted on is the one the name addresses
     let Some(linux_user) = nix::unistd::User::from_name(user.name())? else {
         // The account may exist under a different name, e.g. when a usermod rename
         // succeeded but the store update was lost. Whether that is this user or an
         // unrelated account that reuses the UID can not be decided here, refuse
-        // instead of orphaning the account or deleting a wrong one.
+        // instead of acting on a possibly wrong account.
         if let Some(other_user) = nix::unistd::User::from_uid(user.uid())? {
             anyhow::bail!(
-                "No user named '{}' in the system, but UID {} belongs to '{}', refusing to delete",
+                "No user named '{}' in the system, but UID {} belongs to '{}', refusing to act \
+                 on the account",
                 user.name(),
                 user.uid(),
                 other_user.name
@@ -602,7 +680,8 @@ fn resolve_account_checked(user: &store::User) -> anyhow::Result<Option<nix::uni
     };
     if linux_user.uid != user.uid() {
         anyhow::bail!(
-            "User '{}' has UID {} in the system but UID {} in the store, refusing to delete",
+            "User '{}' has UID {} in the system but UID {} in the store, refusing to act on \
+             the account",
             user.name(),
             linux_user.uid,
             user.uid()
@@ -677,14 +756,19 @@ fn days_since_epoch() -> anyhow::Result<i64> {
     Ok(days as i64)
 }
 
-/// Expire the account so no new session (password or pubkey SSH) can start while its
-/// deletion is in progress. Sessions already running are handled by the process sweep.
+/// Expire the account so no new session (password or pubkey SSH) can start. Sessions
+/// already running are handled by the session teardown and the process sweep.
 ///
-/// The expiry is set to the day before the deletion: the shadow field has day
+/// The expiry is set to the day before the departure: the shadow field has day
 /// granularity and some login paths treat an account as expired only strictly after
-/// its date, so the deletion day itself could keep logins open until midnight.
+/// its date, so the departure day itself could keep logins open until midnight.
 async fn expire_account(name: &str) -> anyhow::Result<()> {
     let expire_days = days_since_epoch()? - 1;
+    // A departed account is re-expired on every sync; skip the usermod when the
+    // expiry is already in effect
+    if account_expire_days(name)?.is_some_and(|days| days <= expire_days) {
+        return Ok(());
+    }
     let output = process::Command::new("/usr/sbin/usermod")
         .arg("--expiredate")
         // shadow parses a plain number as days since the epoch, which sidesteps the
@@ -702,18 +786,18 @@ async fn expire_account(name: &str) -> anyhow::Result<()> {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    tracing::info!("Expired account so no new session can start during deletion");
+    tracing::info!("Expired account so no new session can start");
     Ok(())
 }
 
-/// Lift an expiry that is already in effect, so a user whose account survived a failed
-/// deletion and who is synced again is not locked out silently. An expiry in the
-/// future is an operator's scheduled offboarding and stays.
+/// Lift an expiry that is already in effect, reactivating the expired account of a
+/// departed member who rejoined. An expiry in the future is an operator's scheduled
+/// offboarding and stays.
 ///
 /// octosync owns the account lifecycle of synced users, so a past expiry set by an
 /// operator does not survive a sync either. Suspending a member is done by removing
 /// them from the org.
-async fn clear_deletion_expiry(name: &str) -> anyhow::Result<()> {
+async fn clear_departure_expiry(name: &str) -> anyhow::Result<()> {
     let Some(expire_days) = account_expire_days(name)? else {
         return Ok(());
     };

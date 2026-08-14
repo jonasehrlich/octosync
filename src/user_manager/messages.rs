@@ -3,8 +3,8 @@
 //! A platform backend is an actor handling the full message set. The messages carry
 //! owned data so they can cross the actor boundary.
 
-use crate::{archiver, public_keys, store};
-use std::{collections, path};
+use crate::{public_keys, store};
+use std::collections;
 
 /// Creates a platform user for the given GitHub user without a password.
 #[hannibal::message(response = anyhow::Result<store::User>)]
@@ -16,18 +16,19 @@ pub struct CreateUser {
 /// UID and GID of the account [`CreateUser`] creates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccountIds {
-    /// The stored IDs of a rejoining member: the account is created with exactly this
-    /// UID and its private group with exactly this GID, so file ownership survives the
-    /// delete and re-create cycle. When either ID is taken, creation fails instead of
-    /// falling back to a fresh one. A tombstone migrated from v1 carries no GID and
-    /// leaves the private group to `useradd`.
+    /// The stored IDs of a rejoining member whose account is gone from the system
+    /// (purged, or removed by hand): the account is created with exactly this UID and
+    /// its private group with exactly this GID, so file ownership survives the removal
+    /// and re-create cycle. When either ID is taken, creation fails instead of falling
+    /// back to a fresh one. A tombstone migrated from v1 carries no GID and leaves the
+    /// private group to `useradd`.
     Stored {
         uid: nix::unistd::Uid,
         gid: Option<nix::unistd::Gid>,
     },
     /// System-allocated IDs for a brand-new member, avoiding the IDs reserved by
     /// tombstones: shadow-utils allocates the highest ID in range plus one, so
-    /// deleting the user with the highest UID frees exactly the next UID to be
+    /// purging the user with the highest UID frees exactly the next UID to be
     /// allocated.
     Fresh {
         reserved_uids: collections::HashSet<nix::unistd::Uid>,
@@ -45,32 +46,50 @@ pub struct UpdateUser {
     pub available_user: store::User,
 }
 
-/// Prepares the deletion of a platform user: verifies that the stored user still
-/// matches the platform account, expires the account so no new session can start,
-/// and stops everything that could block the deletion or keep writing to the home
-/// directory while it is archived.
-#[hannibal::message(response = anyhow::Result<DeletionPreparation>)]
-pub struct PrepareUserDeletion {
-    pub user: store::User,
-}
-
-/// Outcome of [`PrepareUserDeletion`].
-#[derive(Debug)]
-pub enum DeletionPreparation {
-    /// No platform account for the user exists, there is nothing to delete.
-    NothingToDo,
-    /// The account can be removed once its home directory is archived.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    Prepared { home_dir: path::PathBuf },
-}
-
-/// Removes the platform account of a prepared user. Taking an
-/// [`archiver::ArchiveReceipt`] forces the home directory to be archived before the
-/// account and its files can be deleted.
+/// Expires the platform account of a departed user, replacing its deletion: verifies
+/// that the stored user still matches the platform account, expires it so no new
+/// session (password or pubkey SSH) can start, ends the running sessions and strips
+/// the supplementary groups. The account, its home directory and its primary group
+/// stay on the machine as the durable departure record, so the departure is a
+/// reversible lockout that a rejoin heals, until the purge removes the account after
+/// the retention period.
+///
+/// Idempotent, so the sync can send it for every departed user on every run and an
+/// expiry interrupted at any point converges.
 #[hannibal::message(response = anyhow::Result<()>)]
-pub struct RemoveAccount {
+pub struct ExpireAccount {
     pub user: store::User,
-    pub receipt: archiver::ArchiveReceipt,
+}
+
+/// Permanently removes the expired platform account of a departed user with
+/// `userdel --remove`, deleting the home directory without an archive: the one
+/// deliberately irreversible operation left now that expiry replaced deletion.
+///
+/// The account-side half of the purge eligibility is verified here: the shadow expiry
+/// must be set and at most `expired_before`. It is the evidence on the machine itself
+/// that survives store damage and is cleared on any reactivation, so a wrongly
+/// resurrected tombstone can never purge a live account.
+#[hannibal::message(response = anyhow::Result<PurgeOutcome>)]
+pub struct PurgeAccount {
+    pub user: store::User,
+    /// Latest shadow expiry, in days since the epoch, an account may have to be purged
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub expired_before: i64,
+}
+
+/// Outcome of [`PurgeAccount`]. Only the Linux backend can verify the account-side
+/// eligibility, the mock previews every purge as performed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PurgeOutcome {
+    /// The account and its home directory were removed
+    Purged,
+    /// No account for the user exists on the system, nothing was done
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    NoAccount,
+    /// The account's shadow expiry is missing or newer than `expired_before`: the
+    /// account-side clock does not agree with the store's, nothing was done
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    NotExpired,
 }
 
 /// Synchronizes the supplementary groups of a user.

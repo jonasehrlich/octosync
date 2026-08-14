@@ -317,6 +317,28 @@ impl UserStore {
         );
     }
 
+    /// Move a departed tombstone to the purged map, keeping its IDs for a rejoin even
+    /// after the purge
+    pub fn mark_purged(
+        &mut self,
+        id: &octocrab::models::UserId,
+        purged_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        if let Some(departed) = self.departed.remove(id) {
+            self.purged.insert(
+                departed.id,
+                PurgedUser {
+                    id: departed.id,
+                    name: departed.name,
+                    uid: departed.uid,
+                    gid: departed.gid,
+                    departed_at: departed.departed_at,
+                    purged_at,
+                },
+            );
+        }
+    }
+
     /// Drop the tombstones of users that are active again, keeping every user in
     /// exactly one of the three maps
     pub fn prune_rejoined(&mut self) {
@@ -330,7 +352,7 @@ impl UserStore {
     }
 
     /// Load the store from the file system, starting empty if the file doesn't exist.
-    /// A v1 file is backed up once and migrated with an empty archived map.
+    /// A v1 file is backed up once and migrated with empty tombstone maps.
     #[tracing::instrument(name = "Store::load", skip(self))]
     async fn load(&mut self) -> anyhow::Result<()> {
         let path = self.path();
@@ -750,6 +772,25 @@ mod tests {
             assert_eq!(departed.uid, user.uid);
             assert_eq!(departed.gid, user.gid);
             assert_eq!(departed.departed_at, departed_at());
+        }
+
+        #[tokio::test]
+        async fn mark_purged_moves_a_departed_tombstone_to_the_purged_map() {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let mut store = UserStore::new(temp_dir.path()).await.unwrap();
+            let departed = departed_user();
+            store.departed.insert(departed.id, departed.clone());
+            let purged_at = chrono::Utc::now();
+
+            store.mark_purged(&departed.id, purged_at);
+
+            assert!(store.departed.is_empty());
+            let purged = &store.purged[&departed.id];
+            assert_eq!(purged.name, departed.name);
+            assert_eq!(purged.uid, departed.uid);
+            assert_eq!(purged.gid, departed.gid);
+            assert_eq!(purged.departed_at, departed.departed_at);
+            assert_eq!(purged.purged_at, purged_at);
         }
 
         #[tokio::test]

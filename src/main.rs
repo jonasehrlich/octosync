@@ -6,8 +6,6 @@ use fs2::FileExt as _;
 use std::{fs, path, sync};
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-mod archiver;
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod authorized_keys;
 mod groups;
 mod octosync;
@@ -120,6 +118,9 @@ struct Cli {
     command: Commands,
 }
 
+/// Number of days an account stays expired before a purge removes it
+const DEFAULT_PURGE_AFTER_DAYS: u32 = 180;
+
 /// Arguments for the sync subcommand
 #[derive(clap::Args, Debug)]
 struct SyncArgs {
@@ -130,14 +131,31 @@ struct SyncArgs {
     /// To map GitHub teams to Linux user groups use `--group <gh-team-slug>:<linux-group>`.
     #[arg(long, value_parser = clap::value_parser!(groups::GroupMapping), verbatim_doc_comment)]
     group: Vec<groups::GroupMapping>,
+    /// Days a departed member's account must have been expired before the purge at the
+    /// end of the sync removes the account and its home directory permanently
+    #[arg(long, default_value_t = DEFAULT_PURGE_AFTER_DAYS)]
+    purge_after_days: u32,
+}
+
+/// Arguments for the purge subcommand
+#[derive(clap::Args, Debug)]
+struct PurgeArgs {
+    #[command(flatten)]
+    octocrab: InstallationClientArgs,
+    /// Days a departed member's account must have been expired before it is purged
+    #[arg(long, default_value_t = DEFAULT_PURGE_AFTER_DAYS)]
+    purge_after_days: u32,
 }
 
 #[derive(clap::Subcommand, Debug)]
 enum Commands {
     /// Synchronize GitHub organization members with Linux user accounts
     Sync(SyncArgs),
-    /// Delete all stored user data and Linux users created by octosync
+    /// Expire all octosync-managed Linux user accounts and record their departure
     Delete,
+    /// Permanently remove the accounts and home directories of members who departed
+    /// longer than the retention period ago
+    Purge(PurgeArgs),
 }
 
 #[tokio::main]
@@ -186,6 +204,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Delete => {
             app.delete().await?;
+        }
+        Commands::Purge(a) => {
+            app.purge(&a).await?;
         }
     }
     Ok(())

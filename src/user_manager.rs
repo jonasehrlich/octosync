@@ -8,21 +8,17 @@
 //! when another invocation holds the lock, so the concurrent per-user syncs must never
 //! run them in parallel.
 //!
-//! Deletion is split so the disk-heavy work stays concurrent: the actor prepares the
-//! deletion and removes the account, while the home directory archiving between the
-//! two runs outside the actor in the caller's task.
-
 pub mod backends;
 mod messages;
 
 pub use messages::{
-    AccountIds, CreateUser, DeletionPreparation, EnsureGroupsExist, PrepareUserDeletion,
-    RemoveAccount, SyncSupplementaryGroups, UpdateAuthorizedKeys, UpdateUser,
+    AccountIds, CreateUser, EnsureGroupsExist, ExpireAccount, PurgeAccount, PurgeOutcome,
+    SyncSupplementaryGroups, UpdateAuthorizedKeys, UpdateUser,
 };
 
 use crate::{public_keys, store};
 use anyhow::Context as _;
-use std::{collections, path};
+use std::collections;
 
 /// Handle to a spawned platform user manager actor.
 ///
@@ -30,12 +26,10 @@ use std::{collections, path};
 /// one-message-at-a-time serialization holds across every user of the handle.
 #[derive(Clone)]
 pub struct UserManager {
-    /// Directory where home directories of deleted users are archived
-    home_archive_dir: path::PathBuf,
     create_user: hannibal::Caller<CreateUser>,
     update_user: hannibal::Caller<UpdateUser>,
-    prepare_user_deletion: hannibal::Caller<PrepareUserDeletion>,
-    remove_account: hannibal::Caller<RemoveAccount>,
+    expire_account: hannibal::Caller<ExpireAccount>,
+    purge_account: hannibal::Caller<PurgeAccount>,
     sync_supplementary_groups: hannibal::Caller<SyncSupplementaryGroups>,
     ensure_groups_exist: hannibal::Caller<EnsureGroupsExist>,
     update_authorized_keys: hannibal::Caller<UpdateAuthorizedKeys>,
@@ -47,23 +41,21 @@ const ACTOR_ERROR: &str = "User manager actor not available or failed to process
 impl UserManager {
     #[builder]
     pub fn new(
-        /// Directory where home directories of deleted users are archived
-        home_archive_dir: path::PathBuf,
         /// Preview actions without changing users, groups or files on the system
         dry_run: bool,
     ) -> Self {
         if dry_run {
-            return Self::from_actor(backends::mock::MockUserManager::new(1000), home_archive_dir);
+            return Self::from_actor(backends::mock::MockUserManager::new(1000));
         }
 
         #[cfg(target_os = "linux")]
         {
-            Self::from_actor(backends::linux::LinuxUserManager::new(), home_archive_dir)
+            Self::from_actor(backends::linux::LinuxUserManager::new())
         }
 
         #[cfg(not(target_os = "linux"))]
         {
-            Self::from_actor(backends::mock::MockUserManager::new(1000), home_archive_dir)
+            Self::from_actor(backends::mock::MockUserManager::new(1000))
         }
     }
 }
@@ -71,12 +63,12 @@ impl UserManager {
 impl UserManager {
     /// Spawn the actor and keep one caller per message type, erasing the concrete
     /// actor type from the handle.
-    fn from_actor<A>(actor: A, home_archive_dir: path::PathBuf) -> Self
+    fn from_actor<A>(actor: A) -> Self
     where
         A: hannibal::Handler<CreateUser>
             + hannibal::Handler<UpdateUser>
-            + hannibal::Handler<PrepareUserDeletion>
-            + hannibal::Handler<RemoveAccount>
+            + hannibal::Handler<ExpireAccount>
+            + hannibal::Handler<PurgeAccount>
             + hannibal::Handler<SyncSupplementaryGroups>
             + hannibal::Handler<EnsureGroupsExist>
             + hannibal::Handler<UpdateAuthorizedKeys>,
@@ -84,11 +76,10 @@ impl UserManager {
         use hannibal::spawnable::Spawnable as _;
         let addr = actor.spawn();
         Self {
-            home_archive_dir,
             create_user: addr.caller(),
             update_user: addr.caller(),
-            prepare_user_deletion: addr.caller(),
-            remove_account: addr.caller(),
+            expire_account: addr.caller(),
+            purge_account: addr.caller(),
             sync_supplementary_groups: addr.caller(),
             ensure_groups_exist: addr.caller(),
             update_authorized_keys: addr.caller(),
@@ -127,50 +118,29 @@ impl UserManager {
             .context(ACTOR_ERROR)?
     }
 
-    /// Deletes the platform user of `user`, returning the path of the created home
-    /// directory archive, or `None` when there was no account or nothing to archive.
-    ///
-    /// The actor prepares the deletion ([`PrepareUserDeletion`]) and removes the
-    /// account ([`RemoveAccount`]); the disk- and CPU-heavy home directory archiving
-    /// between the two runs here, outside the actor, so concurrent deletions only
-    /// serialize on the account mutations themselves. A failed archive aborts the
-    /// deletion, the caller keeps the user's tombstone and retries on the next sync.
-    #[tracing::instrument(
-        name = "UserManager::delete_user",
-        skip_all,
-        fields(user = %user.name(), uid = user.uid().as_raw())
-    )]
-    pub async fn delete_user(&self, user: &store::User) -> anyhow::Result<Option<path::PathBuf>> {
-        let preparation = self
-            .prepare_user_deletion
-            .call(PrepareUserDeletion { user: user.clone() })
+    /// Sends [`ExpireAccount`] to the actor and awaits the expiry, the reversible
+    /// replacement for deleting the account.
+    pub async fn expire_user(&self, user: &store::User) -> anyhow::Result<()> {
+        self.expire_account
+            .call(ExpireAccount { user: user.clone() })
             .await
-            .context(ACTOR_ERROR)??;
+            .context(ACTOR_ERROR)?
+    }
 
-        let DeletionPreparation::Prepared { home_dir } = preparation else {
-            return Ok(None);
-        };
-
-        let receipt = crate::archiver::archive_home_dir(&self.home_archive_dir, user, &home_dir)
-            .await
-            .context("Home directory was not archived, not deleting user")?;
-        let archive_path = receipt.archive_path().map(path::Path::to_path_buf);
-        if let Some(archive_path) = &archive_path {
-            tracing::info!(
-                home_dir = %home_dir.display(),
-                archive_path = %archive_path.display(),
-                "Archived home directory",
-            );
-        }
-
-        self.remove_account
-            .call(RemoveAccount {
+    /// Sends [`PurgeAccount`] to the actor and awaits the outcome. `expired_before` is
+    /// the account-side eligibility bound, see [`PurgeAccount`].
+    pub async fn purge_user(
+        &self,
+        user: &store::User,
+        expired_before: i64,
+    ) -> anyhow::Result<PurgeOutcome> {
+        self.purge_account
+            .call(PurgeAccount {
                 user: user.clone(),
-                receipt,
+                expired_before,
             })
             .await
-            .context(ACTOR_ERROR)??;
-        Ok(archive_path)
+            .context(ACTOR_ERROR)?
     }
 
     /// Sends [`SyncSupplementaryGroups`] to the actor and awaits the update.
@@ -218,11 +188,8 @@ impl UserManager {
 impl UserManager {
     /// Build a manager backed by a [`backends::testing::TestingUserManager`], so
     /// tests can mock the response of every operation.
-    pub(crate) fn testing(
-        actor: backends::testing::TestingUserManager,
-        home_archive_dir: path::PathBuf,
-    ) -> Self {
-        Self::from_actor(actor, home_archive_dir)
+    pub(crate) fn testing(actor: backends::testing::TestingUserManager) -> Self {
+        Self::from_actor(actor)
     }
 }
 
@@ -266,78 +233,27 @@ mod tests {
         #[tokio::test]
         async fn responses_are_returned_in_order() {
             let mut actor = backends::testing::TestingUserManager::default();
+            actor.expire_account.push_back(Ok(()));
             actor
-                .prepare_user_deletion
-                .push_back(Ok(DeletionPreparation::NothingToDo));
-            actor
-                .prepare_user_deletion
+                .expire_account
                 .push_back(Err(anyhow::anyhow!("scripted failure")));
-            let manager = UserManager::testing(actor, path::PathBuf::new());
+            let manager = UserManager::testing(actor);
 
             let user = test_user(1, "alice");
-            manager.delete_user(&user).await.unwrap();
-            let err = manager.delete_user(&user).await.unwrap_err();
+            manager.expire_user(&user).await.unwrap();
+            let err = manager.expire_user(&user).await.unwrap_err();
             assert!(err.to_string().contains("scripted failure"));
         }
 
         #[tokio::test]
         async fn exhausted_script_fails_with_the_message_name() {
-            let manager = UserManager::testing(Default::default(), path::PathBuf::new());
+            let manager = UserManager::testing(Default::default());
 
             let err = manager
                 .ensure_groups_exist(&["developers".to_string()])
                 .await
                 .unwrap_err();
             assert!(err.to_string().contains("EnsureGroupsExist"));
-        }
-    }
-
-    mod deletion_flow {
-        use super::*;
-
-        #[tokio::test]
-        async fn archives_the_home_directory_before_removing_the_account() {
-            let home_dir = tempfile::tempdir().unwrap();
-            std::fs::write(home_dir.path().join("notes.txt"), "important").unwrap();
-            let archive_dir = tempfile::tempdir().unwrap();
-
-            let mut actor = backends::testing::TestingUserManager::default();
-            actor
-                .prepare_user_deletion
-                .push_back(Ok(DeletionPreparation::Prepared {
-                    home_dir: home_dir.path().to_path_buf(),
-                }));
-            actor.remove_account.push_back(Ok(()));
-            let manager = UserManager::testing(actor, archive_dir.path().to_path_buf());
-
-            manager.delete_user(&test_user(1, "alice")).await.unwrap();
-
-            // RemoveAccount was consumed from the script, and the archive exists
-            let archives = std::fs::read_dir(archive_dir.path()).unwrap().count();
-            assert!(archives > 0, "expected an archive to be created");
-        }
-
-        #[tokio::test]
-        async fn failed_archive_aborts_the_deletion() {
-            // A home directory that is a plain file makes the archiver refuse
-            let bogus_home = tempfile::NamedTempFile::new().unwrap();
-            let archive_dir = tempfile::tempdir().unwrap();
-
-            let mut actor = backends::testing::TestingUserManager::default();
-            actor
-                .prepare_user_deletion
-                .push_back(Ok(DeletionPreparation::Prepared {
-                    home_dir: bogus_home.path().to_path_buf(),
-                }));
-            // No RemoveAccount response is scripted: reaching it would fail with
-            // "No scripted response left", so the assertion below proves it is never sent
-            let manager = UserManager::testing(actor, archive_dir.path().to_path_buf());
-
-            let err = manager
-                .delete_user(&test_user(1, "alice"))
-                .await
-                .unwrap_err();
-            assert!(err.to_string().contains("not deleting user"));
         }
     }
 
@@ -362,14 +278,14 @@ mod tests {
 
         impl hannibal::Actor for OverlapProbe {}
 
-        impl hannibal::Handler<PrepareUserDeletion> for OverlapProbe {
+        impl hannibal::Handler<ExpireAccount> for OverlapProbe {
             async fn handle(
                 &mut self,
                 _ctx: &mut hannibal::Context<Self>,
-                _msg: PrepareUserDeletion,
-            ) -> anyhow::Result<DeletionPreparation> {
+                _msg: ExpireAccount,
+            ) -> anyhow::Result<()> {
                 self.probe().await;
-                Ok(DeletionPreparation::NothingToDo)
+                Ok(())
             }
         }
 
@@ -406,13 +322,13 @@ mod tests {
             }
         }
 
-        impl hannibal::Handler<RemoveAccount> for OverlapProbe {
+        impl hannibal::Handler<PurgeAccount> for OverlapProbe {
             async fn handle(
                 &mut self,
                 _ctx: &mut hannibal::Context<Self>,
-                _msg: RemoveAccount,
-            ) -> anyhow::Result<()> {
-                Ok(())
+                _msg: PurgeAccount,
+            ) -> anyhow::Result<PurgeOutcome> {
+                Ok(PurgeOutcome::NoAccount)
             }
         }
 
@@ -443,13 +359,10 @@ mod tests {
         async fn concurrent_operations_never_overlap() {
             let active = sync::Arc::new(atomic::AtomicUsize::new(0));
             let max_active = sync::Arc::new(atomic::AtomicUsize::new(0));
-            let manager = UserManager::from_actor(
-                OverlapProbe {
-                    active: active.clone(),
-                    max_active: max_active.clone(),
-                },
-                path::PathBuf::new(),
-            );
+            let manager = UserManager::from_actor(OverlapProbe {
+                active: active.clone(),
+                max_active: max_active.clone(),
+            });
 
             let user = test_user(1, "alice");
             let calls = (0..8).map(|i| {
@@ -457,7 +370,7 @@ mod tests {
                 let user = &user;
                 async move {
                     if i % 2 == 0 {
-                        manager.delete_user(user).await.map(|_| ())
+                        manager.expire_user(user).await
                     } else {
                         manager.sync_supplementary_groups(user, &[]).await
                     }
