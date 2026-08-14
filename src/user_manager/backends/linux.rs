@@ -412,39 +412,24 @@ impl hannibal::Handler<ExpireAccount> for LinuxUserManager {
         // without the expiry the account stays reachable and the rest is cosmetic.
         expire_account(&linux_user.name).await?;
 
-        // The steps below revoke different kinds of access and none of them is a
-        // precondition of another, so a failing one must not skip the others: a
-        // process stuck in uninterruptible I/O may not keep the departed member in
-        // their supplementary groups for the whole retention period. The first error
-        // is returned once all of them ran, so the tombstone-driven retry on the next
-        // sync still converges.
-        let mut error = None;
+        // None of the steps below is a precondition of another, so they are all run
+        // before the first error is returned: a process stuck in uninterruptible I/O
+        // may not keep the departed member in their supplementary groups for the whole
+        // retention period. Returning an error is what makes the next sync retry.
 
         // Before the sweep, so no scheduled job can spawn processes into the teardown
-        keep_first_error(&mut error, remove_scheduled_jobs(&linux_user).await);
+        let scheduled_jobs = remove_scheduled_jobs(&linux_user).await;
 
         // logind first, then the sweep as the catch-all for processes outside logind's
         // session scopes and as the sole mechanism on systems without logind
         end_logind_sessions(&linux_user).await;
-        keep_first_error(&mut error, kill_processes_for_user(&linux_user).await);
+        let sweep = kill_processes_for_user(&linux_user).await;
 
         // octosync owns the supplementary groups of synced users, and a departed
         // member keeps no access granted through them
-        keep_first_error(&mut error, strip_supplementary_groups(&linux_user).await);
+        let groups = strip_supplementary_groups(&linux_user).await;
 
-        error.map_or(Ok(()), Err)
-    }
-}
-
-/// Keep the first error of the independent teardown steps, so one failing step does
-/// not skip the following ones. Only the first is returned, so a later one is logged
-/// here instead of being lost.
-fn keep_first_error(first: &mut Option<anyhow::Error>, result: anyhow::Result<()>) {
-    if let Err(e) = result {
-        match first {
-            None => *first = Some(e),
-            Some(_) => tracing::error!("Another teardown step of the account failed: {e:#}"),
-        }
+        scheduled_jobs.and(sweep).and(groups)
     }
 }
 
@@ -467,51 +452,38 @@ async fn end_logind_sessions(user: &nix::unistd::User) {
             return;
         }
         Err(_) => {
-            tracing::error!(
-                "Connecting to the system bus timed out, ending sessions with the process \
-                 sweep alone"
-            );
+            tracing::error!("System bus did not answer in time, leaving the sessions to the sweep");
             return;
         }
     };
-    if let Err(e) = terminate_logind_user(&connection, user.uid.as_raw()).await {
-        tracing::error!("logind is available but did not end the user's sessions: {e:#}");
+
+    // zbus applies no reply timeout of its own and the bus does not enforce one on the
+    // method calls it forwards, so a wedged logind never answers. The teardown runs
+    // inside the actor, where waiting for it would stall every following platform
+    // operation, so the conversation gets one deadline and the sweep takes over.
+    let uid = user.uid.as_raw();
+    match tokio::time::timeout(LOGIND_TIMEOUT, terminate_logind_user(&connection, uid)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::error!("logind is available but did not end the sessions: {e:#}"),
+        Err(_) => {
+            tracing::error!("logind did not answer in time, leaving the sessions to the sweep")
+        }
     }
 }
 
-/// Deadline for a single logind D-Bus operation.
-///
-/// zbus applies no reply timeout of its own, and the bus does not enforce one on the
-/// method calls it forwards, so a wedged logind would never answer. The teardown runs
-/// inside the actor, which would leave every following platform operation waiting
-/// behind it for as long as logind stays wedged.
+/// Deadline for the logind conversation, see [`end_logind_sessions`]
 const LOGIND_TIMEOUT: time::Duration = time::Duration::from_secs(5);
-
-/// Await a logind D-Bus operation, failing after [`LOGIND_TIMEOUT`] instead of waiting
-/// for a reply that may never come.
-async fn with_logind_timeout<T>(
-    operation: &str,
-    call: impl Future<Output = zbus::Result<T>>,
-) -> anyhow::Result<T> {
-    tokio::time::timeout(LOGIND_TIMEOUT, call)
-        .await
-        .with_context(|| format!("logind did not answer '{operation}' in time"))?
-        .with_context(|| format!("logind call '{operation}' failed"))
-}
 
 /// Disable linger for the user and terminate their sessions over logind's D-Bus API.
 ///
 /// `TerminateUser` returns once the stop jobs are queued rather than once the
 /// processes are gone, so the caller's sweep is what establishes that they exited.
 async fn terminate_logind_user(connection: &zbus::Connection, uid: u32) -> anyhow::Result<()> {
-    let manager = with_logind_timeout(
-        "Manager proxy",
-        zbus::Proxy::new(
-            connection,
-            "org.freedesktop.login1",
-            "/org/freedesktop/login1",
-            "org.freedesktop.login1.Manager",
-        ),
+    let manager = zbus::Proxy::new(
+        connection,
+        "org.freedesktop.login1",
+        "/org/freedesktop/login1",
+        "org.freedesktop.login1.Manager",
     )
     .await
     .context("Failed to create the logind manager proxy")?;
@@ -519,36 +491,27 @@ async fn terminate_logind_user(connection: &zbus::Connection, uid: u32) -> anyho
     // Disabling linger keeps a `user@.service` from restarting user services after the
     // termination, but it is the lesser half: a surviving login session matters more,
     // so a failure here must not skip the termination below
-    if let Err(e) = with_logind_timeout(
-        "SetUserLinger",
-        manager.call::<_, _, ()>("SetUserLinger", &(uid, false, false)),
-    )
-    .await
+    if let Err(e) = manager
+        .call::<_, _, ()>("SetUserLinger", &(uid, false, false))
+        .await
     {
-        tracing::warn!("Failed to disable linger, terminating the sessions anyway: {e:#}");
+        tracing::warn!("Failed to disable linger, terminating the sessions anyway: {e}");
     }
 
     // GetUser errors when the user neither has a session nor lingers, the usual state
     // of a departed account whose teardown is retried by a later sync: nothing to
-    // terminate.
-    // A timed-out GetUser lands here too, which is the right move: a logind that is
-    // not answering will not terminate anything either, so the sweep takes over
-    // instead of the teardown waiting out a second deadline.
-    if let Err(e) = with_logind_timeout(
-        "GetUser",
-        manager.call::<_, _, zbus::zvariant::OwnedObjectPath>("GetUser", &uid),
-    )
-    .await
+    // terminate
+    if manager
+        .call::<_, _, zbus::zvariant::OwnedObjectPath>("GetUser", &uid)
+        .await
+        .is_err()
     {
-        tracing::debug!("logind reports no user to terminate: {e:#}");
         return Ok(());
     }
-    with_logind_timeout(
-        "TerminateUser",
-        manager.call::<_, _, ()>("TerminateUser", &uid),
-    )
-    .await
-    .context("Failed to terminate the user's sessions")
+    manager
+        .call::<_, _, ()>("TerminateUser", &uid)
+        .await
+        .context("Failed to terminate the user's sessions")
 }
 
 /// Remove the departed user's scheduled work, which outlives their sessions: cron and
