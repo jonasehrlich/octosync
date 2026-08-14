@@ -133,6 +133,26 @@ impl Octosync {
         gh_user: &octocrab::models::Author,
         store: &store::UserStore,
     ) -> anyhow::Result<store::User> {
+        // With expiry, departed accounts stay on the machine as adoptable-by-name. A
+        // leaver's GitHub login can be released and claimed by a different person;
+        // adopting the expired account would hand that person the previous owner's
+        // home directory and UID, so the collision is refused and left to an operator.
+        if let Some(tombstone) = store
+            .departed()
+            .values()
+            .find(|tombstone| tombstone.name() == gh_user.login)
+            && tombstone.id() != gh_user.id
+        {
+            anyhow::bail!(
+                "Login '{}' belonged to the departed member with GitHub ID {}, but the joining \
+                 member has GitHub ID {}: the login was recycled by a different person, refusing \
+                 to create the user",
+                gh_user.login,
+                tombstone.id(),
+                gh_user.id
+            );
+        }
+
         // A departed member rejoins into their expired account; a purged one gets a
         // fresh account and home directory under their old IDs
         let stored_ids = store
@@ -738,6 +758,23 @@ mod tests {
                     reserved_gids: [nix::unistd::Gid::from_raw(2001)].into(),
                 }]
             );
+        }
+
+        /// A departed member's login claimed by a different person must not adopt the
+        /// expired account: no user manager response is scripted, so the test also
+        /// proves the guard refuses before any platform operation runs.
+        #[tokio::test]
+        async fn recycled_login_of_a_departed_member_is_refused() {
+            let (octosync, _data_dir) = octosync_with(TestingUserManager::default());
+            let mut old_store = store::UserStore::new(_data_dir.path()).await.unwrap();
+            old_store.depart_user(user(1, "alice"), chrono::Utc::now());
+
+            let err = octosync
+                .create_user(&author(2, "alice"), &old_store)
+                .await
+                .unwrap_err();
+
+            assert!(err.to_string().contains("recycled"));
         }
 
         /// Tombstones survive member processing structurally: a failed re-creation
