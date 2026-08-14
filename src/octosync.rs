@@ -1,9 +1,5 @@
 use crate::{
-    GlobalArgs, InstallationClientArgs, SyncArgs, groups, public_keys, store,
-    user_manager::{
-        self, CreateUser as _, DeleteUser as _, ManageAuthorizedKeys as _,
-        ManageSupplementaryGroups as _, UpdateUser as _,
-    },
+    GlobalArgs, InstallationClientArgs, SyncArgs, groups, public_keys, store, user_manager,
 };
 use anyhow::Context as _;
 use futures::{StreamExt as _, stream};
@@ -11,11 +7,13 @@ use std::{collections, path, sync, time};
 use tokio::fs;
 
 /// Maximum number of user deletions that run concurrently. Each deletion archives the
-/// user's home directory, which is disk- and CPU-heavy, so it is not unbounded.
+/// user's home directory outside the user manager actor, which is disk- and CPU-heavy,
+/// so it is not unbounded. Account mutations serialize on the actor.
 const MAX_CONCURRENT_DELETES: usize = 4;
 
-/// Maximum number of users processed concurrently during a sync. Bounds the number of
-/// GitHub requests and user management commands in flight at the same time.
+/// Maximum number of users processed concurrently during a sync. Bounds the GitHub
+/// requests in flight at the same time. The platform operations of each user are
+/// serialized by the user manager actor.
 const MAX_CONCURRENT_USER_SYNCS: usize = 8;
 
 /// Maximum number of items per page supported by the GitHub API
@@ -66,7 +64,7 @@ async fn org_client(args: &InstallationClientArgs) -> anyhow::Result<octocrab::O
 
 pub struct Octosync {
     data_dir: path::PathBuf,
-    user_manager: user_manager::PlatformUserManager,
+    user_manager: user_manager::UserManager,
 }
 
 impl Octosync {
@@ -74,7 +72,7 @@ impl Octosync {
         global_config: sync::Arc<GlobalArgs>,
         data_dir: &path::Path,
     ) -> anyhow::Result<Self> {
-        let user_manager = user_manager::PlatformUserManager::builder()
+        let user_manager = user_manager::UserManager::builder()
             .dry_run(global_config.dry_run)
             .home_archive_dir(data_dir.join("home-archive"))
             .build();
@@ -175,7 +173,7 @@ impl Octosync {
         // Create the resolved groups before the users are processed, so the per-user
         // group sync can rely on every managed group existing
         self.user_manager
-            .ensure_groups_exists(&assignments.all_groups())
+            .ensure_groups_exist(&assignments.all_groups())
             .await?;
 
         let mut new_store = self
