@@ -16,7 +16,7 @@ Synchronize GitHub organization members to local user accounts on a Linux system
 - Create a cron job to run the application at your desired interval, e.g., every hour:
 
 ```sh
-0 * * * * /path/to/octosync sync --org \<org-name\> --app-id \<app-id\> --private-key /path/to/private-key.pem
+0 * * * * /path/to/octosync sync --org <org-name> --app-id <app-id> --private-key /path/to/private-key.pem
 ```
 
 ## Installation
@@ -28,8 +28,26 @@ the instructions below.
 ## Run
 
 ```sh
-octosync sync --org \<org-name\> --app-id \<app-id\> --private-key \<private-key.pem\>
+octosync sync --org <org-name> --app-id <app-id> --private-key <private-key.pem>
 ```
+
+### Group management
+
+Add every synced user to a Linux group with `--group <linux-group>`, or map a GitHub team to a Linux
+group with `--group <gh-team-slug>:<linux-group>`. Both forms can be passed multiple times.
+
+```sh
+octosync sync --org <org-name> --app-id <app-id> --private-key <private-key.pem> \
+  --group developers --group backend-team:backend
+```
+
+Linux user groups are created if they are missing. Mapped GitHub teams are checked against the org's
+team list. A mapped team that does not exist in the org is skipped with a warning: the Linux group
+is not created and no longer assigned to any synced user.
+
+octosync fully manages the supplementary groups of synced users. On every sync they are replaced
+with the groups derived from the `--group` arguments, so memberships added through other channels
+are removed.
 
 ### Home directory archives
 
@@ -58,11 +76,17 @@ cargo install cargo-zigbuild
 Build for the target platform using
 
 ```sh
-cargo zigbuild --target \<target-triple\>
+cargo zigbuild --target <target-triple>
 ```
 
-e.g:
+List all target triples using
 
 ```sh
-cargo zigbuild --target aarch64-unknown-linux-gnu
+rustup target list
+```
+
+or
+
+```sh
+rustc --print target-list
 ```

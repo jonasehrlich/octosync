@@ -3,25 +3,22 @@
 ## Unreleased
 
 - Archive home directories of deleted users in the data directory
-  [#9](https://github.com/jonasehrlich/octosync/pull/9)
+  ([#9](https://github.com/jonasehrlich/octosync/pull/9))
 - Only delete users whose GitHub ID is missing from the fetched org member list. Users whose
-  processing failed stay in the store unchanged and are retried on the next sync.
-  [#15](https://github.com/jonasehrlich/octosync/pull/15)
-- A failed authorized keys fetch no longer fails user processing; the existing `authorized_keys`
-  file is kept and the fetch is retried on the next sync.
-  [#15](https://github.com/jonasehrlich/octosync/pull/15)
+  processing failed stay in the store unchanged.
+  ([#15](https://github.com/jonasehrlich/octosync/pull/15))
+- A failed authorized keys fetch no longer fails user processing which could lead to the deletion of
+  users whose keys could not be fetched. ([#15](https://github.com/jonasehrlich/octosync/pull/15))
 - Fetch public keys through the authenticated GitHub client instead of the anonymous, rate-limited
-  `https://github.com/<login>.keys` endpoint [#15](https://github.com/jonasehrlich/octosync/pull/15)
-- Validate fetched public keys, skipping malformed entries
-  [#15](https://github.com/jonasehrlich/octosync/pull/15)
-- Manage fetched keys in a marked, octosync-managed block inside `authorized_keys`
-  [#15](https://github.com/jonasehrlich/octosync/pull/15)
+  endpoint ([#15](https://github.com/jonasehrlich/octosync/pull/15))
+- Manage SSH fetched keys in a marked, octosync-managed block inside `authorized_keys`
+  ([#15](https://github.com/jonasehrlich/octosync/pull/15))
 - Write `authorized_keys` atomically, never follow symlinks and enforce exact permissions on `.ssh`
-  and `authorized_keys` [#15](https://github.com/jonasehrlich/octosync/pull/15)
-- Add request timeouts to the GitHub client and bound the sync concurrency
-  [#15](https://github.com/jonasehrlich/octosync/pull/15)
+  and `authorized_keys` ([#15](https://github.com/jonasehrlich/octosync/pull/15))
 - Refuse a sync that would delete every stored user
-  [#17](https://github.com/jonasehrlich/octosync/pull/17)
+  ([#17](https://github.com/jonasehrlich/octosync/pull/17))
+- Implement mapping GitHub teams to Linux groups with `--group <gh-team-slug>:<linux-group>`
+  ([#20](https://github.com/jonasehrlich/octosync/pull/20))
 
 ## v0.3.0
 

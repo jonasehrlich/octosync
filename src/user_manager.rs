@@ -1,5 +1,5 @@
 use crate::{public_keys, store};
-use std::path;
+use std::{collections, path};
 
 pub trait CreateUser {
     /// Creates a platform user for the given GitHub user.
@@ -24,6 +24,10 @@ pub trait ManageAuthorizedKeys {
 
 pub trait ManageSupplementaryGroups {
     /// Synchronizes supplementary groups for the given user.
+    ///
+    /// octosync owns the supplementary groups of synced users: the user's memberships
+    /// are replaced with `groups`, keeping only the primary group. Groups assigned
+    /// through other channels are removed.
     async fn sync_supplementary_groups(
         &self,
         user: &store::User,
@@ -146,11 +150,33 @@ impl UpdateUser for PlatformUserManager {
     }
 }
 
+/// Compute the supplementary groups to set for a user, or `None` when the current
+/// memberships already match and no update is needed.
+///
+/// octosync owns the supplementary groups of synced users: the result is exactly
+/// `groups` minus the user's primary group, regardless of the current memberships.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn supplementary_groups_update(
+    groups: &[String],
+    primary_group: &str,
+    current: &collections::BTreeSet<String>,
+) -> Option<Vec<String>> {
+    let desired: collections::BTreeSet<String> = groups
+        .iter()
+        .filter(|group| group.as_str() != primary_group)
+        .cloned()
+        .collect();
+    if desired == *current {
+        return None;
+    }
+    Some(desired.into_iter().collect())
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
     use anyhow::Context as _;
-    use std::path;
+    use std::{collections, path};
     use tokio::process;
 
     #[derive(Clone, Debug)]
@@ -366,7 +392,7 @@ mod linux {
     }
 
     impl ManageSupplementaryGroups for LinuxUserManager {
-        #[tracing::instrument(name = "UserManager::sync_supplementary_groups", skip(self, user, groups), fields(user = %user.name()))]
+        #[tracing::instrument(name = "UserManager::sync_supplementary_groups", skip_all, fields(user = %user.name()))]
         async fn sync_supplementary_groups(
             &self,
             user: &store::User,
@@ -391,12 +417,15 @@ mod linux {
                 })?
                 .name;
 
-            let supplementary_groups: Vec<String> = groups
-                .iter()
-                .filter(|group| group.as_str() != primary_group_name)
-                .cloned()
-                .collect();
+            let current_groups = current_supplementary_groups(&linux_user)
+                .with_context(|| format!("Failed to read current groups of '{}'", user.name()))?;
 
+            let Some(supplementary_groups) =
+                super::supplementary_groups_update(groups, &primary_group_name, &current_groups)
+            else {
+                tracing::debug!("Supplementary groups are already up to date");
+                return Ok(());
+            };
             sync_user_supplementary_groups_by_name(&linux_user.name, &supplementary_groups).await
         }
 
@@ -416,7 +445,7 @@ mod linux {
                     .with_context(|| format!("Failed to execute groupadd for '{}'", group))?;
 
                 if output.status.success() {
-                    tracing::info!("Created missing group '{}'", group);
+                    tracing::info!(group, "Created missing group");
                 } else {
                     return Err(anyhow::anyhow!(
                         "Failed to create missing group '{}': {}",
@@ -430,10 +459,42 @@ mod linux {
         }
     }
 
+    /// The names of the supplementary groups the user is currently a member of,
+    /// excluding the primary group
+    fn current_supplementary_groups(
+        user: &nix::unistd::User,
+    ) -> anyhow::Result<collections::BTreeSet<String>> {
+        let user_name = std::ffi::CString::new(user.name.as_str())
+            .context("User name contains an interior NUL byte")?;
+        let gids = nix::unistd::getgrouplist(&user_name, user.gid)
+            .context("Failed to list the user's groups")?;
+
+        let mut names = collections::BTreeSet::new();
+        for gid in gids {
+            if gid == user.gid {
+                continue;
+            }
+            // A group deleted since getgrouplist has no name to compare or pass to
+            // usermod, skip it
+            if let Some(group) = nix::unistd::Group::from_gid(gid)
+                .with_context(|| format!("Failed to resolve group with GID {gid}"))?
+            {
+                names.insert(group.name);
+            }
+        }
+        Ok(names)
+    }
+
+    /// Serializes group-modifying `usermod` invocations. `usermod` fails instead of
+    /// waiting when another process holds the lock on /etc/group, so the concurrent
+    /// per-user syncs must not run it in parallel.
+    static USERMOD_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     async fn sync_user_supplementary_groups_by_name(
         user_name: &str,
         supplementary_groups: &[String],
     ) -> anyhow::Result<()> {
+        let _guard = USERMOD_LOCK.lock().await;
         let output = process::Command::new("/usr/sbin/usermod")
             .arg("--groups")
             .arg(supplementary_groups.join(","))
@@ -444,9 +505,9 @@ mod linux {
 
         if output.status.success() {
             tracing::info!(
-                "Synchronized supplementary groups for '{}' to {:?}",
-                user_name,
-                supplementary_groups
+                user = user_name,
+                groups = ?supplementary_groups,
+                "Synchronized supplementary groups"
             );
             Ok(())
         } else {
@@ -581,9 +642,9 @@ mod mock {
             groups: &[String],
         ) -> anyhow::Result<()> {
             tracing::info!(
-                "Mock syncing supplementary groups {:?} for user '{}' (not actually managing groups on non-Linux OS)",
-                groups,
-                user.name()
+                user = %user.name(),
+                ?groups,
+                "Mock syncing supplementary groups (not actually managing groups on non-Linux OS)"
             );
             Ok(())
         }
@@ -615,6 +676,63 @@ mod mock {
             // fetch_add increments the value and returns the PREVIOUS value.
             // We add 1 to the result to return the "new" incremented number.
             self.inner.fetch_add(1, sync::atomic::Ordering::SeqCst) + 1
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod supplementary_groups_update {
+        use super::*;
+
+        fn set(groups: &[&str]) -> collections::BTreeSet<String> {
+            groups.iter().map(|group| group.to_string()).collect()
+        }
+
+        fn groups(groups: &[&str]) -> Vec<String> {
+            groups.iter().map(|group| group.to_string()).collect()
+        }
+
+        #[test]
+        fn replaces_out_of_band_memberships() {
+            let update =
+                supplementary_groups_update(&groups(&["developers"]), "alice", &set(&["docker"]));
+            assert_eq!(update, Some(groups(&["developers"])));
+        }
+
+        #[test]
+        fn primary_group_is_excluded() {
+            let update =
+                supplementary_groups_update(&groups(&["alice", "developers"]), "alice", &set(&[]));
+            assert_eq!(update, Some(groups(&["developers"])));
+        }
+
+        #[test]
+        fn no_update_when_groups_match() {
+            let update = supplementary_groups_update(
+                &groups(&["developers", "ops"]),
+                "alice",
+                &set(&["developers", "ops"]),
+            );
+            assert_eq!(update, None);
+        }
+
+        #[test]
+        fn empty_desired_set_clears_groups() {
+            let update = supplementary_groups_update(&groups(&[]), "alice", &set(&["docker"]));
+            assert_eq!(update, Some(groups(&[])));
+        }
+
+        #[test]
+        fn duplicate_groups_are_deduplicated_and_sorted() {
+            let update = supplementary_groups_update(
+                &groups(&["ops", "developers", "ops"]),
+                "alice",
+                &set(&[]),
+            );
+            assert_eq!(update, Some(groups(&["developers", "ops"])));
         }
     }
 }
