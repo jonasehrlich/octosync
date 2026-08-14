@@ -60,6 +60,9 @@ async fn org_client(args: &InstallationClientArgs) -> anyhow::Result<octocrab::O
 
 pub struct Octosync {
     data_dir: path::PathBuf,
+    /// Preview mode: platform operations go to the mock backend and every store is
+    /// created with saving disabled
+    dry_run: bool,
     user_manager: user_manager::UserManager,
 }
 
@@ -73,6 +76,7 @@ impl Octosync {
             .build();
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
+            dry_run: global_config.dry_run,
             user_manager,
         })
     }
@@ -209,7 +213,7 @@ impl Octosync {
         let octocrab = org_client(&args.octocrab).await?;
         let (org_members, old_store, assignments) = tokio::try_join!(
             get_all_org_members(&octocrab, &args.octocrab.org),
-            store::UserStore::from_dir(&self.data_dir),
+            store::UserStore::from_dir(&self.data_dir, self.dry_run),
             groups::GroupAssignments::resolve(&octocrab, &args.octocrab.org, &args.group)
         )?;
         tracing::info!("Successfully retrieved {} members", org_members.len());
@@ -383,7 +387,7 @@ impl Octosync {
         store: &store::UserStore,
         assignments: &groups::GroupAssignments,
     ) -> anyhow::Result<store::UserStore> {
-        let mut new_store = store::UserStore::new(&self.data_dir).await?;
+        let mut new_store = store::UserStore::new(&self.data_dir, self.dry_run).await?;
         // Tombstones are carried over wholesale before any member is processed, so
         // their survival never depends on per-user processing succeeding
         *new_store.departed_mut() = store.departed().clone();
@@ -413,7 +417,7 @@ impl Octosync {
 
     #[tracing::instrument(name = "Octosync::delete", skip(self))]
     pub async fn delete(&self) -> anyhow::Result<()> {
-        let mut store = store::UserStore::from_dir(&self.data_dir).await?;
+        let mut store = store::UserStore::from_dir(&self.data_dir, self.dry_run).await?;
         let users: Vec<store::User> = store.data().values().cloned().collect();
         let count = users.len();
         // The store file is kept: the tombstones preserve every UID so members
@@ -438,7 +442,7 @@ impl Octosync {
         let octocrab = org_client(&args.octocrab).await?;
         let (org_members, mut store) = tokio::try_join!(
             get_all_org_members(&octocrab, &args.octocrab.org),
-            store::UserStore::from_dir(&self.data_dir),
+            store::UserStore::from_dir(&self.data_dir, self.dry_run),
         )?;
         let org_member_map: collections::HashMap<octocrab::models::UserId, String> =
             collections::HashMap::from_iter(
@@ -574,9 +578,38 @@ mod tests {
             let data_dir = tempfile::tempdir().unwrap();
             let octosync = Octosync {
                 data_dir: data_dir.path().to_path_buf(),
+                dry_run: false,
                 user_manager: UserManager::testing(actor),
             };
             (octosync, data_dir)
+        }
+
+        /// A dry run must not write the users database: new members would be
+        /// persisted with invented mock IDs and tombstone changes would be acted on
+        /// by a later real run.
+        #[tokio::test]
+        async fn dry_run_does_not_write_the_store() {
+            let mut actor = TestingUserManager::default();
+            actor.expire_account.push_back(Ok(()));
+            let data_dir = tempfile::tempdir().unwrap();
+            let octosync = Octosync {
+                data_dir: data_dir.path().to_path_buf(),
+                dry_run: true,
+                user_manager: UserManager::testing(actor),
+            };
+            let mut store = store::UserStore::new(data_dir.path(), true).await.unwrap();
+
+            octosync
+                .depart_and_expire(&mut store, vec![user(1, "alice")])
+                .await
+                .unwrap();
+
+            // The departure exists in memory but nothing was persisted
+            assert!(store.departed().contains_key(&octocrab::models::UserId(1)));
+            let on_disk = store::UserStore::from_dir(data_dir.path(), false)
+                .await
+                .unwrap();
+            assert!(on_disk.departed().is_empty());
         }
 
         #[tokio::test]
@@ -587,7 +620,9 @@ mod tests {
             // No UpdateAuthorizedKeys response is scripted: the key fetch against the
             // unreachable client fails, so the keys must be skipped, not synced
             let (octosync, _data_dir) = octosync_with(actor);
-            let empty_store = store::UserStore::new(_data_dir.path()).await.unwrap();
+            let empty_store = store::UserStore::new(_data_dir.path(), false)
+                .await
+                .unwrap();
 
             let processed = octosync
                 .process_user(
@@ -608,7 +643,9 @@ mod tests {
             actor.update_user.push_back(Ok(user(1, "alice-renamed")));
             actor.sync_supplementary_groups.push_back(Ok(()));
             let (octosync, _data_dir) = octosync_with(actor);
-            let mut old_store = store::UserStore::new(_data_dir.path()).await.unwrap();
+            let mut old_store = store::UserStore::new(_data_dir.path(), false)
+                .await
+                .unwrap();
             old_store
                 .data_mut()
                 .insert(octocrab::models::UserId(1), user(1, "alice"));
@@ -634,7 +671,9 @@ mod tests {
                 .sync_supplementary_groups
                 .push_back(Err(anyhow::anyhow!("boom")));
             let (octosync, _data_dir) = octosync_with(actor);
-            let empty_store = store::UserStore::new(_data_dir.path()).await.unwrap();
+            let empty_store = store::UserStore::new(_data_dir.path(), false)
+                .await
+                .unwrap();
 
             let err = octosync
                 .process_user(
@@ -659,7 +698,9 @@ mod tests {
             let mut actor = TestingUserManager::default();
             actor.create_user.push_back(Err(anyhow::anyhow!("boom")));
             let (octosync, _data_dir) = octosync_with(actor);
-            let empty_store = store::UserStore::new(_data_dir.path()).await.unwrap();
+            let empty_store = store::UserStore::new(_data_dir.path(), false)
+                .await
+                .unwrap();
 
             let new_store = octosync
                 .process_members(
@@ -680,7 +721,9 @@ mod tests {
             actor.create_user.push_back(Ok(user(1, "alice")));
             actor.sync_supplementary_groups.push_back(Ok(()));
             let (octosync, _data_dir) = octosync_with(actor);
-            let empty_store = store::UserStore::new(_data_dir.path()).await.unwrap();
+            let empty_store = store::UserStore::new(_data_dir.path(), false)
+                .await
+                .unwrap();
 
             let new_store = octosync
                 .process_members(
@@ -705,7 +748,9 @@ mod tests {
             actor.sync_supplementary_groups.push_back(Ok(()));
             let received_ids = actor.create_user_ids.clone();
             let (octosync, _data_dir) = octosync_with(actor);
-            let mut old_store = store::UserStore::new(_data_dir.path()).await.unwrap();
+            let mut old_store = store::UserStore::new(_data_dir.path(), false)
+                .await
+                .unwrap();
             old_store.depart_user(user(1, "alice"), chrono::Utc::now());
 
             let new_store = octosync
@@ -738,7 +783,9 @@ mod tests {
             actor.sync_supplementary_groups.push_back(Ok(()));
             let received_ids = actor.create_user_ids.clone();
             let (octosync, _data_dir) = octosync_with(actor);
-            let mut old_store = store::UserStore::new(_data_dir.path()).await.unwrap();
+            let mut old_store = store::UserStore::new(_data_dir.path(), false)
+                .await
+                .unwrap();
             old_store.depart_user(user(1, "alice"), chrono::Utc::now());
 
             octosync
@@ -766,7 +813,9 @@ mod tests {
         #[tokio::test]
         async fn recycled_login_of_a_departed_member_is_refused() {
             let (octosync, _data_dir) = octosync_with(TestingUserManager::default());
-            let mut old_store = store::UserStore::new(_data_dir.path()).await.unwrap();
+            let mut old_store = store::UserStore::new(_data_dir.path(), false)
+                .await
+                .unwrap();
             old_store.depart_user(user(1, "alice"), chrono::Utc::now());
 
             let err = octosync
@@ -786,7 +835,9 @@ mod tests {
                 .create_user
                 .push_back(Err(anyhow::anyhow!("UID is taken")));
             let (octosync, _data_dir) = octosync_with(actor);
-            let mut old_store = store::UserStore::new(_data_dir.path()).await.unwrap();
+            let mut old_store = store::UserStore::new(_data_dir.path(), false)
+                .await
+                .unwrap();
             old_store.depart_user(user(1, "alice"), chrono::Utc::now());
 
             let new_store = octosync
@@ -815,14 +866,16 @@ mod tests {
             let mut actor = TestingUserManager::default();
             actor.expire_account.push_back(Err(anyhow::anyhow!("boom")));
             let (octosync, data_dir) = octosync_with(actor);
-            let mut store = store::UserStore::new(data_dir.path()).await.unwrap();
+            let mut store = store::UserStore::new(data_dir.path(), false).await.unwrap();
 
             octosync
                 .depart_and_expire(&mut store, vec![user(1, "alice")])
                 .await
                 .unwrap();
 
-            let saved = store::UserStore::from_dir(data_dir.path()).await.unwrap();
+            let saved = store::UserStore::from_dir(data_dir.path(), false)
+                .await
+                .unwrap();
             let tombstone = &saved.departed()[&octocrab::models::UserId(1)];
             assert_eq!(tombstone.name(), "alice");
             assert!(saved.data().is_empty());
@@ -836,7 +889,7 @@ mod tests {
             actor.expire_account.push_back(Ok(()));
             let expired_users = actor.expired_users.clone();
             let (octosync, data_dir) = octosync_with(actor);
-            let mut store = store::UserStore::new(data_dir.path()).await.unwrap();
+            let mut store = store::UserStore::new(data_dir.path(), false).await.unwrap();
             store.depart_user(user(1, "alice"), chrono::Utc::now());
 
             // No leavers this sync, the existing tombstone alone drives the expiry
@@ -855,7 +908,7 @@ mod tests {
             let mut actor = TestingUserManager::default();
             actor.expire_account.push_back(Ok(()));
             let (octosync, data_dir) = octosync_with(actor);
-            let mut store = store::UserStore::new(data_dir.path()).await.unwrap();
+            let mut store = store::UserStore::new(data_dir.path(), false).await.unwrap();
             store
                 .data_mut()
                 .insert(octocrab::models::UserId(1), user(1, "alice"));
@@ -863,7 +916,9 @@ mod tests {
 
             octosync.delete().await.unwrap();
 
-            let saved = store::UserStore::from_dir(data_dir.path()).await.unwrap();
+            let saved = store::UserStore::from_dir(data_dir.path(), false)
+                .await
+                .unwrap();
             assert!(saved.data().is_empty());
             assert_eq!(
                 saved.departed()[&octocrab::models::UserId(1)].name(),
@@ -889,7 +944,7 @@ mod tests {
             let mut actor = TestingUserManager::default();
             actor.purge_account.push_back(Ok(PurgeOutcome::Purged));
             let (octosync, data_dir) = octosync_with(actor);
-            let mut store = store::UserStore::new(data_dir.path()).await.unwrap();
+            let mut store = store::UserStore::new(data_dir.path(), false).await.unwrap();
             store.depart_user(user(1, "alice"), old_departure());
 
             octosync
@@ -900,7 +955,9 @@ mod tests {
             assert!(store.departed().is_empty());
             // The tombstone survives the purge and is saved, so the UID stays
             // reserved for a rejoin even after the purge
-            let saved = store::UserStore::from_dir(data_dir.path()).await.unwrap();
+            let saved = store::UserStore::from_dir(data_dir.path(), false)
+                .await
+                .unwrap();
             let purged = &saved.purged()[&octocrab::models::UserId(1)];
             assert_eq!(purged.name(), "alice");
         }
@@ -912,7 +969,7 @@ mod tests {
             let mut actor = TestingUserManager::default();
             actor.purge_account.push_back(Ok(PurgeOutcome::Purged));
             let (octosync, data_dir) = octosync_with(actor);
-            let mut store = store::UserStore::new(data_dir.path()).await.unwrap();
+            let mut store = store::UserStore::new(data_dir.path(), false).await.unwrap();
             store.depart_user(user(1, "alice"), chrono::Utc::now());
 
             octosync
@@ -931,7 +988,7 @@ mod tests {
             let mut actor = TestingUserManager::default();
             actor.purge_account.push_back(Ok(PurgeOutcome::Purged));
             let (octosync, data_dir) = octosync_with(actor);
-            let mut store = store::UserStore::new(data_dir.path()).await.unwrap();
+            let mut store = store::UserStore::new(data_dir.path(), false).await.unwrap();
             let alice = user(1, "alice");
             store.depart_user(alice.clone(), old_departure());
 
@@ -952,7 +1009,7 @@ mod tests {
             actor.purge_account.push_back(Ok(PurgeOutcome::NotExpired));
             actor.purge_account.push_back(Ok(PurgeOutcome::NoAccount));
             let (octosync, data_dir) = octosync_with(actor);
-            let mut store = store::UserStore::new(data_dir.path()).await.unwrap();
+            let mut store = store::UserStore::new(data_dir.path(), false).await.unwrap();
             store.depart_user(user(1, "alice"), old_departure());
             store.depart_user(user(2, "bob"), old_departure());
 
@@ -972,7 +1029,7 @@ mod tests {
             let mut actor = TestingUserManager::default();
             actor.purge_account.push_back(Err(anyhow::anyhow!("boom")));
             let (octosync, data_dir) = octosync_with(actor);
-            let mut store = store::UserStore::new(data_dir.path()).await.unwrap();
+            let mut store = store::UserStore::new(data_dir.path(), false).await.unwrap();
             store.depart_user(user(1, "alice"), old_departure());
 
             octosync
@@ -991,7 +1048,7 @@ mod tests {
             let actor = TestingUserManager::default();
             let expired_users = actor.expired_users.clone();
             let (octosync, data_dir) = octosync_with(actor);
-            let mut store = store::UserStore::new(data_dir.path()).await.unwrap();
+            let mut store = store::UserStore::new(data_dir.path(), false).await.unwrap();
             store.depart_user(user(1, "alice"), old_departure());
             store.mark_purged(&octocrab::models::UserId(1), chrono::Utc::now());
 

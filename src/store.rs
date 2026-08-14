@@ -246,6 +246,9 @@ struct StoreDataRef<'a> {
 #[derive(Debug)]
 pub struct UserStore {
     dir: path::PathBuf,
+    /// Preview mode: [`UserStore::save`] never writes, so a dry run cannot persist
+    /// invented mock IDs or tombstone changes into the real users database
+    dry_run: bool,
     /// In-memory cache of users loaded from the members database, keyed by GitHub user ID
     users: UserMap,
     /// Tombstones of departed members whose account is expired on the machine, keyed by
@@ -259,11 +262,13 @@ pub struct UserStore {
 }
 
 impl UserStore {
-    /// Create a new store instance with the given directory, without loading any data
-    pub async fn new(dir: &path::Path) -> anyhow::Result<Self> {
+    /// Create a new store instance with the given directory, without loading any data.
+    /// A store created with `dry_run` never writes on save.
+    pub async fn new(dir: &path::Path, dry_run: bool) -> anyhow::Result<Self> {
         fs::create_dir_all(&dir).await?;
         Ok(Self {
             dir: dir.to_path_buf(),
+            dry_run,
             users: UserMap::new(),
             departed: DepartedMap::new(),
             purged: PurgedMap::new(),
@@ -272,8 +277,8 @@ impl UserStore {
 
     /// Create a new store loading data from the directory
     #[tracing::instrument(name = "Store::from_dir")]
-    pub async fn from_dir(dir: &path::Path) -> anyhow::Result<Self> {
-        let mut s = Self::new(dir).await?;
+    pub async fn from_dir(dir: &path::Path, dry_run: bool) -> anyhow::Result<Self> {
+        let mut s = Self::new(dir, dry_run).await?;
         s.load().await?;
         Ok(s)
     }
@@ -429,7 +434,14 @@ impl UserStore {
         Ok(())
     }
 
+    /// Write the store to the users database file. A dry run never writes: the
+    /// preview must not persist invented mock IDs or tombstone changes that a later
+    /// real run would act on.
     pub async fn save(&self) -> anyhow::Result<()> {
+        if self.dry_run {
+            tracing::info!("Dry run: not writing the users database");
+            return Ok(());
+        }
         let content = serde_json::to_string_pretty(&StoreDataRef {
             version: STORE_VERSION,
             users: &self.users,
@@ -646,7 +658,7 @@ mod tests {
             let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
             let store_path = temp_dir.path().join("store");
 
-            let store = UserStore::from_dir(&store_path)
+            let store = UserStore::from_dir(&store_path, false)
                 .await
                 .expect("Failed to create store");
 
@@ -660,7 +672,7 @@ mod tests {
         async fn load_nonexistent_file() {
             let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
 
-            let store = UserStore::from_dir(temp_dir.path())
+            let store = UserStore::from_dir(temp_dir.path(), false)
                 .await
                 .expect("Failed to create store");
 
@@ -675,7 +687,7 @@ mod tests {
             let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
             write_users_file(temp_dir.path(), &v1_content()).await;
 
-            let store = UserStore::from_dir(temp_dir.path())
+            let store = UserStore::from_dir(temp_dir.path(), false)
                 .await
                 .expect("Failed to load store");
 
@@ -698,7 +710,7 @@ mod tests {
             let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
             write_users_file(temp_dir.path(), &v1_content()).await;
 
-            let store = UserStore::from_dir(temp_dir.path()).await.unwrap();
+            let store = UserStore::from_dir(temp_dir.path(), false).await.unwrap();
             store.save().await.expect("Failed to save store");
 
             let content = fs::read_to_string(temp_dir.path().join(USERS_FILE_NAME))
@@ -716,7 +728,9 @@ mod tests {
             let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
             write_users_file(temp_dir.path(), r#"{ "version": 3, "users": {} }"#).await;
 
-            let err = UserStore::from_dir(temp_dir.path()).await.unwrap_err();
+            let err = UserStore::from_dir(temp_dir.path(), false)
+                .await
+                .unwrap_err();
             assert!(err.to_string().contains("version 3"));
         }
 
@@ -724,7 +738,7 @@ mod tests {
         async fn round_trip_with_departed_and_purged_users() {
             let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
 
-            let mut store = UserStore::from_dir(temp_dir.path())
+            let mut store = UserStore::from_dir(temp_dir.path(), false)
                 .await
                 .expect("Failed to create store");
             let active = user();
@@ -736,7 +750,7 @@ mod tests {
 
             store.save().await.expect("Failed to save store");
 
-            let loaded = UserStore::from_dir(temp_dir.path())
+            let loaded = UserStore::from_dir(temp_dir.path(), false)
                 .await
                 .expect("Failed to load store");
             assert_eq!(loaded.users[&active.id], active);
@@ -751,7 +765,7 @@ mod tests {
             let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
             write_users_file(temp_dir.path(), r#"{ "version": 2, "users": {} }"#).await;
 
-            let store = UserStore::from_dir(temp_dir.path()).await.unwrap();
+            let store = UserStore::from_dir(temp_dir.path(), false).await.unwrap();
             assert!(store.users.is_empty());
             assert!(store.departed.is_empty());
             assert!(store.purged.is_empty());
@@ -760,7 +774,7 @@ mod tests {
         #[tokio::test]
         async fn depart_user_moves_an_active_user_to_the_tombstones() {
             let temp_dir = tempfile::TempDir::new().unwrap();
-            let mut store = UserStore::new(temp_dir.path()).await.unwrap();
+            let mut store = UserStore::new(temp_dir.path(), false).await.unwrap();
             let user = user();
             store.users.insert(user.id, user.clone());
 
@@ -777,7 +791,7 @@ mod tests {
         #[tokio::test]
         async fn mark_purged_moves_a_departed_tombstone_to_the_purged_map() {
             let temp_dir = tempfile::TempDir::new().unwrap();
-            let mut store = UserStore::new(temp_dir.path()).await.unwrap();
+            let mut store = UserStore::new(temp_dir.path(), false).await.unwrap();
             let departed = departed_user();
             store.departed.insert(departed.id, departed.clone());
             let purged_at = chrono::Utc::now();
@@ -796,7 +810,7 @@ mod tests {
         #[tokio::test]
         async fn prune_rejoined_drops_tombstones_of_active_users() {
             let temp_dir = tempfile::TempDir::new().unwrap();
-            let mut store = UserStore::new(temp_dir.path()).await.unwrap();
+            let mut store = UserStore::new(temp_dir.path(), false).await.unwrap();
             let rejoined = user();
             let departed = departed_user();
             store
@@ -816,7 +830,7 @@ mod tests {
         #[tokio::test]
         async fn prune_rejoined_drops_purged_tombstones_of_active_users() {
             let temp_dir = tempfile::TempDir::new().unwrap();
-            let mut store = UserStore::new(temp_dir.path()).await.unwrap();
+            let mut store = UserStore::new(temp_dir.path(), false).await.unwrap();
             let purged = purged_user();
             let rejoined = User::from_test_purged(&purged);
             store.purged.insert(purged.id, purged.clone());
@@ -827,12 +841,25 @@ mod tests {
             assert!(store.purged.is_empty());
         }
 
+        /// A store in dry-run mode previews everything in memory but never persists
+        #[tokio::test]
+        async fn dry_run_save_writes_nothing() {
+            let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
+            let mut store = UserStore::new(temp_dir.path(), true).await.unwrap();
+            let user = user();
+            store.users.insert(user.id, user);
+
+            store.save().await.expect("Dry-run save must succeed");
+
+            assert!(!temp_dir.path().join(USERS_FILE_NAME).exists());
+        }
+
         #[tokio::test]
         async fn load_invalid_json() {
             let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
             write_users_file(temp_dir.path(), "{ invalid json content").await;
 
-            let result = UserStore::from_dir(temp_dir.path()).await;
+            let result = UserStore::from_dir(temp_dir.path(), false).await;
             assert!(result.is_err());
         }
 
@@ -840,7 +867,7 @@ mod tests {
         async fn user_path() {
             let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
 
-            let store = UserStore::new(temp_dir.path())
+            let store = UserStore::new(temp_dir.path(), false)
                 .await
                 .expect("Failed to create store");
 
@@ -852,7 +879,7 @@ mod tests {
         async fn multiple_users() {
             let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
 
-            let mut store = UserStore::new(temp_dir.path())
+            let mut store = UserStore::new(temp_dir.path(), false)
                 .await
                 .expect("Failed to create store");
 
@@ -868,7 +895,7 @@ mod tests {
 
             store.save().await.expect("Failed to save store");
 
-            let loaded_store = UserStore::from_dir(temp_dir.path())
+            let loaded_store = UserStore::from_dir(temp_dir.path(), false)
                 .await
                 .expect("Failed to load store");
 
