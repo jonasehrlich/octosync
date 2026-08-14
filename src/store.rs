@@ -101,37 +101,34 @@ impl User {
     }
 }
 
-/// Tombstone of a user whose account octosync deleted (or is deleting). It keeps the
-/// UID so a rejoining member gets their old UID back and file ownership outside the
-/// archived home directory survives the delete and re-create cycle.
+/// Tombstone of a member who left the org. Their account stays on the machine expired,
+/// and the tombstone keeps the IDs so a rejoining member gets their old UID and GID
+/// back and file ownership survives the departure.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, bon::Builder)]
-pub struct ArchivedUser {
+pub struct DepartedUser {
     /// GitHub user ID, used as the primary key for identifying users in the store
     id: octocrab::models::UserId,
-    /// GitHub login at the time of deletion
+    /// GitHub login at the time of departure
     name: String,
-    /// Linux user UID the account had, reserved for a rejoin
+    /// Linux user UID the account has, reserved for a rejoin
     #[serde(with = "uid_serde")]
     uid: unistd::Uid,
-    /// GID of the primary group the account had, reserved for a rejoin. `None` when
-    /// the user was archived before their GID was backfilled.
+    /// GID of the primary group the account has, reserved for a rejoin. `None` when
+    /// the user departed before their GID was backfilled.
     #[serde(default, with = "gid_serde", skip_serializing_if = "Option::is_none")]
     gid: Option<unistd::Gid>,
-    /// When the user was archived for deletion
-    deleted_at: chrono::DateTime<chrono::Utc>,
-    /// Path of the archived home directory, so a rejoin can later restore it
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    home_archive: Option<path::PathBuf>,
+    /// When the member departed and their account was expired
+    departed_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[allow(unused)]
-impl ArchivedUser {
+impl DepartedUser {
     /// Get the GitHub user ID
     pub fn id(&self) -> octocrab::models::UserId {
         self.id
     }
 
-    /// Get the login the user had when they were archived
+    /// Get the login the user had when they departed
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -146,31 +143,81 @@ impl ArchivedUser {
         self.gid
     }
 
-    /// Get the time the user was archived for deletion
-    pub fn deleted_at(&self) -> chrono::DateTime<chrono::Utc> {
-        self.deleted_at
-    }
-
-    /// Get the path of the archived home directory, if one was created
-    pub fn home_archive(&self) -> Option<&path::Path> {
-        self.home_archive.as_deref()
+    /// Get the time the member departed
+    pub fn departed_at(&self) -> chrono::DateTime<chrono::Utc> {
+        self.departed_at
     }
 }
 
-impl From<&ArchivedUser> for User {
+impl From<&DepartedUser> for User {
     /// Account identity of the tombstone, used to address platform operations
-    fn from(archived: &ArchivedUser) -> Self {
+    fn from(departed: &DepartedUser) -> Self {
         Self {
-            id: archived.id,
-            name: archived.name.clone(),
-            uid: archived.uid,
-            gid: archived.gid,
+            id: departed.id,
+            name: departed.name.clone(),
+            uid: departed.uid,
+            gid: departed.gid,
         }
     }
 }
 
+/// Tombstone of a departed user whose expired account and home directory were purged
+/// after the retention period. It keeps the IDs so a member rejoining even after the
+/// purge gets their old UID and GID back, with an empty home directory.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, bon::Builder)]
+pub struct PurgedUser {
+    /// GitHub user ID, used as the primary key for identifying users in the store
+    id: octocrab::models::UserId,
+    /// GitHub login at the time of departure
+    name: String,
+    /// Linux user UID the account had, reserved for a rejoin
+    #[serde(with = "uid_serde")]
+    uid: unistd::Uid,
+    /// GID of the primary group the account had, reserved for a rejoin
+    #[serde(default, with = "gid_serde", skip_serializing_if = "Option::is_none")]
+    gid: Option<unistd::Gid>,
+    /// When the member departed and their account was expired
+    departed_at: chrono::DateTime<chrono::Utc>,
+    /// When the expired account and its home directory were purged
+    purged_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[allow(unused)]
+impl PurgedUser {
+    /// Get the GitHub user ID
+    pub fn id(&self) -> octocrab::models::UserId {
+        self.id
+    }
+
+    /// Get the login the user had when they departed
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Get the Linux user UID reserved for a rejoin
+    pub fn uid(&self) -> unistd::Uid {
+        self.uid
+    }
+
+    /// Get the GID of the primary group reserved for a rejoin, if it is tracked
+    pub fn gid(&self) -> Option<unistd::Gid> {
+        self.gid
+    }
+
+    /// Get the time the member departed
+    pub fn departed_at(&self) -> chrono::DateTime<chrono::Utc> {
+        self.departed_at
+    }
+
+    /// Get the time the account was purged
+    pub fn purged_at(&self) -> chrono::DateTime<chrono::Utc> {
+        self.purged_at
+    }
+}
+
 pub type UserMap = collections::HashMap<octocrab::models::UserId, User>;
-pub type ArchivedMap = collections::HashMap<octocrab::models::UserId, ArchivedUser>;
+pub type DepartedMap = collections::HashMap<octocrab::models::UserId, DepartedUser>;
+pub type PurgedMap = collections::HashMap<octocrab::models::UserId, PurgedUser>;
 
 const USERS_FILE_NAME: &str = "users.json";
 const USERS_V1_FILE_NAME: &str = "users-v1.json";
@@ -182,7 +229,9 @@ const STORE_VERSION: u64 = 2;
 struct StoreData {
     users: UserMap,
     #[serde(default)]
-    archived: ArchivedMap,
+    departed: DepartedMap,
+    #[serde(default)]
+    purged: PurgedMap,
 }
 
 /// Borrowing counterpart of [`StoreData`] for serialization
@@ -190,7 +239,8 @@ struct StoreData {
 struct StoreDataRef<'a> {
     version: u64,
     users: &'a UserMap,
-    archived: &'a ArchivedMap,
+    departed: &'a DepartedMap,
+    purged: &'a PurgedMap,
 }
 
 #[derive(Debug)]
@@ -198,9 +248,14 @@ pub struct UserStore {
     dir: path::PathBuf,
     /// In-memory cache of users loaded from the members database, keyed by GitHub user ID
     users: UserMap,
-    /// Tombstones of deleted users, keyed by GitHub user ID. Kept separate from the
-    /// active users so no consumer can process a tombstone as an active user.
-    archived: ArchivedMap,
+    /// Tombstones of departed members whose account is expired on the machine, keyed by
+    /// GitHub user ID. Kept separate from the active users so no consumer can process a
+    /// tombstone as an active user.
+    departed: DepartedMap,
+    /// Tombstones of departed members whose expired account was purged, keyed by GitHub
+    /// user ID. Kept separate from `departed` so the expiry reconciliation and the
+    /// purge can never fight over an entry.
+    purged: PurgedMap,
 }
 
 impl UserStore {
@@ -210,7 +265,8 @@ impl UserStore {
         Ok(Self {
             dir: dir.to_path_buf(),
             users: UserMap::new(),
-            archived: ArchivedMap::new(),
+            departed: DepartedMap::new(),
+            purged: PurgedMap::new(),
         })
     }
 
@@ -230,41 +286,42 @@ impl UserStore {
         &mut self.users
     }
 
-    pub fn archived(&self) -> &ArchivedMap {
-        &self.archived
+    pub fn departed(&self) -> &DepartedMap {
+        &self.departed
     }
 
-    pub fn archived_mut(&mut self) -> &mut ArchivedMap {
-        &mut self.archived
+    pub fn departed_mut(&mut self) -> &mut DepartedMap {
+        &mut self.departed
     }
 
-    /// Turn a user into a tombstone, keeping their UID for a later rejoin
-    pub fn archive_user(&mut self, user: User, deleted_at: chrono::DateTime<chrono::Utc>) {
+    pub fn purged(&self) -> &PurgedMap {
+        &self.purged
+    }
+
+    pub fn purged_mut(&mut self) -> &mut PurgedMap {
+        &mut self.purged
+    }
+
+    /// Turn a user into a departed tombstone, keeping their IDs for a later rejoin
+    pub fn depart_user(&mut self, user: User, departed_at: chrono::DateTime<chrono::Utc>) {
         self.users.remove(&user.id);
-        self.archived.insert(
+        self.departed.insert(
             user.id,
-            ArchivedUser {
+            DepartedUser {
                 id: user.id,
                 name: user.name,
                 uid: user.uid,
                 gid: user.gid,
-                deleted_at,
-                home_archive: None,
+                departed_at,
             },
         );
     }
 
-    /// Record the home directory archive of an archived user
-    pub fn record_home_archive(&mut self, id: &octocrab::models::UserId, archive: path::PathBuf) {
-        if let Some(archived) = self.archived.get_mut(id) {
-            archived.home_archive = Some(archive);
-        }
-    }
-
-    /// Drop the tombstones of users that are active again, keeping every user either
-    /// active or archived but never both
+    /// Drop the tombstones of users that are active again, keeping every user in
+    /// exactly one of the three maps
     pub fn prune_rejoined(&mut self) {
-        self.archived.retain(|id, _| !self.users.contains_key(id));
+        self.departed.retain(|id, _| !self.users.contains_key(id));
+        self.purged.retain(|id, _| !self.users.contains_key(id));
     }
 
     /// Get the file path for the users database file
@@ -312,7 +369,8 @@ impl UserStore {
                 self.backup_v1_file().await?;
                 StoreData {
                     users,
-                    archived: ArchivedMap::new(),
+                    departed: DepartedMap::new(),
+                    purged: PurgedMap::new(),
                 }
             }
             Some(version) if version.as_u64() == Some(STORE_VERSION) => {
@@ -328,7 +386,8 @@ impl UserStore {
         };
 
         self.users = data.users;
-        self.archived = data.archived;
+        self.departed = data.departed;
+        self.purged = data.purged;
         Ok(())
     }
 
@@ -352,7 +411,8 @@ impl UserStore {
         let content = serde_json::to_string_pretty(&StoreDataRef {
             version: STORE_VERSION,
             users: &self.users,
-            archived: &self.archived,
+            departed: &self.departed,
+            purged: &self.purged,
         })?;
         let path = self.path();
         // Stage in a temporary file that atomically replaces the database on commit, so a
@@ -385,22 +445,32 @@ mod tests {
         }
     }
 
-    fn deleted_at() -> chrono::DateTime<chrono::Utc> {
+    fn departed_at() -> chrono::DateTime<chrono::Utc> {
         chrono::DateTime::parse_from_rfc3339("2026-08-14T09:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc)
     }
 
-    fn archived_user() -> ArchivedUser {
-        ArchivedUser {
+    fn departed_user() -> DepartedUser {
+        DepartedUser {
             id: octocrab::models::UserId(456),
             name: "bob".to_string(),
             uid: unistd::Uid::from_raw(1005),
             gid: Some(unistd::Gid::from_raw(1005)),
-            deleted_at: deleted_at(),
-            home_archive: Some(path::PathBuf::from(
-                "/var/lib/octosync/home-archive/bob.tar.gz",
-            )),
+            departed_at: departed_at(),
+        }
+    }
+
+    fn purged_user() -> PurgedUser {
+        PurgedUser {
+            id: octocrab::models::UserId(789),
+            name: "carol".to_string(),
+            uid: unistd::Uid::from_raw(1006),
+            gid: Some(unistd::Gid::from_raw(1006)),
+            departed_at: departed_at(),
+            purged_at: chrono::DateTime::parse_from_rfc3339("2027-02-14T09:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
         }
     }
 
@@ -485,46 +555,49 @@ mod tests {
         }
     }
 
-    mod archived_user {
+    mod departed_user {
         use super::*;
 
         #[test]
         fn round_trip_serialization() {
-            let original = archived_user();
+            let original = departed_user();
 
             let serialized = serde_json::to_string(&original).expect("Failed to serialize");
-            let deserialized: ArchivedUser =
+            let deserialized: DepartedUser =
                 serde_json::from_str(&serialized).expect("Failed to deserialize");
 
             assert_eq!(original, deserialized);
         }
 
         #[test]
-        fn deleted_at_is_serialized_as_rfc3339() {
-            let serialized = serde_json::to_string(&archived_user()).unwrap();
-            assert!(serialized.contains("\"deleted_at\":\"2026-08-14T09:00:00Z\""));
-        }
-
-        #[test]
-        fn missing_home_archive_is_omitted_and_parses_back() {
-            let mut archived = archived_user();
-            archived.home_archive = None;
-
-            let serialized = serde_json::to_string(&archived).unwrap();
-            assert!(!serialized.contains("home_archive"));
-
-            let deserialized: ArchivedUser = serde_json::from_str(&serialized).unwrap();
-            assert_eq!(deserialized.home_archive, None);
+        fn departed_at_is_serialized_as_rfc3339() {
+            let serialized = serde_json::to_string(&departed_user()).unwrap();
+            assert!(serialized.contains("\"departed_at\":\"2026-08-14T09:00:00Z\""));
         }
 
         #[test]
         fn account_identity_conversion() {
-            let archived = archived_user();
-            let user = User::from(&archived);
-            assert_eq!(user.id, archived.id);
-            assert_eq!(user.name, archived.name);
-            assert_eq!(user.uid, archived.uid);
-            assert_eq!(user.gid, archived.gid);
+            let departed = departed_user();
+            let user = User::from(&departed);
+            assert_eq!(user.id, departed.id);
+            assert_eq!(user.name, departed.name);
+            assert_eq!(user.uid, departed.uid);
+            assert_eq!(user.gid, departed.gid);
+        }
+    }
+
+    mod purged_user {
+        use super::*;
+
+        #[test]
+        fn round_trip_serialization() {
+            let original = purged_user();
+
+            let serialized = serde_json::to_string(&original).expect("Failed to serialize");
+            let deserialized: PurgedUser =
+                serde_json::from_str(&serialized).expect("Failed to deserialize");
+
+            assert_eq!(original, deserialized);
         }
     }
 
@@ -557,7 +630,8 @@ mod tests {
 
             assert!(store_path.exists());
             assert!(store.users.is_empty());
-            assert!(store.archived.is_empty());
+            assert!(store.departed.is_empty());
+            assert!(store.purged.is_empty());
         }
 
         #[tokio::test]
@@ -569,7 +643,7 @@ mod tests {
                 .expect("Failed to create store");
 
             assert!(store.users.is_empty());
-            assert!(store.archived.is_empty());
+            assert!(store.departed.is_empty());
             // No file, nothing to back up
             assert!(!temp_dir.path().join(USERS_V1_FILE_NAME).exists());
         }
@@ -588,7 +662,7 @@ mod tests {
                 store.users[&octocrab::models::UserId(12345)].name,
                 "testuser"
             );
-            assert!(store.archived.is_empty());
+            assert!(store.departed.is_empty());
 
             // The backup preserves the v1 file byte for byte
             let backup = fs::read_to_string(temp_dir.path().join(USERS_V1_FILE_NAME))
@@ -611,7 +685,8 @@ mod tests {
             let value: serde_json::Value = serde_json::from_str(&content).unwrap();
             assert_eq!(value["version"], 2);
             assert!(value["users"]["12345"].is_object());
-            assert_eq!(value["archived"], serde_json::json!({}));
+            assert_eq!(value["departed"], serde_json::json!({}));
+            assert_eq!(value["purged"], serde_json::json!({}));
         }
 
         #[tokio::test]
@@ -624,16 +699,18 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn round_trip_with_archived_users() {
+        async fn round_trip_with_departed_and_purged_users() {
             let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
 
             let mut store = UserStore::from_dir(temp_dir.path())
                 .await
                 .expect("Failed to create store");
             let active = user();
-            let archived = archived_user();
+            let departed = departed_user();
+            let purged = purged_user();
             store.users.insert(active.id, active.clone());
-            store.archived.insert(archived.id, archived.clone());
+            store.departed.insert(departed.id, departed.clone());
+            store.purged.insert(purged.id, purged.clone());
 
             store.save().await.expect("Failed to save store");
 
@@ -641,50 +718,38 @@ mod tests {
                 .await
                 .expect("Failed to load store");
             assert_eq!(loaded.users[&active.id], active);
-            assert_eq!(loaded.archived[&archived.id], archived);
+            assert_eq!(loaded.departed[&departed.id], departed);
+            assert_eq!(loaded.purged[&purged.id], purged);
             // The file was already v2, no v1 backup is created
             assert!(!temp_dir.path().join(USERS_V1_FILE_NAME).exists());
         }
 
         #[tokio::test]
-        async fn v2_file_without_archived_key_parses() {
+        async fn v2_file_without_tombstone_keys_parses() {
             let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
             write_users_file(temp_dir.path(), r#"{ "version": 2, "users": {} }"#).await;
 
             let store = UserStore::from_dir(temp_dir.path()).await.unwrap();
             assert!(store.users.is_empty());
-            assert!(store.archived.is_empty());
+            assert!(store.departed.is_empty());
+            assert!(store.purged.is_empty());
         }
 
         #[tokio::test]
-        async fn archive_user_moves_an_active_user_to_the_tombstones() {
+        async fn depart_user_moves_an_active_user_to_the_tombstones() {
             let temp_dir = tempfile::TempDir::new().unwrap();
             let mut store = UserStore::new(temp_dir.path()).await.unwrap();
             let user = user();
             store.users.insert(user.id, user.clone());
 
-            store.archive_user(user.clone(), deleted_at());
+            store.depart_user(user.clone(), departed_at());
 
             assert!(store.users.is_empty());
-            let archived = &store.archived[&user.id];
-            assert_eq!(archived.name, user.name);
-            assert_eq!(archived.uid, user.uid);
-            assert_eq!(archived.gid, user.gid);
-            assert_eq!(archived.deleted_at, deleted_at());
-            assert_eq!(archived.home_archive, None);
-        }
-
-        #[tokio::test]
-        async fn record_home_archive_sets_the_path_on_the_tombstone() {
-            let temp_dir = tempfile::TempDir::new().unwrap();
-            let mut store = UserStore::new(temp_dir.path()).await.unwrap();
-            let user = user();
-            store.archive_user(user.clone(), deleted_at());
-
-            let archive = path::PathBuf::from("/data/home-archive/testuser.tar.gz");
-            store.record_home_archive(&user.id, archive.clone());
-
-            assert_eq!(store.archived[&user.id].home_archive, Some(archive));
+            let departed = &store.departed[&user.id];
+            assert_eq!(departed.name, user.name);
+            assert_eq!(departed.uid, user.uid);
+            assert_eq!(departed.gid, user.gid);
+            assert_eq!(departed.departed_at, departed_at());
         }
 
         #[tokio::test]
@@ -692,17 +757,33 @@ mod tests {
             let temp_dir = tempfile::TempDir::new().unwrap();
             let mut store = UserStore::new(temp_dir.path()).await.unwrap();
             let rejoined = user();
-            let departed = archived_user();
+            let departed = departed_user();
             store
-                .archived
-                .insert(rejoined.id, ArchivedUser::from_test_user(&rejoined));
-            store.archived.insert(departed.id, departed.clone());
+                .departed
+                .insert(rejoined.id, DepartedUser::from_test_user(&rejoined));
+            store.departed.insert(departed.id, departed.clone());
             store.users.insert(rejoined.id, rejoined.clone());
 
             store.prune_rejoined();
 
-            assert!(!store.archived.contains_key(&rejoined.id));
-            assert_eq!(store.archived[&departed.id], departed);
+            assert!(!store.departed.contains_key(&rejoined.id));
+            assert_eq!(store.departed[&departed.id], departed);
+        }
+
+        /// A member who rejoins after their account was purged spends the purged
+        /// tombstone, exactly like a departed one
+        #[tokio::test]
+        async fn prune_rejoined_drops_purged_tombstones_of_active_users() {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let mut store = UserStore::new(temp_dir.path()).await.unwrap();
+            let purged = purged_user();
+            let rejoined = User::from_test_purged(&purged);
+            store.purged.insert(purged.id, purged.clone());
+            store.users.insert(rejoined.id, rejoined);
+
+            store.prune_rejoined();
+
+            assert!(store.purged.is_empty());
         }
 
         #[tokio::test]
@@ -760,7 +841,7 @@ mod tests {
         }
     }
 
-    impl ArchivedUser {
+    impl DepartedUser {
         /// Tombstone with the identity of `user`, for tests
         fn from_test_user(user: &User) -> Self {
             Self {
@@ -768,8 +849,19 @@ mod tests {
                 name: user.name.clone(),
                 uid: user.uid,
                 gid: user.gid,
-                deleted_at: deleted_at(),
-                home_archive: None,
+                departed_at: departed_at(),
+            }
+        }
+    }
+
+    impl User {
+        /// Active user with the identity of a purged tombstone, for tests
+        fn from_test_purged(purged: &PurgedUser) -> Self {
+            Self {
+                id: purged.id,
+                name: purged.name.clone(),
+                uid: purged.uid,
+                gid: purged.gid,
             }
         }
     }

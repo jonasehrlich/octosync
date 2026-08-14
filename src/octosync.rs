@@ -96,7 +96,7 @@ impl Octosync {
     ) -> anyhow::Result<store::User> {
         let new_user = match store.data().get(&gh_user.id) {
             Some(user) => self.manage_existing_user(gh_user, user).await?,
-            None => self.create_user(gh_user, store.archived()).await?,
+            None => self.create_user(gh_user, store).await?,
         };
 
         self.user_manager
@@ -126,33 +126,50 @@ impl Octosync {
         Ok(new_user)
     }
 
-    /// Create the platform user, re-using the archived IDs when the member rejoined.
+    /// Create the platform user, re-using the tombstoned IDs when the member rejoined.
     ///
     /// A rejoin whose stored ID is taken fails loudly and is retried on the next
     /// sync; falling back to fresh IDs would recreate exactly the ownership drift
     /// the tombstones exist to prevent. A brand-new member must not be allocated an
-    /// ID a tombstone reserves either, so the reserved IDs travel with the creation.
+    /// ID a tombstone (departed or purged) reserves either, so the reserved IDs
+    /// travel with the creation.
     async fn create_user(
         &self,
         gh_user: &octocrab::models::Author,
-        archived: &store::ArchivedMap,
+        store: &store::UserStore,
     ) -> anyhow::Result<store::User> {
-        let ids = match archived.get(&gh_user.id) {
-            Some(tombstone) => {
+        // A departed member rejoins into their expired account; a purged one gets a
+        // fresh account and home directory under their old IDs
+        let stored_ids = store
+            .departed()
+            .get(&gh_user.id)
+            .map(|tombstone| (tombstone.uid(), tombstone.gid()))
+            .or_else(|| {
+                store
+                    .purged()
+                    .get(&gh_user.id)
+                    .map(|tombstone| (tombstone.uid(), tombstone.gid()))
+            });
+        let ids = match stored_ids {
+            Some((uid, gid)) => {
                 tracing::info!(
-                    uid = tombstone.uid().as_raw(),
+                    uid = uid.as_raw(),
                     "Member rejoined, re-creating the account with its stored IDs"
                 );
-                user_manager::AccountIds::Stored {
-                    uid: tombstone.uid(),
-                    gid: tombstone.gid(),
-                }
+                user_manager::AccountIds::Stored { uid, gid }
             }
             None => user_manager::AccountIds::Fresh {
-                reserved_uids: archived.values().map(store::ArchivedUser::uid).collect(),
-                reserved_gids: archived
+                reserved_uids: store
+                    .departed()
                     .values()
-                    .filter_map(store::ArchivedUser::gid)
+                    .map(store::DepartedUser::uid)
+                    .chain(store.purged().values().map(store::PurgedUser::uid))
+                    .collect(),
+                reserved_gids: store
+                    .departed()
+                    .values()
+                    .filter_map(store::DepartedUser::gid)
+                    .chain(store.purged().values().filter_map(store::PurgedUser::gid))
                     .collect(),
             },
         };
@@ -250,21 +267,15 @@ impl Octosync {
         store: &mut store::UserStore,
         leavers: Vec<store::User>,
     ) -> anyhow::Result<()> {
-        let deleted_at = chrono::Utc::now();
+        let departed_at = chrono::Utc::now();
         for user in leavers {
             tracing::info!("Archiving user '{}' for deletion", user.name());
-            store.archive_user(user, deleted_at);
+            store.depart_user(user, departed_at);
         }
         store.save().await?;
 
-        for (id, archive_path) in self.delete_archived_accounts(store.archived()).await {
-            // An already-gone account reports no archive; keep the path recorded by
-            // the sync that created it
-            if let Some(archive_path) = archive_path {
-                store.record_home_archive(&id, archive_path);
-            }
-        }
-        store.save().await
+        self.delete_archived_accounts(store.departed()).await;
+        Ok(())
     }
 
     /// Process all org members concurrently and collect the successfully processed
@@ -283,7 +294,8 @@ impl Octosync {
         let mut new_store = store::UserStore::new(&self.data_dir).await?;
         // Tombstones are carried over wholesale before any member is processed, so
         // their survival never depends on per-user processing succeeding
-        *new_store.archived_mut() = store.archived().clone();
+        *new_store.departed_mut() = store.departed().clone();
+        *new_store.purged_mut() = store.purged().clone();
         *new_store.data_mut() = stream::iter(org_members)
             .map(|gh_user| {
                 let groups = assignments.user_groups(gh_user.id);
@@ -307,35 +319,23 @@ impl Octosync {
         Ok(new_store)
     }
 
-    /// Delete the platform accounts of the archived users concurrently, returning the
-    /// ID and home archive path of every successful deletion.
+    /// Delete the platform accounts of the archived users concurrently.
     ///
     /// Failures are only logged: the tombstone stays in the store, so the deletion is
     /// retried on every sync until the account is gone.
-    async fn delete_archived_accounts(
-        &self,
-        archived: &store::ArchivedMap,
-    ) -> Vec<(octocrab::models::UserId, Option<path::PathBuf>)> {
-        stream::iter(archived.values())
-            .map(|archived_user| async move {
-                self.user_manager
-                    .delete_user(&store::User::from(archived_user))
-                    .await
-                    .map(|archive_path| (archived_user.id(), archive_path))
-                    .inspect_err(|e| {
-                        tracing::error!(
-                            "Failed to delete user '{}': {:?}",
-                            archived_user.name(),
-                            e
-                        );
-                    })
-                    .ok()
-            })
+    async fn delete_archived_accounts(&self, departed: &store::DepartedMap) {
+        stream::iter(departed.values())
             // Deletion archives the user's home directory, which can take a while for large
             // home directories, run a few deletions concurrently
-            .buffer_unordered(MAX_CONCURRENT_DELETES)
-            .filter_map(|res| async move { res })
-            .collect()
+            .for_each_concurrent(MAX_CONCURRENT_DELETES, |departed_user| async move {
+                if let Err(e) = self
+                    .user_manager
+                    .delete_user(&store::User::from(departed_user))
+                    .await
+                {
+                    tracing::error!("Failed to delete user '{}': {:?}", departed_user.name(), e);
+                }
+            })
             .await
     }
 
@@ -612,7 +612,7 @@ mod tests {
             let received_ids = actor.create_user_ids.clone();
             let (octosync, _data_dir) = octosync_with(actor);
             let mut old_store = store::UserStore::new(_data_dir.path()).await.unwrap();
-            old_store.archive_user(user(1, "alice"), chrono::Utc::now());
+            old_store.depart_user(user(1, "alice"), chrono::Utc::now());
 
             let new_store = octosync
                 .process_members(
@@ -632,7 +632,7 @@ mod tests {
                 }]
             );
             assert!(new_store.data().contains_key(&octocrab::models::UserId(1)));
-            assert!(new_store.archived().is_empty());
+            assert!(new_store.departed().is_empty());
         }
 
         /// A brand-new member's creation carries the IDs reserved by tombstones, so
@@ -645,7 +645,7 @@ mod tests {
             let received_ids = actor.create_user_ids.clone();
             let (octosync, _data_dir) = octosync_with(actor);
             let mut old_store = store::UserStore::new(_data_dir.path()).await.unwrap();
-            old_store.archive_user(user(1, "alice"), chrono::Utc::now());
+            old_store.depart_user(user(1, "alice"), chrono::Utc::now());
 
             octosync
                 .process_members(
@@ -676,7 +676,7 @@ mod tests {
                 .push_back(Err(anyhow::anyhow!("UID is taken")));
             let (octosync, _data_dir) = octosync_with(actor);
             let mut old_store = store::UserStore::new(_data_dir.path()).await.unwrap();
-            old_store.archive_user(user(1, "alice"), chrono::Utc::now());
+            old_store.depart_user(user(1, "alice"), chrono::Utc::now());
 
             let new_store = octosync
                 .process_members(
@@ -691,7 +691,7 @@ mod tests {
             assert!(new_store.data().is_empty());
             assert!(
                 new_store
-                    .archived()
+                    .departed()
                     .contains_key(&octocrab::models::UserId(1))
             );
         }
@@ -714,62 +714,9 @@ mod tests {
                 .unwrap();
 
             let saved = store::UserStore::from_dir(data_dir.path()).await.unwrap();
-            let tombstone = &saved.archived()[&octocrab::models::UserId(1)];
+            let tombstone = &saved.departed()[&octocrab::models::UserId(1)];
             assert_eq!(tombstone.name(), "alice");
-            assert_eq!(tombstone.home_archive(), None);
             assert!(saved.data().is_empty());
-        }
-
-        /// A successful deletion records the home archive path on the tombstone.
-        #[tokio::test]
-        async fn archive_and_delete_records_the_home_archive_path() {
-            let home_dir = tempfile::tempdir().unwrap();
-            std::fs::write(home_dir.path().join("notes.txt"), "important").unwrap();
-
-            let mut actor = TestingUserManager::default();
-            actor
-                .prepare_user_deletion
-                .push_back(Ok(DeletionPreparation::Prepared {
-                    home_dir: home_dir.path().to_path_buf(),
-                }));
-            actor.remove_account.push_back(Ok(()));
-            let (octosync, data_dir) = octosync_with(actor);
-            let mut store = store::UserStore::new(data_dir.path()).await.unwrap();
-
-            octosync
-                .archive_and_delete(&mut store, vec![user(1, "alice")])
-                .await
-                .unwrap();
-
-            let saved = store::UserStore::from_dir(data_dir.path()).await.unwrap();
-            let tombstone = &saved.archived()[&octocrab::models::UserId(1)];
-            let archive = tombstone.home_archive().expect("archive path recorded");
-            assert!(archive.exists());
-        }
-
-        /// A tombstone whose account is already gone reports no archive; the path
-        /// recorded by the sync that archived the home directory must survive.
-        #[tokio::test]
-        async fn archive_and_delete_keeps_a_recorded_archive_path() {
-            let mut actor = TestingUserManager::default();
-            actor
-                .prepare_user_deletion
-                .push_back(Ok(DeletionPreparation::NothingToDo));
-            let (octosync, data_dir) = octosync_with(actor);
-            let mut store = store::UserStore::new(data_dir.path()).await.unwrap();
-            store.archive_user(user(1, "alice"), chrono::Utc::now());
-            let archive = path::PathBuf::from("/data/home-archive/alice.tar.gz");
-            store.record_home_archive(&octocrab::models::UserId(1), archive.clone());
-
-            octosync
-                .archive_and_delete(&mut store, vec![])
-                .await
-                .unwrap();
-
-            assert_eq!(
-                store.archived()[&octocrab::models::UserId(1)].home_archive(),
-                Some(archive.as_path())
-            );
         }
 
         /// The `delete` command tombstones every user instead of removing the store
@@ -792,7 +739,7 @@ mod tests {
             let saved = store::UserStore::from_dir(data_dir.path()).await.unwrap();
             assert!(saved.data().is_empty());
             assert_eq!(
-                saved.archived()[&octocrab::models::UserId(1)].name(),
+                saved.departed()[&octocrab::models::UserId(1)].name(),
                 "alice"
             );
         }
