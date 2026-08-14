@@ -52,6 +52,10 @@
   to another group fails the re-creation loudly instead of falling back to a fresh one. Entries
   migrated from a v1 store carry no GID and are backfilled on their next update.
   ([#22](https://github.com/jonasehrlich/octosync/pull/22))
+- Never allocate a departed user's UID or GID to a brand-new member: `useradd` hands out the highest
+  ID in range plus one, which is exactly what deleting the highest-UID user frees. A new account
+  whose auto-allocated IDs collide with a tombstone is removed while still empty and re-created with
+  explicitly chosen free IDs. ([#22](https://github.com/jonasehrlich/octosync/pull/22))
 
 ## v0.3.0
 

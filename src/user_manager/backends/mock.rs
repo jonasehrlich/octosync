@@ -3,8 +3,8 @@
 
 use crate::store;
 use crate::user_manager::{
-    CreateUser, DeletionPreparation, EnsureGroupsExist, PrepareUserDeletion, RemoveAccount,
-    SyncSupplementaryGroups, UpdateAuthorizedKeys, UpdateUser,
+    AccountIds, CreateUser, DeletionPreparation, EnsureGroupsExist, PrepareUserDeletion,
+    RemoveAccount, SyncSupplementaryGroups, UpdateAuthorizedKeys, UpdateUser,
 };
 
 #[derive(Debug)]
@@ -28,17 +28,24 @@ impl hannibal::Handler<CreateUser> for MockUserManager {
         _ctx: &mut hannibal::Context<Self>,
         msg: CreateUser,
     ) -> anyhow::Result<store::User> {
-        let uid = match msg.uid {
-            Some(uid) => uid,
-            None => {
-                self.next_uid += 1;
-                nix::unistd::Uid::from_raw(self.next_uid as _)
-            }
-        };
         // Mimic the user-private group Linux creates: same numeric ID as the user
-        let gid = msg
-            .gid
-            .unwrap_or_else(|| nix::unistd::Gid::from_raw(uid.as_raw()));
+        let (uid, gid) = match &msg.ids {
+            AccountIds::Stored { uid, gid } => (
+                *uid,
+                gid.unwrap_or_else(|| nix::unistd::Gid::from_raw(uid.as_raw())),
+            ),
+            AccountIds::Fresh {
+                reserved_uids,
+                reserved_gids,
+            } => loop {
+                self.next_uid += 1;
+                let uid = nix::unistd::Uid::from_raw(self.next_uid as _);
+                let gid = nix::unistd::Gid::from_raw(self.next_uid as _);
+                if !reserved_uids.contains(&uid) && !reserved_gids.contains(&gid) {
+                    break (uid, gid);
+                }
+            },
+        };
         tracing::info!(
             "Mock creating user '{}' with UID {} and GID {} (not actually creating users on non-Linux OS)",
             msg.gh_user.login,

@@ -96,10 +96,7 @@ impl Octosync {
     ) -> anyhow::Result<store::User> {
         let new_user = match store.data().get(&gh_user.id) {
             Some(user) => self.manage_existing_user(gh_user, user).await?,
-            None => {
-                self.create_user(gh_user, store.archived().get(&gh_user.id))
-                    .await?
-            }
+            None => self.create_user(gh_user, store.archived()).await?,
         };
 
         self.user_manager
@@ -129,29 +126,37 @@ impl Octosync {
         Ok(new_user)
     }
 
-    /// Create the platform user, re-using the archived UID when the member rejoined.
+    /// Create the platform user, re-using the archived IDs when the member rejoined.
     ///
-    /// A taken UID fails the creation loudly and the tombstone is retried on the next
-    /// sync; falling back to a fresh UID would recreate exactly the ownership drift
-    /// the tombstones exist to prevent.
+    /// A rejoin whose stored ID is taken fails loudly and is retried on the next
+    /// sync; falling back to fresh IDs would recreate exactly the ownership drift
+    /// the tombstones exist to prevent. A brand-new member must not be allocated an
+    /// ID a tombstone reserves either, so the reserved IDs travel with the creation.
     async fn create_user(
         &self,
         gh_user: &octocrab::models::Author,
-        archived: Option<&store::ArchivedUser>,
+        archived: &store::ArchivedMap,
     ) -> anyhow::Result<store::User> {
-        if let Some(archived) = archived {
-            tracing::info!(
-                uid = archived.uid().as_raw(),
-                "Member rejoined, re-creating the account with its stored UID"
-            );
-        }
-        self.user_manager
-            .create_user(
-                gh_user,
-                archived.map(store::ArchivedUser::uid),
-                archived.and_then(store::ArchivedUser::gid),
-            )
-            .await
+        let ids = match archived.get(&gh_user.id) {
+            Some(tombstone) => {
+                tracing::info!(
+                    uid = tombstone.uid().as_raw(),
+                    "Member rejoined, re-creating the account with its stored IDs"
+                );
+                user_manager::AccountIds::Stored {
+                    uid: tombstone.uid(),
+                    gid: tombstone.gid(),
+                }
+            }
+            None => user_manager::AccountIds::Fresh {
+                reserved_uids: archived.values().map(store::ArchivedUser::uid).collect(),
+                reserved_gids: archived
+                    .values()
+                    .filter_map(store::ArchivedUser::gid)
+                    .collect(),
+            },
+        };
+        self.user_manager.create_user(gh_user, ids).await
     }
 
     async fn manage_existing_user(
@@ -621,13 +626,44 @@ mod tests {
 
             assert_eq!(
                 *received_ids.lock().unwrap(),
-                [(
-                    Some(nix::unistd::Uid::from_raw(1001)),
-                    Some(nix::unistd::Gid::from_raw(2001))
-                )]
+                [crate::user_manager::AccountIds::Stored {
+                    uid: nix::unistd::Uid::from_raw(1001),
+                    gid: Some(nix::unistd::Gid::from_raw(2001)),
+                }]
             );
             assert!(new_store.data().contains_key(&octocrab::models::UserId(1)));
             assert!(new_store.archived().is_empty());
+        }
+
+        /// A brand-new member's creation carries the IDs reserved by tombstones, so
+        /// the backend never allocates a departed user's UID or GID to them.
+        #[tokio::test]
+        async fn process_members_reserves_archived_ids_for_a_new_member() {
+            let mut actor = TestingUserManager::default();
+            actor.create_user.push_back(Ok(user(2, "bob")));
+            actor.sync_supplementary_groups.push_back(Ok(()));
+            let received_ids = actor.create_user_ids.clone();
+            let (octosync, _data_dir) = octosync_with(actor);
+            let mut old_store = store::UserStore::new(_data_dir.path()).await.unwrap();
+            old_store.archive_user(user(1, "alice"), chrono::Utc::now());
+
+            octosync
+                .process_members(
+                    &unreachable_octocrab(),
+                    &[author(2, "bob")],
+                    &old_store,
+                    &groups::GroupAssignments::default(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                *received_ids.lock().unwrap(),
+                [crate::user_manager::AccountIds::Fresh {
+                    reserved_uids: [nix::unistd::Uid::from_raw(1001)].into(),
+                    reserved_gids: [nix::unistd::Gid::from_raw(2001)].into(),
+                }]
+            );
         }
 
         /// Tombstones survive member processing structurally: a failed re-creation

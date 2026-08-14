@@ -16,8 +16,8 @@ pub mod backends;
 mod messages;
 
 pub use messages::{
-    CreateUser, DeletionPreparation, EnsureGroupsExist, PrepareUserDeletion, RemoveAccount,
-    SyncSupplementaryGroups, UpdateAuthorizedKeys, UpdateUser,
+    AccountIds, CreateUser, DeletionPreparation, EnsureGroupsExist, PrepareUserDeletion,
+    RemoveAccount, SyncSupplementaryGroups, UpdateAuthorizedKeys, UpdateUser,
 };
 
 use crate::{public_keys, store};
@@ -95,19 +95,18 @@ impl UserManager {
         }
     }
 
-    /// Sends [`CreateUser`] to the actor and awaits the created user. `uid` and `gid`
-    /// are the stored IDs of a rejoining member, see [`CreateUser`].
+    /// Sends [`CreateUser`] to the actor and awaits the created user. `ids` chooses
+    /// between the stored IDs of a rejoining member and fresh allocation, see
+    /// [`AccountIds`].
     pub async fn create_user(
         &self,
         gh_user: &octocrab::models::Author,
-        uid: Option<nix::unistd::Uid>,
-        gid: Option<nix::unistd::Gid>,
+        ids: AccountIds,
     ) -> anyhow::Result<store::User> {
         self.create_user
             .call(CreateUser {
                 gh_user: gh_user.clone(),
-                uid,
-                gid,
+                ids,
             })
             .await
             .context(ACTOR_ERROR)?

@@ -3,19 +3,17 @@
 
 use crate::store;
 use crate::user_manager::{
-    CreateUser, DeletionPreparation, EnsureGroupsExist, PrepareUserDeletion, RemoveAccount,
-    SyncSupplementaryGroups, UpdateAuthorizedKeys, UpdateUser,
+    AccountIds, CreateUser, DeletionPreparation, EnsureGroupsExist, PrepareUserDeletion,
+    RemoveAccount, SyncSupplementaryGroups, UpdateAuthorizedKeys, UpdateUser,
 };
 use std::{collections, sync};
 
 #[derive(Default)]
 pub struct TestingUserManager {
     pub create_user: collections::VecDeque<anyhow::Result<store::User>>,
-    /// UID and GID received with [`CreateUser`], so tests can assert the stored IDs of
-    /// a rejoining member are passed through. Clone the handle before spawning the actor.
-    #[allow(clippy::type_complexity)]
-    pub create_user_ids:
-        sync::Arc<sync::Mutex<Vec<(Option<nix::unistd::Uid>, Option<nix::unistd::Gid>)>>>,
+    /// The [`AccountIds`] received with [`CreateUser`], so tests can assert the stored
+    /// or reserved IDs are passed through. Clone the handle before spawning the actor.
+    pub create_user_ids: sync::Arc<sync::Mutex<Vec<AccountIds>>>,
     pub update_user: collections::VecDeque<anyhow::Result<store::User>>,
     pub prepare_user_deletion: collections::VecDeque<anyhow::Result<DeletionPreparation>>,
     pub remove_account: collections::VecDeque<anyhow::Result<()>>,
@@ -41,10 +39,7 @@ impl hannibal::Handler<CreateUser> for TestingUserManager {
         _ctx: &mut hannibal::Context<Self>,
         msg: CreateUser,
     ) -> anyhow::Result<store::User> {
-        self.create_user_ids
-            .lock()
-            .unwrap()
-            .push((msg.uid, msg.gid));
+        self.create_user_ids.lock().unwrap().push(msg.ids.clone());
         next_response(&mut self.create_user, "CreateUser")
     }
 }
