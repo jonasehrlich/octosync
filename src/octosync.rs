@@ -1,5 +1,5 @@
 use crate::{
-    GlobalArgs, InstallationClientArgs, SyncArgs, public_keys, store,
+    GlobalArgs, InstallationClientArgs, SyncArgs, groups, public_keys, store,
     user_manager::{
         self, CreateUser as _, DeleteUser as _, ManageAuthorizedKeys as _,
         ManageSupplementaryGroups as _, UpdateUser as _,
@@ -17,6 +17,9 @@ const MAX_CONCURRENT_DELETES: usize = 4;
 /// Maximum number of users processed concurrently during a sync. Bounds the number of
 /// GitHub requests and user management commands in flight at the same time.
 const MAX_CONCURRENT_USER_SYNCS: usize = 8;
+
+/// Maximum number of items per page supported by the GitHub API
+pub(crate) const GITHUB_MAX_PER_PAGE: u8 = 100;
 
 /// Timeout for establishing a connection to the GitHub API
 const CONNECT_TIMEOUT: time::Duration = time::Duration::from_secs(10);
@@ -148,9 +151,10 @@ impl Octosync {
     )]
     pub async fn sync(self, args: &SyncArgs) -> anyhow::Result<()> {
         let octocrab = org_client(&args.octocrab).await?;
-        let (org_members, old_store) = tokio::try_join!(
+        let (org_members, old_store, assignments) = tokio::try_join!(
             get_all_org_members(&octocrab, &args.octocrab.org),
-            store::UserStore::from_dir(&self.data_dir)
+            store::UserStore::from_dir(&self.data_dir),
+            groups::GroupAssignments::resolve(&octocrab, &args.octocrab.org, &args.group)
         )?;
         tracing::info!("Successfully retrieved {} members", org_members.len());
 
@@ -168,21 +172,14 @@ impl Octosync {
                 org_members.iter().map(|user| (user.id, user.login.clone())),
             );
 
-        let groups: Vec<String> = args
-            .group
-            .iter()
-            .filter_map(|mapping| match mapping {
-                crate::GroupMapping::AddGroup(group) => Some(group.clone()),
-                crate::GroupMapping::MapGitHubTeam { .. } => None, // Not implemented yet
-            })
-            .collect();
-        // Don't create the groups as part of the try_join above, because at some point we also need
-        // to support mapping GitHub teams to Linux groups, which requires the user -> team -> group mapping
-        // to be available created before processing the users
-        self.user_manager.ensure_groups_exists(&groups).await?;
+        // Create the resolved groups before the users are processed, so the per-user
+        // group sync can rely on every managed group existing
+        self.user_manager
+            .ensure_groups_exists(&assignments.all_groups())
+            .await?;
 
         let mut new_store = self
-            .process_members(&octocrab, &org_members, &old_store, &groups)
+            .process_members(&octocrab, &org_members, &old_store, &assignments)
             .await?;
 
         let (users_to_retry, users_to_delete) =
@@ -234,17 +231,20 @@ impl Octosync {
         octocrab: &octocrab::Octocrab,
         org_members: &[octocrab::models::Author],
         store: &store::UserStore,
-        groups: &[String],
+        assignments: &groups::GroupAssignments,
     ) -> anyhow::Result<store::UserStore> {
         let mut new_store = store::UserStore::new(&self.data_dir).await?;
         *new_store.data_mut() = stream::iter(org_members)
-            .map(|gh_user| async move {
-                self.process_user(octocrab, gh_user, store, groups)
-                    .await
-                    .inspect_err(|e| {
-                        tracing::error!("Failed to process user '{}': {:?}", gh_user.login, e);
-                    })
-                    .ok()
+            .map(|gh_user| {
+                let groups = assignments.user_groups(gh_user.id);
+                async move {
+                    self.process_user(octocrab, gh_user, store, &groups)
+                        .await
+                        .inspect_err(|e| {
+                            tracing::error!("Failed to process user '{}': {:?}", gh_user.login, e);
+                        })
+                        .ok()
+                }
             })
             .buffer_unordered(MAX_CONCURRENT_USER_SYNCS)
             .filter_map(|res| async move { res })

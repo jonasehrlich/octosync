@@ -1,8 +1,6 @@
+use crate::octosync::GITHUB_MAX_PER_PAGE;
 use anyhow::Context as _;
 use std::{fmt, str::FromStr};
-
-/// Maximum number of keys per page supported by the GitHub API
-const FETCH_KEYS_PER_PAGE: usize = 100;
 
 /// A "Key Simple" entry returned by `GET /users/{username}/keys`
 #[derive(Debug, serde::Deserialize)]
@@ -53,7 +51,7 @@ impl PublicKeys {
                 .get(
                     format!("/users/{}/keys", login),
                     Some(&[
-                        ("per_page", FETCH_KEYS_PER_PAGE.to_string()),
+                        ("per_page", GITHUB_MAX_PER_PAGE.to_string()),
                         ("page", page.to_string()),
                     ]),
                 )
@@ -72,7 +70,7 @@ impl PublicKeys {
                     ),
                 }
             }
-            if entry_count < FETCH_KEYS_PER_PAGE {
+            if entry_count < GITHUB_MAX_PER_PAGE as usize {
                 break;
             }
         }
