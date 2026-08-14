@@ -110,6 +110,11 @@ pub struct DepartedUser {
     /// retention period.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expired_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When octosync started removing the account. This is persisted before `userdel`
+    /// runs and retained when the result is ambiguous, allowing the next run to finish
+    /// updating the departure record if the account is already gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    purge_started_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[allow(unused)]
@@ -142,6 +147,11 @@ impl DepartedUser {
     /// Get the time the account teardown completed, `None` while it still has to run
     pub fn expired_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         self.expired_at
+    }
+
+    /// Get when account removal started but was not confirmed complete.
+    pub fn purge_started_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.purge_started_at
     }
 }
 
@@ -311,6 +321,7 @@ impl UserStore {
                 gid: user.gid,
                 departed_at,
                 expired_at: None,
+                purge_started_at: None,
             },
         );
     }
@@ -323,6 +334,24 @@ impl UserStore {
     ) {
         if let Some(departed) = self.departed.get_mut(id) {
             departed.expired_at = Some(expired_at);
+        }
+    }
+
+    /// Record that account removal is about to start.
+    pub fn mark_purge_started(
+        &mut self,
+        id: &octocrab::models::UserId,
+        started_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        if let Some(departed) = self.departed.get_mut(id) {
+            departed.purge_started_at = Some(started_at);
+        }
+    }
+
+    /// Clear the removal marker after confirming that no destructive operation ran.
+    pub fn clear_purge_started(&mut self, id: &octocrab::models::UserId) {
+        if let Some(departed) = self.departed.get_mut(id) {
+            departed.purge_started_at = None;
         }
     }
 
@@ -487,6 +516,7 @@ mod tests {
             gid: Some(unistd::Gid::from_raw(1005)),
             departed_at: departed_at(),
             expired_at: Some(departed_at()),
+            purge_started_at: None,
         }
     }
 
@@ -902,6 +932,7 @@ mod tests {
                 gid: user.gid,
                 departed_at: departed_at(),
                 expired_at: None,
+                purge_started_at: None,
             }
         }
     }

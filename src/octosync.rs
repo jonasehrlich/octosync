@@ -283,6 +283,19 @@ impl Octosync {
             .collect();
 
         for user in candidates {
+            let purge_was_started = store
+                .departed()
+                .get(&user.id())
+                .is_some_and(|departed| departed.purge_started_at().is_some());
+
+            if !purge_was_started {
+                // Persist intent before userdel can remove the account. If the process
+                // stops after this save, the next run can distinguish this attempt from
+                // an account removed independently.
+                store.mark_purge_started(&user.id(), now);
+                store.save().await?;
+            }
+
             match self.user_manager.purge_user(&user, cutoff).await {
                 Ok(user_manager::PurgeOutcome::Purged) => {
                     tracing::info!(
@@ -292,21 +305,36 @@ impl Octosync {
                     );
                     store.mark_purged(&user.id(), now);
                 }
-                // Keep the tombstone until a purge succeeds.
-                Ok(user_manager::PurgeOutcome::NoAccount) => tracing::warn!(
-                    "No account for departed user '{}', not marking the tombstone purged",
-                    user.name()
-                ),
-                Ok(user_manager::PurgeOutcome::NotExpired) => tracing::warn!(
-                    "Account of '{}' has no shadow expiry older than the retention period, \
-                     not purging despite the tombstone age",
-                    user.name()
-                ),
-                // The tombstone stays departed, so the purge is retried on later syncs
+                Ok(user_manager::PurgeOutcome::NoAccount) if purge_was_started => {
+                    tracing::info!(
+                        user = %user.name(),
+                        "Account was removed during an earlier purge attempt; finishing the store update"
+                    );
+                    store.mark_purged(&user.id(), now);
+                }
+                Ok(user_manager::PurgeOutcome::NoAccount) => {
+                    tracing::warn!(
+                        "No account for departed user '{}'; keeping the departure record",
+                        user.name()
+                    );
+                    store.clear_purge_started(&user.id());
+                }
+                Ok(user_manager::PurgeOutcome::NotExpired) => {
+                    tracing::warn!(
+                        "Account of '{}' has no shadow expiry older than the retention period; \
+                         not purging despite the departure date",
+                        user.name()
+                    );
+                    store.clear_purge_started(&user.id());
+                }
                 Err(e) => {
                     tracing::error!("Failed to purge the account of '{}': {:?}", user.name(), e);
+                    // Keep the marker: userdel may have removed the account before
+                    // reporting an error or timing out. The next run resolves whether
+                    // the account still exists.
                 }
             }
+            store.save().await?;
         }
         store.save().await
     }
@@ -1047,12 +1075,18 @@ mod tests {
 
             assert_eq!(store.departed().len(), 2);
             assert!(store.purged().is_empty());
+            assert!(
+                store
+                    .departed()
+                    .values()
+                    .all(|departed| departed.purge_started_at().is_none())
+            );
         }
 
-        /// A failed purge keeps the tombstone departed, so it is retried on the next
-        /// sync.
+        /// An error after account removal starts is ambiguous, so the marker remains
+        /// for the next run to resolve.
         #[tokio::test]
-        async fn failed_purge_keeps_the_tombstone_departed() {
+        async fn failed_purge_keeps_departure_and_marker() {
             let mut actor = TestingUserManager::default();
             actor.purge_account.push_back(Err(anyhow::anyhow!("boom")));
             let (octosync, data_dir) = octosync_with(actor);
@@ -1069,6 +1103,67 @@ mod tests {
                 .unwrap();
 
             assert!(store.departed().contains_key(&octocrab::models::UserId(1)));
+            assert!(store.purged().is_empty());
+            assert!(
+                store.departed()[&octocrab::models::UserId(1)]
+                    .purge_started_at()
+                    .is_some()
+            );
+
+            let saved = store::UserStore::from_dir(data_dir.path(), false)
+                .await
+                .unwrap();
+            assert!(
+                saved.departed()[&octocrab::models::UserId(1)]
+                    .purge_started_at()
+                    .is_some()
+            );
+        }
+
+        #[tokio::test]
+        async fn interrupted_purge_finishes_store_update_when_account_is_gone() {
+            let mut actor = TestingUserManager::default();
+            actor.purge_account.push_back(Ok(PurgeOutcome::NoAccount));
+            let (octosync, data_dir) = octosync_with(actor);
+            let mut store = store::UserStore::new(data_dir.path(), false).await.unwrap();
+            let id = octocrab::models::UserId(1);
+            store.depart_user(user(1, "alice"), old_departure());
+            store.mark_purge_started(&id, old_departure());
+            store.save().await.unwrap();
+
+            octosync
+                .purge_expired(
+                    &mut store,
+                    &member_map(&[unrelated_member()]),
+                    RETENTION_DAYS,
+                )
+                .await
+                .unwrap();
+
+            assert!(!store.departed().contains_key(&id));
+            assert_eq!(store.purged()[&id].name(), "alice");
+        }
+
+        #[tokio::test]
+        async fn missing_account_without_prior_attempt_keeps_departure() {
+            let mut actor = TestingUserManager::default();
+            actor.purge_account.push_back(Ok(PurgeOutcome::NoAccount));
+            let (octosync, data_dir) = octosync_with(actor);
+            let mut store = store::UserStore::new(data_dir.path(), false).await.unwrap();
+            let id = octocrab::models::UserId(1);
+            store.depart_user(user(1, "alice"), old_departure());
+
+            octosync
+                .purge_expired(
+                    &mut store,
+                    &member_map(&[unrelated_member()]),
+                    RETENTION_DAYS,
+                )
+                .await
+                .unwrap();
+
+            assert!(store.departed().contains_key(&id));
+            assert!(store.departed()[&id].purge_started_at().is_none());
             assert!(store.purged().is_empty());
         }
 
