@@ -53,44 +53,53 @@ impl hannibal::Handler<CreateUser> for LinuxUserManager {
                 .build());
         }
 
-        let mut command = process::Command::new("/usr/sbin/useradd");
-        command
-            .arg("--create-home")
-            .arg("--shell")
-            .arg("/bin/bash")
-            .arg("--password")
-            .arg("!")
-            .arg(&user.login);
-
-        let proc = command.output();
-        let o = proc
-            .await
-            .context("Failed to wait for useradd command to finish")?;
-
-        if o.status.success() {
-            tracing::info!("Created user");
-
-            let linux_user = nix::unistd::User::from_name(&user.login)
-                .context("Failed to retrieve user info for newly created user ")?
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "User '{}' was created but could not be found in the system",
-                        user.login
-                    )
-                })?;
-
-            Ok(store::User::builder()
-                .id(user.id)
-                .uid(linux_user.uid)
-                .name(user.login.clone())
-                .build())
-        } else {
-            Err(anyhow::anyhow!(
-                "Failed to create user: {}",
-                String::from_utf8_lossy(&o.stderr)
-            ))
-        }
+        add_account(&user.login, user.id, None).await
     }
+}
+
+/// Create a platform account with `useradd`. Re-creating a previously deleted account
+/// with its stored UID keeps ownership of files outside the home directory intact.
+async fn add_account(
+    login: &str,
+    id: octocrab::models::UserId,
+    uid: Option<nix::unistd::Uid>,
+) -> anyhow::Result<store::User> {
+    let mut command = process::Command::new("/usr/sbin/useradd");
+    command
+        .arg("--create-home")
+        .arg("--shell")
+        .arg("/bin/bash")
+        .arg("--password")
+        .arg("!");
+    if let Some(uid) = uid {
+        command.arg("--uid").arg(uid.to_string());
+    }
+    command.arg(login);
+
+    let o = command
+        .output()
+        .await
+        .context("Failed to wait for useradd command to finish")?;
+
+    if !o.status.success() {
+        anyhow::bail!(
+            "Failed to create user: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
+    tracing::info!("Created user");
+
+    let linux_user = nix::unistd::User::from_name(login)
+        .context("Failed to retrieve user info for newly created user")?
+        .ok_or_else(|| {
+            anyhow::anyhow!("User '{login}' was created but could not be found in the system")
+        })?;
+
+    Ok(store::User::builder()
+        .id(id)
+        .uid(linux_user.uid)
+        .name(login.to_string())
+        .build())
 }
 
 impl hannibal::Handler<UpdateUser> for LinuxUserManager {
@@ -105,9 +114,13 @@ impl hannibal::Handler<UpdateUser> for LinuxUserManager {
         msg: UpdateUser,
     ) -> anyhow::Result<store::User> {
         let (gh_user, available_user) = (&msg.gh_user, &msg.available_user);
-        let linux_user = nix::unistd::User::from_uid(available_user.uid())?.ok_or_else(|| {
-            anyhow::anyhow!("User not found in system when attempting to update user",)
-        })?;
+        let Some(linux_user) = nix::unistd::User::from_uid(available_user.uid())? else {
+            // The account is known in the store but gone from the system, e.g. deleted by
+            // hand. Re-create it with the stored UID so files owned by the old account
+            // keep their owner.
+            tracing::info!("User no longer exists in the system, re-creating with stored UID");
+            return add_account(&gh_user.login, gh_user.id, Some(available_user.uid())).await;
+        };
 
         if gh_user.login == linux_user.name {
             return Ok(available_user.clone());
@@ -189,10 +202,14 @@ impl hannibal::Handler<RemoveAccount> for LinuxUserManager {
     ) -> anyhow::Result<()> {
         // The actor handles other messages between preparation and removal, so verify
         // again that the name still belongs to the stored user before userdel
-        let Some(_linux_user) = resolve_account_checked(&msg.user)? else {
+        let Some(linux_user) = resolve_account_checked(&msg.user)? else {
             tracing::warn!("User disappeared after deletion was prepared, nothing to do");
             return Ok(());
         };
+
+        // A process spawned between the preparation sweep and here (archiving can take
+        // a while) would make userdel fail, so sweep again right before it
+        kill_processes_for_user(&linux_user).await?;
 
         let proc = process::Command::new("/usr/sbin/userdel")
             .arg("--remove")

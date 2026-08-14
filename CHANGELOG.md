@@ -19,6 +19,12 @@
   ([#17](https://github.com/jonasehrlich/octosync/pull/17))
 - Implement mapping GitHub teams to Linux groups with `--group <gh-team-slug>:<linux-group>`
   ([#20](https://github.com/jonasehrlich/octosync/pull/20))
+- Re-create stored users whose account disappeared from the system, passing the stored UID to
+  `useradd` so file ownership survives a delete and re-create cycle
+  ([#19](https://github.com/jonasehrlich/octosync/pull/19))
+- Kill a user's processes a second time right before `userdel`, so a process spawned while the home
+  directory was archived cannot fail the deletion
+  ([#19](https://github.com/jonasehrlich/octosync/pull/19))
 
 ## v0.3.0
 
