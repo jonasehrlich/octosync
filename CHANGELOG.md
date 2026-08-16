@@ -28,10 +28,11 @@
   ([#15](https://github.com/jonasehrlich/octosync/pull/15))
 - GitHub teams can now be mapped to Linux groups with `--group <gh-team-slug>:<linux-group>`.
   ([#20](https://github.com/jonasehrlich/octosync/pull/20))
-- `users.json` is automatically migrated to a versioned v2 format that records departed and purged
+- Synchronization migrates `users.json` to a versioned v2 format that records departed and purged
   members. The original v1 file is backed up once as `users-v1.json`.
   ([#22](https://github.com/jonasehrlich/octosync/pull/22),
-  [#25](https://github.com/jonasehrlich/octosync/pull/25))
+  [#25](https://github.com/jonasehrlich/octosync/pull/25),
+  [#28](https://github.com/jonasehrlich/octosync/pull/28))
 
 ## v0.3.0
 

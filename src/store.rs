@@ -1,7 +1,7 @@
 use anyhow::Context as _;
 use nix::unistd;
 use serde::{Deserialize, Serialize};
-use std::{collections, path};
+use std::{collections, path, sync};
 use tokio::{fs, io};
 
 mod uid_serde {
@@ -262,6 +262,11 @@ pub struct UserStore {
     /// user ID. Kept separate from `departed` so the expiry reconciliation and the
     /// purge can never fight over an entry.
     purged: PurgedMap,
+    /// Whether a v1 file was loaded whose backup is still outstanding. Loading must not
+    /// touch the data directory, so the copy that keeps a rollback to a pre-v2 binary
+    /// possible is deferred to the first save. The save that performs it clears the
+    /// flag, so a later save cannot overwrite the backup with the v2 file.
+    migrated_from_v1: sync::atomic::AtomicBool,
 }
 
 impl UserStore {
@@ -274,6 +279,7 @@ impl UserStore {
             users: UserMap::new(),
             departed: DepartedMap::new(),
             purged: PurgedMap::new(),
+            migrated_from_v1: sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -419,8 +425,10 @@ impl UserStore {
                         path.display()
                     )
                 })?;
-                // Preserve rollback compatibility before the next v2 save.
-                self.backup_v1_file().await?;
+                // Loading writes nothing; the save that rewrites the file as v2 takes
+                // the backup that keeps a rollback possible.
+                self.migrated_from_v1
+                    .store(true, sync::atomic::Ordering::Relaxed);
                 StoreData {
                     users,
                     departed: DepartedMap::new(),
@@ -465,6 +473,14 @@ impl UserStore {
         if self.dry_run {
             tracing::info!("Dry run: not writing the users database");
             return Ok(());
+        }
+        // The file on disk is still v1 until the write below replaces it, so this is the
+        // last moment at which it can be preserved for a rollback.
+        if self
+            .migrated_from_v1
+            .swap(false, sync::atomic::Ordering::Relaxed)
+        {
+            self.backup_v1_file().await?;
         }
         let content = serde_json::to_string_pretty(&StoreDataRef {
             version: STORE_VERSION,
@@ -695,8 +711,10 @@ mod tests {
             assert!(!temp_dir.path().join(USERS_V1_FILE_NAME).exists());
         }
 
+        /// Loading a v1 file migrates it in memory only: a read, and a `--dry-run` in
+        /// particular, must not write anything into the data directory.
         #[tokio::test]
-        async fn v1_file_is_migrated_and_backed_up() {
+        async fn v1_file_is_migrated_in_memory_without_writing() {
             let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
             write_users_file(temp_dir.path(), &v1_content()).await;
 
@@ -710,16 +728,32 @@ mod tests {
                 "testuser"
             );
             assert!(store.departed.is_empty());
-
-            // The backup preserves the v1 file byte for byte
-            let backup = fs::read_to_string(temp_dir.path().join(USERS_V1_FILE_NAME))
+            assert!(!temp_dir.path().join(USERS_V1_FILE_NAME).exists());
+            // The file itself is untouched until a save rewrites it
+            let on_disk = fs::read_to_string(temp_dir.path().join(USERS_FILE_NAME))
                 .await
-                .expect("Backup file was not created");
-            assert_eq!(backup, v1_content());
+                .unwrap();
+            assert_eq!(on_disk, v1_content());
+        }
+
+        /// A dry run over a v1 file leaves the data directory exactly as it found it.
+        #[tokio::test]
+        async fn dry_run_over_a_v1_file_creates_no_files() {
+            let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
+            write_users_file(temp_dir.path(), &v1_content()).await;
+
+            let store = UserStore::from_dir(temp_dir.path(), true).await.unwrap();
+            store.save().await.expect("Dry-run save must succeed");
+
+            assert!(!temp_dir.path().join(USERS_V1_FILE_NAME).exists());
+            let on_disk = fs::read_to_string(temp_dir.path().join(USERS_FILE_NAME))
+                .await
+                .unwrap();
+            assert_eq!(on_disk, v1_content());
         }
 
         #[tokio::test]
-        async fn save_after_v1_migration_writes_v2() {
+        async fn save_after_v1_migration_writes_v2_and_backs_up_v1() {
             let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
             write_users_file(temp_dir.path(), &v1_content()).await;
 
@@ -734,6 +768,29 @@ mod tests {
             assert!(value["users"]["12345"].is_object());
             assert_eq!(value["departed"], serde_json::json!({}));
             assert_eq!(value["purged"], serde_json::json!({}));
+
+            // The rollback copy preserves the v1 file byte for byte
+            let backup = fs::read_to_string(temp_dir.path().join(USERS_V1_FILE_NAME))
+                .await
+                .expect("Backup file was not created");
+            assert_eq!(backup, v1_content());
+        }
+
+        /// The backup is taken by the first save only: a second save must not copy the
+        /// v2 file over the rollback copy of the v1 one.
+        #[tokio::test]
+        async fn second_save_does_not_overwrite_the_v1_backup() {
+            let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
+            write_users_file(temp_dir.path(), &v1_content()).await;
+
+            let store = UserStore::from_dir(temp_dir.path(), false).await.unwrap();
+            store.save().await.expect("Failed to save store");
+            store.save().await.expect("Failed to save store again");
+
+            let backup = fs::read_to_string(temp_dir.path().join(USERS_V1_FILE_NAME))
+                .await
+                .unwrap();
+            assert_eq!(backup, v1_content());
         }
 
         #[tokio::test]
