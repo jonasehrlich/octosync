@@ -2,37 +2,51 @@
 
 ## Unreleased
 
-- Departed members are now locked out instead of immediately deleted: octosync expires their
-  account, ends their sessions, removes their crontab and queued `at` jobs, and strips supplementary
-  groups while keeping the account and home directory intact. Rejoining reverses the expiry and
-  restores access to the same files and IDs. The `delete` command now follows this reversible
-  departure flow as well. ([#25](https://github.com/jonasehrlich/octosync/pull/25))
-- Expired accounts are permanently purged after a configurable retention period (180 days by
-  default), either during sync or with the new `purge` command. Purging removes the home directory
-  without an archive, but reserves the departed member's UID and GID for a later rejoin.
-  ([#25](https://github.com/jonasehrlich/octosync/pull/25))
-- Sync no longer offboards members because their processing or key fetch failed, and refuses a sync
-  that would expire every stored user. Dry runs no longer write preview state to `users.json`.
+- Account lifecycle now separates member departure from permanent account deletion.
+  ([#25](https://github.com/jonasehrlich/octosync/pull/25),
+  [#28](https://github.com/jonasehrlich/octosync/pull/28))
+  - Departed members are disabled instead of immediately deleted. octosync blocks new logins, ends
+    sessions and processes, removes scheduled work and supplementary groups, and preserves the
+    account and home directory.
+  - Rejoining restores the account and its files.
+  - Despite its name, the `delete` command uses the reversible departure flow.
+  - Accounts disabled beyond the configurable retention period of 180 days by default are eligible
+    for purge. Purge can run during sync or through the new `purge` command.
+  - Purge permanently deletes the account and home directory without an archive. An interrupted
+    account deletion resumes from its stored marker.
+- Synchronization now protects against incomplete membership updates.
   ([#15](https://github.com/jonasehrlich/octosync/pull/15),
   [#17](https://github.com/jonasehrlich/octosync/pull/17),
-  [#25](https://github.com/jonasehrlich/octosync/pull/25))
-- Account identity is preserved across departures, manual account removal and rejoins. octosync
-  restores stored UIDs and GIDs, prevents their reuse by other members, and refuses unsafe login or
-  ID collisions rather than modifying the wrong account.
+  [#25](https://github.com/jonasehrlich/octosync/pull/25),
+  [#28](https://github.com/jonasehrlich/octosync/pull/28))
+  - A failed member update does not disable the member.
+  - Membership data that would disable every stored account is rejected before accounts are changed.
+- Account identity is preserved across departures, manual account deletion and rejoins.
   ([#19](https://github.com/jonasehrlich/octosync/pull/19),
   [#22](https://github.com/jonasehrlich/octosync/pull/22),
   [#25](https://github.com/jonasehrlich/octosync/pull/25))
-- GitHub SSH keys are now fetched through the authenticated client and updated inside an
-  octosync-managed block, preserving manually managed keys. Existing keys survive fetch failures,
-  and updates are atomic and protected against unsafe permissions and symlinks.
-  ([#15](https://github.com/jonasehrlich/octosync/pull/15))
+  - Stored UIDs and GIDs are restored when an account is recreated.
+  - IDs assigned to departed members cannot be reused by other members.
+  - Unsafe login or ID collisions are rejected rather than modifying the wrong account.
+- SSH authorized key handling now distinguishes routine synchronization from account departure.
+  ([#15](https://github.com/jonasehrlich/octosync/pull/15),
+  [#28](https://github.com/jonasehrlich/octosync/pull/28))
+  - Routine synchronization fetches keys through the authenticated GitHub client and updates an
+    octosync-managed block while preserving manually managed keys.
+  - Existing keys remain in place when fetching fails.
+  - Writes are atomic, enforce ownership and permissions, and cannot be redirected through symlinks
+    or replacement of the `.ssh` directory.
+  - Departure removes the entire `authorized_keys` file, including manually managed keys. Rejoining
+    recreates it from the member's fetched GitHub keys.
 - GitHub teams can now be mapped to Linux groups with `--group <gh-team-slug>:<linux-group>`.
   ([#20](https://github.com/jonasehrlich/octosync/pull/20))
-- Synchronization migrates `users.json` to a versioned v2 format that records departed and purged
-  members. The original v1 file is backed up once as `users-v1.json`.
+- Synchronization migrates `users.json` to a versioned v2 format.
   ([#22](https://github.com/jonasehrlich/octosync/pull/22),
   [#25](https://github.com/jonasehrlich/octosync/pull/25),
   [#28](https://github.com/jonasehrlich/octosync/pull/28))
+  - The v2 format records active members, departed members and members whose accounts were
+    permanently deleted.
+  - The original v1 file is backed up during the write as `users-v1.json`.
 
 ## v0.3.0
 
