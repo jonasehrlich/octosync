@@ -388,7 +388,11 @@ impl hannibal::Handler<ExpireAccount> for LinuxUserManager {
         let groups = strip_supplementary_groups(&linux_user).await;
 
         // Remove both fetched and manually configured SSH access.
-        let keys = crate::authorized_keys::remove_authorized_keys(&linux_user);
+        let keys = tokio::task::spawn_blocking(move || {
+            crate::authorized_keys::remove_authorized_keys(&linux_user)
+        })
+        .await
+        .context("Authorized keys removal task failed")?;
 
         scheduled_jobs.and(sweep).and(groups).and(keys)
     }
@@ -707,7 +711,11 @@ impl hannibal::Handler<UpdateAuthorizedKeys> for LinuxUserManager {
                 msg.user.name()
             );
         };
-        crate::authorized_keys::update_authorized_keys(&linux_user, &msg.keys).await
+        tokio::task::spawn_blocking(move || {
+            crate::authorized_keys::update_authorized_keys(&linux_user, &msg.keys)
+        })
+        .await
+        .context("Authorized keys update task failed")?
     }
 }
 
