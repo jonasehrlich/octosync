@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.4.0 2026-08-16
+## v0.4.0
 
 - Account lifecycle now separates member departure from permanent account deletion.
   ([#25](https://github.com/jonasehrlich/octosync/pull/25),
