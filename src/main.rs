@@ -118,7 +118,7 @@ struct Cli {
     command: Commands,
 }
 
-/// Number of days an account stays expired before a purge removes it
+/// Number of days an account stays disabled before it is eligible for purge.
 const DEFAULT_PURGE_AFTER_DAYS: u32 = 180;
 
 /// Arguments for the sync subcommand
@@ -131,8 +131,8 @@ struct SyncArgs {
     /// To map GitHub teams to Linux user groups use `--group <gh-team-slug>:<linux-group>`.
     #[arg(long, value_parser = clap::value_parser!(groups::GroupMapping), verbatim_doc_comment)]
     group: Vec<groups::GroupMapping>,
-    /// Days a departed member's account must have been expired before the purge at the
-    /// end of the sync removes the account and its home directory permanently
+    /// Days a departed member's account must remain disabled before the purge at the
+    /// end of sync permanently deletes the account and home directory.
     #[arg(long, default_value_t = DEFAULT_PURGE_AFTER_DAYS)]
     purge_after_days: u32,
 }
@@ -142,7 +142,7 @@ struct SyncArgs {
 struct PurgeArgs {
     #[command(flatten)]
     octocrab: InstallationClientArgs,
-    /// Days a departed member's account must have been expired before it is purged
+    /// Days a departed member's account must remain disabled before it can be purged.
     #[arg(long, default_value_t = DEFAULT_PURGE_AFTER_DAYS)]
     purge_after_days: u32,
 }
@@ -151,10 +151,9 @@ struct PurgeArgs {
 enum Commands {
     /// Synchronize GitHub organization members with Linux user accounts
     Sync(SyncArgs),
-    /// Expire all octosync-managed Linux user accounts and record their departure
+    /// Record every managed member as departed and disable their Linux account.
     Delete,
-    /// Permanently remove the accounts and home directories of members who departed
-    /// longer than the retention period ago
+    /// Permanently delete accounts and home directories after the retention period.
     Purge(PurgeArgs),
 }
 

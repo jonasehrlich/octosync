@@ -3,7 +3,7 @@
 
 use crate::store;
 use crate::user_manager::{
-    AccountIds, CreateUser, EnsureGroupsExist, ExpireAccount, PurgeAccount, PurgeOutcome,
+    AccountIds, CreateUser, DisableAccount, EnsureGroupsExist, PurgeAccount, PurgeOutcome,
     SyncSupplementaryGroups, UpdateAuthorizedKeys, UpdateUser,
 };
 
@@ -103,20 +103,20 @@ impl hannibal::Handler<UpdateUser> for MockUserManager {
     }
 }
 
-impl hannibal::Handler<ExpireAccount> for MockUserManager {
+impl hannibal::Handler<DisableAccount> for MockUserManager {
     #[tracing::instrument(
-        name = "UserManager::expire_account",
+        name = "UserManager::disable_account",
         skip_all,
         fields(user = %msg.user.name(), uid = msg.user.uid().as_raw())
     )]
     async fn handle(
         &mut self,
         _ctx: &mut hannibal::Context<Self>,
-        msg: ExpireAccount,
+        msg: DisableAccount,
     ) -> anyhow::Result<()> {
         tracing::info!(
-            "Would expire the account, remove its scheduled work, end its sessions and strip \
-             its supplementary groups"
+            "Would disable the account, remove its authorized keys and scheduled work, end its \
+             sessions, and remove its supplementary groups"
         );
         Ok(())
     }
@@ -133,10 +133,10 @@ impl hannibal::Handler<PurgeAccount> for MockUserManager {
         _ctx: &mut hannibal::Context<Self>,
         msg: PurgeAccount,
     ) -> anyhow::Result<PurgeOutcome> {
-        // The account-side shadow-expiry check needs a real account, so the preview
-        // reports the purge the store-side eligibility selected
-        tracing::info!("Would purge the expired account and its home directory");
-        Ok(PurgeOutcome::Purged)
+        // The shadow-expiry check needs a real account, so preview mode reports the
+        // permanent deletion selected by the store-side eligibility checks.
+        tracing::info!("Would permanently delete the disabled account and its home directory");
+        Ok(PurgeOutcome::Deleted)
     }
 }
 

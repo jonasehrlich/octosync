@@ -2,7 +2,7 @@
 
 use crate::store;
 use crate::user_manager::{
-    AccountIds, CreateUser, EnsureGroupsExist, ExpireAccount, PurgeAccount, PurgeOutcome,
+    AccountIds, CreateUser, DisableAccount, EnsureGroupsExist, PurgeAccount, PurgeOutcome,
     SyncSupplementaryGroups, UpdateAuthorizedKeys, UpdateUser, supplementary_groups_update,
 };
 use anyhow::Context as _;
@@ -64,7 +64,7 @@ impl hannibal::Handler<CreateUser> for LinuxUserManager {
 /// Check that a pre-existing account with the GitHub login may be adopted.
 ///
 /// Adopting an account whose IDs differ from a rejoining member's stored ones, or
-/// whose IDs another user's tombstone reserves, would create an ownership drift between the users.
+/// whose IDs are retained for another departed member, would create an ownership drift.
 fn verify_adoption(existing: &nix::unistd::User, ids: &AccountIds) -> anyhow::Result<()> {
     match ids {
         AccountIds::Stored { uid, gid } => {
@@ -95,8 +95,8 @@ fn verify_adoption(existing: &nix::unistd::User, ids: &AccountIds) -> anyhow::Re
         } => {
             if reserved_uids.contains(&existing.uid) || reserved_gids.contains(&existing.gid) {
                 anyhow::bail!(
-                    "User '{}' already exists with UID {} and GID {}, which a departed user's \
-                     tombstone reserves, refusing to adopt the account",
+                    "User '{}' already exists with UID {} and GID {}, which are retained for a \
+                     departed member. Refusing to adopt the account",
                     existing.name,
                     existing.uid,
                     existing.gid
@@ -110,11 +110,11 @@ fn verify_adoption(existing: &nix::unistd::User, ids: &AccountIds) -> anyhow::Re
 /// Number of candidates to probe before giving up the search for a free ID
 const FREE_ID_ATTEMPTS: u32 = 10_000;
 
-/// Create an account without re-using IDs reserved by tombstones.
+/// Create an account without reusing IDs retained for departed members.
 ///
-/// If an account is created with a UID or GID that a departed user's tombstone reserves, the
-/// new account may own files and directories that the departed user should still control.
-/// Thus the account is deleted and the function searches for a free UID / GID pair.
+/// If an account is created with a retained UID or GID, it may own files and directories
+/// that still belong to the departed member. Delete that new account immediately and
+/// create it again with a free UID/GID pair.
 async fn add_account_with_fresh_ids(
     login: &str,
     reserved_uids: &collections::HashSet<nix::unistd::Uid>,
@@ -356,24 +356,24 @@ impl hannibal::Handler<UpdateUser> for LinuxUserManager {
     }
 }
 
-impl hannibal::Handler<ExpireAccount> for LinuxUserManager {
+impl hannibal::Handler<DisableAccount> for LinuxUserManager {
     #[tracing::instrument(
-        name = "UserManager::expire_account",
+        name = "UserManager::disable_account",
         skip_all,
         fields(user = %msg.user.name(), uid = msg.user.uid().as_raw())
     )]
     async fn handle(
         &mut self,
         _ctx: &mut hannibal::Context<Self>,
-        msg: ExpireAccount,
+        msg: DisableAccount,
     ) -> anyhow::Result<()> {
         let AccountResolution::Matches(linux_user) = resolve_account(&msg.user, None)? else {
-            tracing::warn!("User not found in system when attempting to expire, nothing to do");
+            tracing::warn!("User not found while attempting to disable the account. Nothing to do");
             return Ok(());
         };
 
-        // Block new sessions before tearing down existing work.
-        expire_account(&linux_user.name).await?;
+        // Block new sessions before ending existing work.
+        disable_account(&linux_user.name).await?;
 
         // Run independent cleanup steps before returning the first error.
 
@@ -616,14 +616,14 @@ impl hannibal::Handler<PurgeAccount> for LinuxUserManager {
             return Ok(PurgeOutcome::NoAccount);
         };
 
-        // Reactivation clears the shadow expiry, preventing a live account from being purged.
-        if !account_is_expired(&linux_user.name, msg.expired_before)? {
-            return Ok(PurgeOutcome::NotExpired);
+        // Reactivation clears the shadow expiry, preventing an active account from being deleted.
+        if !shadow_expired_by(&linux_user.name, msg.disabled_before)? {
+            return Ok(PurgeOutcome::NotDisabledLongEnough);
         }
 
-        // The account has been expired for the whole retention period, so nothing is
-        // left to shut down cleanly into. userdel decides whether the account is busy,
-        // so a failed sweep is only logged.
+        // The account has been disabled for the whole retention period. `userdel`
+        // decides whether it can be deleted, so a failed final process sweep is logged
+        // without replacing that authoritative result.
         if let Err(e) = force_kill_processes_for_user(&linux_user).await {
             tracing::warn!("Failed to sweep processes before userdel: {e:#}");
         }
@@ -636,13 +636,13 @@ impl hannibal::Handler<PurgeAccount> for LinuxUserManager {
             .context("Failed to wait for userdel command to finish")?;
         if !o.status.success() {
             anyhow::bail!(
-                "Failed to purge user '{}': {}",
+                "Failed to permanently delete account '{}': {}",
                 linux_user.name,
                 String::from_utf8_lossy(&o.stderr)
             );
         }
-        tracing::info!("Purged the expired account and its home directory");
-        Ok(PurgeOutcome::Purged)
+        tracing::info!("Permanently deleted the disabled account and its home directory");
+        Ok(PurgeOutcome::Deleted)
     }
 }
 
@@ -736,6 +736,9 @@ impl hannibal::Handler<UpdateAuthorizedKeys> for LinuxUserManager {
         _ctx: &mut hannibal::Context<Self>,
         msg: UpdateAuthorizedKeys,
     ) -> anyhow::Result<()> {
+        // Writing into a home directory is a mutation like any other, so the stored name
+        // and UID have to agree before it happens: a reassigned UID would otherwise put
+        // one member's keys into an unrelated account's home.
         let AccountResolution::Matches(linux_user) = resolve_account(&msg.user, None)? else {
             anyhow::bail!(
                 "User '{}' was not found while updating authorized_keys",
@@ -855,10 +858,11 @@ async fn sync_user_supplementary_groups_by_name(
 
 const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
 
-/// Expire the account as of yesterday; existing sessions are handled separately.
-async fn expire_account(name: &str) -> anyhow::Result<()> {
+/// Disable the account by setting its shadow expiry to yesterday.
+/// Existing sessions are handled separately.
+async fn disable_account(name: &str) -> anyhow::Result<()> {
     let expire_at = chrono::Utc::now() - chrono::Duration::days(1);
-    if account_is_expired(name, expire_at)? {
+    if shadow_expired_by(name, expire_at)? {
         return Ok(());
     }
     let output = process::Command::new("/usr/sbin/usermod")
@@ -872,18 +876,19 @@ async fn expire_account(name: &str) -> anyhow::Result<()> {
 
     if !output.status.success() {
         anyhow::bail!(
-            "Failed to expire account '{}': {}",
+            "Failed to disable account '{}': {}",
             name,
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    tracing::info!("Expired account so no new session can start");
+    tracing::info!("Disabled account so no new session can start");
     Ok(())
 }
 
-/// Clear an effective expiry while preserving a future scheduled expiry.
+/// Reactivate an account by clearing an effective shadow expiry.
+/// A future scheduled expiry is preserved.
 async fn clear_departure_expiry(name: &str) -> anyhow::Result<()> {
-    if !account_is_expired(name, chrono::Utc::now())? {
+    if !shadow_expired_by(name, chrono::Utc::now())? {
         return Ok(());
     }
 
@@ -902,13 +907,13 @@ async fn clear_departure_expiry(name: &str) -> anyhow::Result<()> {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    tracing::info!("Cleared the expiry of the reactivated account");
+    tracing::info!("Reactivated the account by clearing its shadow expiry");
     Ok(())
 }
 
 /// Whether the shadow expiry is on or before `as_of`.
-fn account_is_expired(name: &str, as_of: chrono::DateTime<chrono::Utc>) -> anyhow::Result<bool> {
-    Ok(account_expire_days(name)?.is_some_and(|expire_days| expire_days <= shadow_days(as_of)))
+fn shadow_expired_by(name: &str, as_of: chrono::DateTime<chrono::Utc>) -> anyhow::Result<bool> {
+    Ok(shadow_expiry_days(name)?.is_some_and(|expire_days| expire_days <= shadow_days(as_of)))
 }
 
 fn shadow_days(timestamp: chrono::DateTime<chrono::Utc>) -> i64 {
@@ -924,7 +929,7 @@ const SHADOW_BUFFER_MAX: usize = 64 * 1024;
 ///
 /// The reentrant call writes into caller-owned storage instead of a static buffer, so
 /// correctness does not rest on no other thread in the process reading shadow entries.
-fn account_expire_days(name: &str) -> anyhow::Result<Option<i64>> {
+fn shadow_expiry_days(name: &str) -> anyhow::Result<Option<i64>> {
     let c_name = std::ffi::CString::new(name).context("User name contains an interior NUL byte")?;
     let mut entry = std::mem::MaybeUninit::<libc::spwd>::uninit();
     let mut buf = vec![0 as libc::c_char; SHADOW_BUFFER_SIZE];

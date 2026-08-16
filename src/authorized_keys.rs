@@ -30,7 +30,7 @@ const AUTHORIZED_KEYS_FILE_NAME: &str = "authorized_keys";
 /// the pinned `.ssh` directory, so the rename never crosses a resolvable path.
 const STAGING_FILE_NAME: &str = ".authorized_keys.octosync";
 
-/// The mode constants above are plain `u32`; [`Mode`] is backed by the platform's
+/// The mode constants above are plain `u32`. [`Mode`] is backed by the platform's
 /// `mode_t`, which is narrower on some targets.
 fn mode(bits: u32) -> Mode {
     Mode::from_bits_truncate(bits as mode_t)
@@ -293,7 +293,7 @@ impl DotSSHDirectory {
 /// re-rendered, so manual lines keep their position relative to it.
 ///
 /// A start marker without a matching end marker means the block was tampered with or an
-/// editor stripped it; everything after the start marker is treated as managed so stale
+/// editor stripped it. Everything after the start marker is treated as managed so stale
 /// fetched keys can not survive outside an intact block.
 fn split_around_managed_block(content: &str) -> (Vec<&str>, Vec<&str>) {
     let mut before = Vec::new();
@@ -543,8 +543,8 @@ mod tests {
 
         sync_authorized_keys(tmp.path(), &keys(&[KEY1]), uid, gid).expect("sync failed");
 
-        // The block is re-rendered at the position of the first one; the manual line that
-        // followed it keeps its place after the block
+        // The block is rendered at the position of the first one. The manual line that
+        // followed it keeps its place after the block.
         let content = fs::read_to_string(&path).expect("read failed");
         assert_eq!(
             content,
@@ -664,7 +664,7 @@ mod tests {
         assert!(!attacker_dir.join(AUTHORIZED_KEYS_FILE_NAME).exists());
     }
 
-    /// Expiring an account removes the complete file, including manual entries.
+    /// Disabling an account removes the complete file, including manual entries.
     #[test]
     fn departure_removes_all_authorized_keys() {
         let (tmp, ssh_dir) = home_with_ssh_dir();

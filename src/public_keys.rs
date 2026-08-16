@@ -14,7 +14,7 @@ struct UserKeyEntry {
 }
 
 /// An ordered set of validated SSH public keys. Keys with the same key data but different
-/// comments count as the same key; the first one wins.
+/// comments count as the same key. The first one wins.
 #[derive(Debug, Clone, Default)]
 pub struct PublicKeys {
     keys: Vec<ssh_key::PublicKey>,
