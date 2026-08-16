@@ -49,30 +49,30 @@ octosync fully manages the supplementary groups of synced users. On every sync t
 with the groups derived from the `--group` arguments, so memberships added through other channels
 are removed.
 
-### Departures: expiry instead of deletion
+### Departures disable accounts instead of deleting them
 
-When a member leaves the org, their account is not deleted. It is expired instead, which blocks both
-password and pubkey SSH logins, running sessions are ended, their crontab and queued `at` jobs are
-removed and the supplementary groups are stripped. The account and home directory stay on the
-machine as the durable departure record, so a wrong departure decision is a reversible lockout: a
-member who rejoins is synced back into their account with their files, UID and GID intact.
+When a member leaves the org, octosync disables the account by setting its shadow expiry. It also
+removes every authorized key, removes the crontab and queued `at` jobs, ends running sessions and
+processes, and removes supplementary groups. The account and home directory remain on the machine.
+The users database keeps a departure record, so a member who rejoins can be restored to the same
+account with their files, UID and GID intact.
 
 Sessions are ended through logind, which logs the user out cleanly and tears down their session
 scopes. On a machine without logind, such as a container, the SIGTERM/SIGKILL process sweep is the
 whole mechanism and the missing system bus is not reported as an error.
 
-Accounts that have been expired for longer than the retention period (180 days by default,
-configurable with `--purge-after-days`) are purged at the end of each sync: the account and its home
-directory are removed permanently and without an archive. A purge only happens when the tombstone in
-the users database and the account's own shadow expiry agree on the age of the departure and the
-member is absent from the fetched member list. The purge can also be run explicitly:
+Accounts that have been disabled for longer than the retention period (180 days by default,
+configurable with `--purge-after-days`) are eligible for purge at the end of each sync. Purging
+permanently deletes the account and home directory without an archive. It runs only when the stored
+departure date and the account's shadow expiry are both old enough, and the member is absent from
+the fetched member list. The purge can also be run explicitly:
 
 ```sh
 octosync purge --org <org-name> --app-id <app-id> --private-key <private-key.pem>
 ```
 
-Even after a purge the users database remembers the member's UID and GID, so a member rejoining
-later still gets their old IDs back, with an empty home directory.
+After permanent deletion, the users database still remembers the member's UID and GID. A member who
+rejoins later receives the same IDs with a new, empty home directory.
 
 ## Development
 

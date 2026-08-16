@@ -2,7 +2,7 @@
 
 use crate::store;
 use crate::user_manager::{
-    AccountIds, CreateUser, EnsureGroupsExist, ExpireAccount, PurgeAccount, PurgeOutcome,
+    AccountIds, CreateUser, DisableAccount, EnsureGroupsExist, PurgeAccount, PurgeOutcome,
     SyncSupplementaryGroups, UpdateAuthorizedKeys, UpdateUser, supplementary_groups_update,
 };
 use anyhow::Context as _;
@@ -64,7 +64,7 @@ impl hannibal::Handler<CreateUser> for LinuxUserManager {
 /// Check that a pre-existing account with the GitHub login may be adopted.
 ///
 /// Adopting an account whose IDs differ from a rejoining member's stored ones, or
-/// whose IDs another user's tombstone reserves, would create an ownership drift between the users.
+/// whose IDs are retained for another departed member, would create an ownership drift.
 fn verify_adoption(existing: &nix::unistd::User, ids: &AccountIds) -> anyhow::Result<()> {
     match ids {
         AccountIds::Stored { uid, gid } => {
@@ -95,8 +95,8 @@ fn verify_adoption(existing: &nix::unistd::User, ids: &AccountIds) -> anyhow::Re
         } => {
             if reserved_uids.contains(&existing.uid) || reserved_gids.contains(&existing.gid) {
                 anyhow::bail!(
-                    "User '{}' already exists with UID {} and GID {}, which a departed user's \
-                     tombstone reserves, refusing to adopt the account",
+                    "User '{}' already exists with UID {} and GID {}, which are retained for a \
+                     departed member. Refusing to adopt the account",
                     existing.name,
                     existing.uid,
                     existing.gid
@@ -110,11 +110,11 @@ fn verify_adoption(existing: &nix::unistd::User, ids: &AccountIds) -> anyhow::Re
 /// Number of candidates to probe before giving up the search for a free ID
 const FREE_ID_ATTEMPTS: u32 = 10_000;
 
-/// Create an account without re-using IDs reserved by tombstones.
+/// Create an account without reusing IDs retained for departed members.
 ///
-/// If an account is created with a UID or GID that a departed user's tombstone reserves, the
-/// new account may own files and directories that the departed user should still control.
-/// Thus the account is deleted and the function searches for a free UID / GID pair.
+/// If an account is created with a retained UID or GID, it may own files and directories
+/// that still belong to the departed member. Delete that new account immediately and
+/// create it again with a free UID/GID pair.
 async fn add_account_with_fresh_ids(
     login: &str,
     reserved_uids: &collections::HashSet<nix::unistd::Uid>,
@@ -356,24 +356,24 @@ impl hannibal::Handler<UpdateUser> for LinuxUserManager {
     }
 }
 
-impl hannibal::Handler<ExpireAccount> for LinuxUserManager {
+impl hannibal::Handler<DisableAccount> for LinuxUserManager {
     #[tracing::instrument(
-        name = "UserManager::expire_account",
+        name = "UserManager::disable_account",
         skip_all,
         fields(user = %msg.user.name(), uid = msg.user.uid().as_raw())
     )]
     async fn handle(
         &mut self,
         _ctx: &mut hannibal::Context<Self>,
-        msg: ExpireAccount,
+        msg: DisableAccount,
     ) -> anyhow::Result<()> {
         let AccountResolution::Matches(linux_user) = resolve_account(&msg.user, None)? else {
-            tracing::warn!("User not found in system when attempting to expire, nothing to do");
+            tracing::warn!("User not found while attempting to disable the account. Nothing to do");
             return Ok(());
         };
 
-        // Block new sessions before tearing down existing work.
-        expire_account(&linux_user.name).await?;
+        // Block new sessions before ending existing work.
+        disable_account(&linux_user.name).await?;
 
         // Run independent cleanup steps before returning the first error.
 
@@ -387,7 +387,14 @@ impl hannibal::Handler<ExpireAccount> for LinuxUserManager {
         // Remove access granted through supplementary groups.
         let groups = strip_supplementary_groups(&linux_user).await;
 
-        scheduled_jobs.and(sweep).and(groups)
+        // Remove both fetched and manually configured SSH access.
+        let keys = tokio::task::spawn_blocking(move || {
+            crate::authorized_keys::remove_authorized_keys(&linux_user)
+        })
+        .await
+        .context("Authorized keys removal task failed")?;
+
+        scheduled_jobs.and(sweep).and(groups).and(keys)
     }
 }
 
@@ -459,22 +466,34 @@ async fn terminate_logind_user(connection: &zbus::Connection, uid: u32) -> anyho
 
 /// Remove `cron` and `at` jobs that can outlive login sessions.
 ///
-/// Expiring the account already blocks the PAM account check `cron` and `at` perform, so
+/// The shadow expiry already blocks the PAM account check `cron` and `at` perform, so
 /// this is the second half of that guarantee rather than the only one, and it also
 /// covers a machine whose `cron` does not consult PAM.
 async fn remove_scheduled_jobs(user: &nix::unistd::User) -> anyhow::Result<()> {
-    remove_crontab(&user.name).await?;
-    remove_at_jobs(&user.name).await
+    // The two schedulers are independent, so a crontab that could not be removed must
+    // not leave the queued `at` jobs in place as well.
+    let crontab = remove_crontab(&user.name).await;
+    let at_jobs = remove_at_jobs(&user.name).await;
+    crontab.and(at_jobs)
 }
 
 /// Remove the user's `crontab`
 ///
 /// List the `crontab` first to avoid treating absence as an error.
 async fn remove_crontab(name: &str) -> anyhow::Result<()> {
-    let Some(list) = optional_command("/usr/bin/crontab", &["-l", "-u", name]).await? else {
+    let Some(list) = optional_command("/usr/bin/crontab", ["-l", "-u", name]).await? else {
         return Ok(());
     };
     if !list.status.success() {
+        // A user without a crontab and an unreadable spool both exit non-zero, and only
+        // the first means there is nothing to remove. Reporting the rest keeps a
+        // permission or spool failure from silently leaving scheduled work behind.
+        if !is_missing_crontab(&list.stderr) {
+            anyhow::bail!(
+                "Failed to list the crontab of '{name}': {}",
+                String::from_utf8_lossy(&list.stderr)
+            );
+        }
         return Ok(());
     }
 
@@ -493,12 +512,22 @@ async fn remove_crontab(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether `crontab -l` reported an absent crontab rather than a failure.
+///
+/// There is no distinct exit code for it, so the message is the only signal. cronie and
+/// vixie-cron print "no crontab for <user>". busybox prints "no job for <user>".
+/// Anything else is treated as a real failure.
+fn is_missing_crontab(stderr: &[u8]) -> bool {
+    let stderr = String::from_utf8_lossy(stderr).to_lowercase();
+    stderr.contains("no crontab for") || stderr.contains("no job for")
+}
+
 /// Remove the user's queued `at` jobs from root's global listing.
 ///
 /// `atq` lists the jobs of every user with the owner in the last field, which is the only way to
 /// select one user's jobs for `atrm`.
 async fn remove_at_jobs(name: &str) -> anyhow::Result<()> {
-    let Some(queue) = optional_command("/usr/bin/atq", &[]).await? else {
+    let Some(queue) = optional_command("/usr/bin/atq", std::iter::empty::<&str>()).await? else {
         return Ok(());
     };
     if !queue.status.success() {
@@ -520,11 +549,16 @@ async fn remove_at_jobs(name: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let output = process::Command::new("/usr/bin/atrm")
-        .args(&job_ids)
-        .output()
-        .await
-        .context("Failed to wait for atrm command to finish")?;
+    // `atrm` ships with `atq`, so a machine that has one and not the other is broken
+    // rather than simply without `at`. Failing the whole departure cleanup over it
+    // would keep the account enabled, so report the queued jobs and continue.
+    let Some(output) = optional_command("/usr/bin/atrm", &job_ids).await? else {
+        tracing::warn!(
+            jobs = job_ids.len(),
+            "'atrm' is not installed, leaving the at jobs of '{name}' queued"
+        );
+        return Ok(());
+    };
     if !output.status.success() {
         anyhow::bail!(
             "Failed to remove the at jobs of '{name}': {}",
@@ -539,10 +573,14 @@ async fn remove_at_jobs(name: &str) -> anyhow::Result<()> {
 }
 
 /// Treat a missing optional command as no work to do.
-async fn optional_command(
+async fn optional_command<I, S>(
     program: &str,
-    args: &[&str],
-) -> anyhow::Result<Option<std::process::Output>> {
+    args: I,
+) -> anyhow::Result<Option<std::process::Output>>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
     match process::Command::new(program).args(args).output().await {
         Ok(output) => Ok(Some(output)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -578,14 +616,14 @@ impl hannibal::Handler<PurgeAccount> for LinuxUserManager {
             return Ok(PurgeOutcome::NoAccount);
         };
 
-        // Reactivation clears the shadow expiry, preventing a live account from being purged.
-        if !account_is_expired(&linux_user.name, msg.expired_before)? {
-            return Ok(PurgeOutcome::NotExpired);
+        // Reactivation clears the shadow expiry, preventing an active account from being deleted.
+        if !shadow_expired_by(&linux_user.name, msg.disabled_before)? {
+            return Ok(PurgeOutcome::NotDisabledLongEnough);
         }
 
-        // The account has been expired for the whole retention period, so nothing is
-        // left to shut down cleanly into. userdel decides whether the account is busy,
-        // so a failed sweep is only logged.
+        // The account has been disabled for the whole retention period. `userdel`
+        // decides whether it can be deleted, so a failed final process sweep is logged
+        // without replacing that authoritative result.
         if let Err(e) = force_kill_processes_for_user(&linux_user).await {
             tracing::warn!("Failed to sweep processes before userdel: {e:#}");
         }
@@ -598,13 +636,13 @@ impl hannibal::Handler<PurgeAccount> for LinuxUserManager {
             .context("Failed to wait for userdel command to finish")?;
         if !o.status.success() {
             anyhow::bail!(
-                "Failed to purge user '{}': {}",
+                "Failed to permanently delete account '{}': {}",
                 linux_user.name,
                 String::from_utf8_lossy(&o.stderr)
             );
         }
-        tracing::info!("Purged the expired account and its home directory");
-        Ok(PurgeOutcome::Purged)
+        tracing::info!("Permanently deleted the disabled account and its home directory");
+        Ok(PurgeOutcome::Deleted)
     }
 }
 
@@ -698,7 +736,20 @@ impl hannibal::Handler<UpdateAuthorizedKeys> for LinuxUserManager {
         _ctx: &mut hannibal::Context<Self>,
         msg: UpdateAuthorizedKeys,
     ) -> anyhow::Result<()> {
-        crate::authorized_keys::update_authorized_keys(&msg.user, &msg.keys).await
+        // Writing into a home directory is a mutation like any other, so the stored name
+        // and UID have to agree before it happens: a reassigned UID would otherwise put
+        // one member's keys into an unrelated account's home.
+        let AccountResolution::Matches(linux_user) = resolve_account(&msg.user, None)? else {
+            anyhow::bail!(
+                "User '{}' was not found while updating authorized_keys",
+                msg.user.name()
+            );
+        };
+        tokio::task::spawn_blocking(move || {
+            crate::authorized_keys::update_authorized_keys(&linux_user, &msg.keys)
+        })
+        .await
+        .context("Authorized keys update task failed")?
     }
 }
 
@@ -807,10 +858,11 @@ async fn sync_user_supplementary_groups_by_name(
 
 const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
 
-/// Expire the account as of yesterday; existing sessions are handled separately.
-async fn expire_account(name: &str) -> anyhow::Result<()> {
+/// Disable the account by setting its shadow expiry to yesterday.
+/// Existing sessions are handled separately.
+async fn disable_account(name: &str) -> anyhow::Result<()> {
     let expire_at = chrono::Utc::now() - chrono::Duration::days(1);
-    if account_is_expired(name, expire_at)? {
+    if shadow_expired_by(name, expire_at)? {
         return Ok(());
     }
     let output = process::Command::new("/usr/sbin/usermod")
@@ -824,18 +876,19 @@ async fn expire_account(name: &str) -> anyhow::Result<()> {
 
     if !output.status.success() {
         anyhow::bail!(
-            "Failed to expire account '{}': {}",
+            "Failed to disable account '{}': {}",
             name,
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    tracing::info!("Expired account so no new session can start");
+    tracing::info!("Disabled account so no new session can start");
     Ok(())
 }
 
-/// Clear an effective expiry while preserving a future scheduled expiry.
+/// Reactivate an account by clearing an effective shadow expiry.
+/// A future scheduled expiry is preserved.
 async fn clear_departure_expiry(name: &str) -> anyhow::Result<()> {
-    if !account_is_expired(name, chrono::Utc::now())? {
+    if !shadow_expired_by(name, chrono::Utc::now())? {
         return Ok(());
     }
 
@@ -854,32 +907,64 @@ async fn clear_departure_expiry(name: &str) -> anyhow::Result<()> {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    tracing::info!("Cleared the expiry of the reactivated account");
+    tracing::info!("Reactivated the account by clearing its shadow expiry");
     Ok(())
 }
 
 /// Whether the shadow expiry is on or before `as_of`.
-fn account_is_expired(name: &str, as_of: chrono::DateTime<chrono::Utc>) -> anyhow::Result<bool> {
-    Ok(account_expire_days(name)?.is_some_and(|expire_days| expire_days <= shadow_days(as_of)))
+fn shadow_expired_by(name: &str, as_of: chrono::DateTime<chrono::Utc>) -> anyhow::Result<bool> {
+    Ok(shadow_expiry_days(name)?.is_some_and(|expire_days| expire_days <= shadow_days(as_of)))
 }
 
 fn shadow_days(timestamp: chrono::DateTime<chrono::Utc>) -> i64 {
     timestamp.timestamp().div_euclid(SECONDS_PER_DAY)
 }
 
-/// Read the shadow expiry as days since the epoch through libc's `getspnam`.
-fn account_expire_days(name: &str) -> anyhow::Result<Option<i64>> {
+/// Initial size of the buffer `getspnam_r` writes the entry's strings into.
+const SHADOW_BUFFER_SIZE: usize = 1024;
+/// Refuse to grow the buffer past this. A shadow entry never approaches it.
+const SHADOW_BUFFER_MAX: usize = 64 * 1024;
+
+/// Read the shadow expiry as days since the epoch through libc's `getspnam_r`.
+///
+/// The reentrant call writes into caller-owned storage instead of a static buffer, so
+/// correctness does not rest on no other thread in the process reading shadow entries.
+fn shadow_expiry_days(name: &str) -> anyhow::Result<Option<i64>> {
     let c_name = std::ffi::CString::new(name).context("User name contains an interior NUL byte")?;
-    // SAFETY: getspnam returns a pointer into static storage, which is only unsound
-    // when another thread calls it concurrently. Every call site runs on the user
-    // manager actor, which processes one message at a time.
-    let entry = unsafe { libc::getspnam(c_name.as_ptr()) };
-    if entry.is_null() {
+    let mut entry = std::mem::MaybeUninit::<libc::spwd>::uninit();
+    let mut buf = vec![0 as libc::c_char; SHADOW_BUFFER_SIZE];
+
+    let found = loop {
+        let mut result: *mut libc::spwd = std::ptr::null_mut();
+        // SAFETY: every pointer refers to live local storage of the length passed
+        // alongside it, and getspnam_r only writes through them.
+        let rc = unsafe {
+            libc::getspnam_r(
+                c_name.as_ptr(),
+                entry.as_mut_ptr(),
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut result,
+            )
+        };
+        match rc {
+            // A null result with a successful call means no shadow entry exists.
+            0 => break !result.is_null(),
+            libc::ERANGE if buf.len() < SHADOW_BUFFER_MAX => {
+                buf.resize((buf.len() * 2).min(SHADOW_BUFFER_MAX), 0);
+            }
+            rc => {
+                return Err(std::io::Error::from_raw_os_error(rc))
+                    .with_context(|| format!("Failed to read the shadow entry of '{name}'"));
+            }
+        }
+    };
+
+    if !found {
         return Ok(None);
     }
-    // SAFETY: checked to be non-null above, and the field is copied out before any
-    // following getspnam call can overwrite the storage
-    let expire_days = unsafe { (*entry).sp_expire };
+    // SAFETY: a successful call with a non-null result initialized the entry
+    let expire_days = unsafe { entry.assume_init() }.sp_expire;
     // An empty expiry field is reported as -1
     Ok((expire_days >= 0).then_some(expire_days))
 }

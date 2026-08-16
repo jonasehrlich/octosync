@@ -9,7 +9,7 @@ pub mod backends;
 mod messages;
 
 pub use messages::{
-    AccountIds, CreateUser, EnsureGroupsExist, ExpireAccount, PurgeAccount, PurgeOutcome,
+    AccountIds, CreateUser, DisableAccount, EnsureGroupsExist, PurgeAccount, PurgeOutcome,
     SyncSupplementaryGroups, UpdateAuthorizedKeys, UpdateUser,
 };
 
@@ -22,7 +22,7 @@ use std::collections;
 pub struct UserManager {
     create_user: hannibal::Caller<CreateUser>,
     update_user: hannibal::Caller<UpdateUser>,
-    expire_account: hannibal::Caller<ExpireAccount>,
+    disable_account: hannibal::Caller<DisableAccount>,
     purge_account: hannibal::Caller<PurgeAccount>,
     sync_supplementary_groups: hannibal::Caller<SyncSupplementaryGroups>,
     ensure_groups_exist: hannibal::Caller<EnsureGroupsExist>,
@@ -59,7 +59,7 @@ impl UserManager {
     where
         A: hannibal::Handler<CreateUser>
             + hannibal::Handler<UpdateUser>
-            + hannibal::Handler<ExpireAccount>
+            + hannibal::Handler<DisableAccount>
             + hannibal::Handler<PurgeAccount>
             + hannibal::Handler<SyncSupplementaryGroups>
             + hannibal::Handler<EnsureGroupsExist>
@@ -70,7 +70,7 @@ impl UserManager {
         Self {
             create_user: addr.caller(),
             update_user: addr.caller(),
-            expire_account: addr.caller(),
+            disable_account: addr.caller(),
             purge_account: addr.caller(),
             sync_supplementary_groups: addr.caller(),
             ensure_groups_exist: addr.caller(),
@@ -106,9 +106,9 @@ impl UserManager {
             .context(ACTOR_ERROR)?
     }
 
-    pub async fn expire_user(&self, user: &store::User) -> anyhow::Result<()> {
-        self.expire_account
-            .call(ExpireAccount { user: user.clone() })
+    pub async fn disable_user(&self, user: &store::User) -> anyhow::Result<()> {
+        self.disable_account
+            .call(DisableAccount { user: user.clone() })
             .await
             .context(ACTOR_ERROR)?
     }
@@ -116,12 +116,12 @@ impl UserManager {
     pub async fn purge_user(
         &self,
         user: &store::User,
-        expired_before: chrono::DateTime<chrono::Utc>,
+        disabled_before: chrono::DateTime<chrono::Utc>,
     ) -> anyhow::Result<PurgeOutcome> {
         self.purge_account
             .call(PurgeAccount {
                 user: user.clone(),
-                expired_before,
+                disabled_before,
             })
             .await
             .context(ACTOR_ERROR)?
@@ -214,15 +214,15 @@ mod tests {
         #[tokio::test]
         async fn responses_are_returned_in_order() {
             let mut actor = backends::testing::TestingUserManager::default();
-            actor.expire_account.push_back(Ok(()));
+            actor.disable_account.push_back(Ok(()));
             actor
-                .expire_account
+                .disable_account
                 .push_back(Err(anyhow::anyhow!("scripted failure")));
             let manager = UserManager::testing(actor);
 
             let user = test_user(1, "alice");
-            manager.expire_user(&user).await.unwrap();
-            let err = manager.expire_user(&user).await.unwrap_err();
+            manager.disable_user(&user).await.unwrap();
+            let err = manager.disable_user(&user).await.unwrap_err();
             assert!(err.to_string().contains("scripted failure"));
         }
 
@@ -259,11 +259,11 @@ mod tests {
 
         impl hannibal::Actor for OverlapProbe {}
 
-        impl hannibal::Handler<ExpireAccount> for OverlapProbe {
+        impl hannibal::Handler<DisableAccount> for OverlapProbe {
             async fn handle(
                 &mut self,
                 _ctx: &mut hannibal::Context<Self>,
-                _msg: ExpireAccount,
+                _msg: DisableAccount,
             ) -> anyhow::Result<()> {
                 self.probe().await;
                 Ok(())
@@ -281,7 +281,7 @@ mod tests {
             }
         }
 
-        // The remaining messages are not exercised; the impls only complete the
+        // The remaining messages are not exercised. The impls only complete the
         // handler set `UserManager::from_actor` requires.
         impl hannibal::Handler<CreateUser> for OverlapProbe {
             async fn handle(
@@ -351,7 +351,7 @@ mod tests {
                 let user = &user;
                 async move {
                     if i % 2 == 0 {
-                        manager.expire_user(user).await
+                        manager.disable_user(user).await
                     } else {
                         manager.sync_supplementary_groups(user, &[]).await
                     }

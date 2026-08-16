@@ -18,7 +18,7 @@ pub enum AccountIds {
         uid: nix::unistd::Uid,
         gid: Option<nix::unistd::Gid>,
     },
-    /// Allocate fresh IDs without spending those reserved by tombstones.
+    /// Allocate fresh IDs without taking IDs retained for departed members.
     Fresh {
         reserved_uids: collections::HashSet<nix::unistd::Uid>,
         reserved_gids: collections::HashSet<nix::unistd::Gid>,
@@ -35,36 +35,37 @@ pub struct UpdateUser {
     pub available_user: store::User,
 }
 
-/// Reversibly expire a departed account and remove its active access.
+/// Reversibly disable a departed member's account and remove its active access.
 ///
-/// Verifies that the stored user matches the platform account and expires the account, which
-/// prevents logins and SSH key access. The account remains on the system and can be restored later.
+/// Verifies that the stored user matches the platform account, sets its shadow expiry,
+/// removes authorized keys and scheduled work, ends sessions and processes, and removes
+/// supplementary groups. The account and home directory remain and can be restored later.
 #[hannibal::message(response = anyhow::Result<()>)]
-pub struct ExpireAccount {
+pub struct DisableAccount {
     pub user: store::User,
 }
 
-/// Permanently remove a departed user's account and home directory once its shadow
-/// expiry meets the cutoff.
+/// Permanently delete a departed member's account and home directory once its shadow
+/// expiry is old enough.
 #[hannibal::message(response = anyhow::Result<PurgeOutcome>)]
 pub struct PurgeAccount {
     pub user: store::User,
-    /// Purge the account if it has been expired since before this timestamp.
+    /// Delete the account if its shadow expiry is on or before this timestamp.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub expired_before: chrono::DateTime<chrono::Utc>,
+    pub disabled_before: chrono::DateTime<chrono::Utc>,
 }
 
 /// Result of checking and applying a [`PurgeAccount`] operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PurgeOutcome {
-    /// The account and home directory were removed.
-    Purged,
+    /// The account and home directory were permanently deleted.
+    Deleted,
     /// No matching account exists.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     NoAccount,
-    /// The account expiry does not meet the cutoff.
+    /// The account is not disabled, or was disabled after the cutoff.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    NotExpired,
+    NotDisabledLongEnough,
 }
 
 /// Replace a user's supplementary groups, excluding their primary group.

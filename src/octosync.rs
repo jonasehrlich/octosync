@@ -115,13 +115,13 @@ impl Octosync {
         Ok(new_user)
     }
 
-    /// Create the platform user, re-using the tombstoned IDs when the member rejoined.
+    /// Create the platform user, reusing retained IDs when the member rejoins.
     ///
     /// A rejoin whose stored ID is taken fails and is retried on the next sync.
     ///
-    /// Falling back to fresh IDs would create an ownership drift that should be prevented by the
-    /// tombstones. A brand-new member must not be allocated an ID that a tombstone (departed or
-    /// purged) reserves either, so the reserved IDs are propagated to the creation.
+    /// Falling back to fresh IDs would break ownership of the member's existing files.
+    /// A brand-new member must not receive an ID retained for any departed member,
+    /// whether their account is disabled or already deleted.
     async fn create_user(
         &self,
         gh_user: &octocrab::models::Author,
@@ -129,32 +129,32 @@ impl Octosync {
     ) -> anyhow::Result<store::User> {
         // Refuse a recycled login for a different GitHub account, rather than expose the departed
         // member's account. This is something that needs to be solved by an operator.
-        if let Some(tombstone) = store
+        if let Some(departure) = store
             .departed()
             .values()
-            .find(|tombstone| tombstone.name() == gh_user.login)
-            && tombstone.id() != gh_user.id
+            .find(|departure| departure.name() == gh_user.login)
+            && departure.id() != gh_user.id
         {
             anyhow::bail!(
                 "Login '{}' belonged to the departed member with GitHub ID {}, but the joining \
                  member has GitHub ID {}: the login was recycled by a different person, refusing \
                  to create the user",
                 gh_user.login,
-                tombstone.id(),
+                departure.id(),
                 gh_user.id
             );
         }
 
-        // Departed members reuse their account, purged members reuse only its IDs.
+        // Departed members reuse their account. Members whose account was deleted reuse only IDs.
         let stored_ids = store
             .departed()
             .get(&gh_user.id)
-            .map(|tombstone| (tombstone.uid(), tombstone.gid()))
+            .map(|departure| (departure.uid(), departure.gid()))
             .or_else(|| {
                 store
-                    .purged()
+                    .deleted()
                     .get(&gh_user.id)
-                    .map(|tombstone| (tombstone.uid(), tombstone.gid()))
+                    .map(|deleted| (deleted.uid(), deleted.gid()))
             });
         let ids = match stored_ids {
             Some((uid, gid)) => {
@@ -169,13 +169,13 @@ impl Octosync {
                     .departed()
                     .values()
                     .map(store::DepartedUser::uid)
-                    .chain(store.purged().values().map(store::PurgedUser::uid))
+                    .chain(store.deleted().values().map(store::DeletedUser::uid))
                     .collect(),
                 reserved_gids: store
                     .departed()
                     .values()
                     .filter_map(store::DepartedUser::gid)
-                    .chain(store.purged().values().filter_map(store::PurgedUser::gid))
+                    .chain(store.deleted().values().filter_map(store::DeletedUser::gid))
                     .collect(),
             },
         };
@@ -196,19 +196,25 @@ impl Octosync {
         )?;
         tracing::info!("Successfully retrieved {} members", org_members.len());
 
-        if org_members.is_empty() && !old_store.data().is_empty() {
-            anyhow::bail!(
-                "Refusing to sync: org '{}' returned no members while {} users are stored. \
-                 Run the 'delete' command to expire all users intentionally.",
-                args.octocrab.org,
-                old_store.data().len()
-            );
-        }
-
         let org_member_map: collections::HashMap<octocrab::models::UserId, String> =
             collections::HashMap::from_iter(
                 org_members.iter().map(|user| (user.id, user.login.clone())),
             );
+
+        // Validate the fetched membership before changing the system. The later
+        // mass-departure safeguard only prevents account disablement. By then a bad
+        // member list could already have renamed accounts, rewritten keys or changed
+        // supplementary groups.
+        if membership_has_no_stored_users(old_store.data(), &org_member_map) {
+            anyhow::bail!(
+                "Refusing to sync: none of the {} stored users is in the fetched member list \
+                 of org '{}' ({} members). Nothing was changed on the system. Run the 'delete' \
+                 command to disable all users intentionally.",
+                old_store.data().len(),
+                args.octocrab.org,
+                org_members.len()
+            );
+        }
 
         // Create the resolved groups before the users are processed, so the per-user
         // group sync can rely on every managed group existing
@@ -231,15 +237,15 @@ impl Octosync {
             new_store.data_mut().insert(user.id(), user.clone());
         }
 
-        if would_expire_all_users(old_store.data(), &leavers) {
+        if would_disable_all_users(old_store.data(), &leavers) {
             for user in leavers {
                 new_store.data_mut().insert(user.id(), user.clone());
             }
             new_store.save().await?;
             anyhow::bail!(
-                "Refusing to expire all {} stored users in a single sync. None of them is in \
+                "Refusing to disable all {} stored users in a single sync. None of them is in \
                  the fetched member list of org '{}' ({} members). All users are kept in \
-                 the store; run the 'delete' command to expire them intentionally.",
+                 the store. Run the 'delete' command to disable them intentionally.",
                 old_store.data().len(),
                 args.octocrab.org,
                 org_members.len()
@@ -247,73 +253,127 @@ impl Octosync {
         }
 
         let leavers: Vec<store::User> = leavers.into_iter().cloned().collect();
-        self.depart_and_expire(&mut new_store, leavers).await?;
+        self.depart_and_disable(&mut new_store, leavers, &org_member_map)
+            .await?;
 
-        self.purge_expired(&mut new_store, &org_member_map, args.purge_after_days)
-            .await
+        self.purge_disabled_accounts(
+            &mut new_store,
+            &args.octocrab.org,
+            &org_member_map,
+            args.purge_after_days,
+        )
+        .await
     }
 
-    /// Permanently remove departed accounts once both the tombstone and account expiry
-    /// exceed the retention period. Current members are never purged.
-    async fn purge_expired(
+    /// Permanently delete departed accounts once both the recorded departure and the
+    /// account's shadow expiry exceed the retention period. Current members are never deleted.
+    async fn purge_disabled_accounts(
         &self,
         store: &mut store::UserStore,
+        org: &str,
         org_member_map: &collections::HashMap<octocrab::models::UserId, String>,
         purge_after_days: u32,
     ) -> anyhow::Result<()> {
+        // Every departure record appears eligible when the fetched membership is empty.
+        // An organization where the app is installed always has at least one member, so
+        // an empty result indicates a scoping, permission or API failure. This also
+        // protects a store with no active users left to exercise the sync-time guard.
+        if org_member_map.is_empty() {
+            anyhow::bail!(
+                "Refusing to purge: GitHub org '{org}' returned no members, which would make \
+                 every departure record eligible. No accounts were deleted.",
+            );
+        }
+
         let now = chrono::Utc::now();
         let cutoff = now - chrono::Duration::days(purge_after_days.into());
 
         let candidates: Vec<store::User> = store
             .departed()
             .values()
-            .filter(|tombstone| {
-                tombstone.departed_at() <= cutoff && !org_member_map.contains_key(&tombstone.id())
+            .filter(|departure| {
+                departure.departed_at() <= cutoff && !org_member_map.contains_key(&departure.id())
             })
             .map(store::User::from)
             .collect();
 
         for user in candidates {
+            // A marker from an earlier run proves that octosync started deleting this
+            // account and stopped before it could update the departure record.
+            let purge_was_interrupted = store
+                .departed()
+                .get(&user.id())
+                .is_some_and(|departure| departure.deletion_started_at().is_some());
+
+            // Persist the intent before `userdel` can make the account disappear, so an
+            // interruption between the two is not mistaken for an operator's removal.
+            if !purge_was_interrupted {
+                store.mark_deletion_started(&user.id(), now);
+                store.save().await?;
+            }
+
             match self.user_manager.purge_user(&user, cutoff).await {
-                Ok(user_manager::PurgeOutcome::Purged) => {
+                Ok(user_manager::PurgeOutcome::Deleted) => {
                     tracing::info!(
                         user = %user.name(),
                         uid = user.uid().as_raw(),
-                        "Purged the expired account after the retention period"
+                        "Permanently deleted the disabled account after the retention period"
                     );
-                    store.mark_purged(&user.id(), now);
+                    store.mark_deleted(&user.id(), now);
                 }
-                // Keep the tombstone until a purge succeeds.
-                Ok(user_manager::PurgeOutcome::NoAccount) => tracing::warn!(
-                    "No account for departed user '{}', not marking the tombstone purged",
-                    user.name()
-                ),
-                Ok(user_manager::PurgeOutcome::NotExpired) => tracing::warn!(
-                    "Account of '{}' has no shadow expiry older than the retention period, \
-                     not purging despite the tombstone age",
-                    user.name()
-                ),
-                // The tombstone stays departed, so the purge is retried on later syncs
+                // A missing account is only considered deleted by octosync when the
+                // persisted marker proves that an earlier purge started it. Otherwise an
+                // operator may have deleted the account independently.
+                Ok(user_manager::PurgeOutcome::NoAccount) if purge_was_interrupted => {
+                    tracing::info!(
+                        user = %user.name(),
+                        "Account was deleted during an interrupted purge. Completing the store update"
+                    );
+                    store.mark_deleted(&user.id(), now);
+                }
+                // Keep the departure record until octosync confirms account deletion.
+                Ok(user_manager::PurgeOutcome::NoAccount) => {
+                    tracing::warn!(
+                        "No account for departed user '{}'. Keeping the departure record",
+                        user.name()
+                    );
+                    store.clear_deletion_started(&user.id());
+                }
+                Ok(user_manager::PurgeOutcome::NotDisabledLongEnough) => {
+                    tracing::warn!(
+                        "Account of '{}' was not disabled before the retention cutoff. \
+                         Keeping the account and departure record",
+                        user.name()
+                    );
+                    store.clear_deletion_started(&user.id());
+                }
+                // Keep the marker because `userdel` can remove the account before
+                // reporting an error or timing out. The next run checks the account and
+                // can complete the store update if it is already gone.
                 Err(e) => {
                     tracing::error!("Failed to purge the account of '{}': {:?}", user.name(), e);
                 }
             }
+            // Persist this result before attempting another account.
+            store.save().await?;
         }
         store.save().await
     }
 
-    /// Persist new departures, then retry every unfinished account teardown. A tombstone only
-    /// carries the completion timestamp once [`user_manager::ExpireAccount`] succeeded, so a
-    /// teardown that failed or was interrupted is retried by the next sync without
-    /// in-memory retry state
-    async fn depart_and_expire(
+    /// Persist new departures, then retry every unfinished account disablement.
+    ///
+    /// A departure record receives its completion timestamp only after
+    /// [`user_manager::DisableAccount`] disables the account and removes its access. A
+    /// failed or interrupted operation is therefore retried by the next sync.
+    async fn depart_and_disable(
         &self,
         store: &mut store::UserStore,
         leavers: Vec<store::User>,
+        org_member_map: &collections::HashMap<octocrab::models::UserId, String>,
     ) -> anyhow::Result<()> {
         let departed_at = chrono::Utc::now();
         for user in leavers {
-            tracing::info!(user = %user.name(), "Recording departure, expiring the account");
+            tracing::info!(user = %user.name(), "Recording departure and disabling the account");
             store.depart_user(user, departed_at);
         }
         store.save().await?;
@@ -321,16 +381,27 @@ impl Octosync {
         let pending: Vec<store::User> = store
             .departed()
             .values()
-            .filter(|tombstone| tombstone.expired_at().is_none())
+            .filter(|departed| {
+                // A rejoining member whose account was already restored but whose group
+                // or key sync then failed is missing from the new store, so their
+                // unfinished departure survives this sync. Disabling the account again
+                // here would undo the reactivation, kill the member's
+                // processes and strip their groups over a transient failure.
+                departed.disabled_at().is_none() && !org_member_map.contains_key(&departed.id())
+            })
             .map(store::User::from)
             .collect();
 
-        // A failed teardown keeps its empty completion timestamp for the next sync.
+        // A failed disablement keeps its empty completion timestamp for the next sync.
         for user in pending {
-            match self.user_manager.expire_user(&user).await {
-                Ok(()) => store.mark_expired(&user.id(), chrono::Utc::now()),
+            match self.user_manager.disable_user(&user).await {
+                Ok(()) => store.mark_disabled(&user.id(), chrono::Utc::now()),
                 Err(e) => {
-                    tracing::error!("Failed to expire the account of '{}': {:?}", user.name(), e)
+                    tracing::error!(
+                        "Failed to disable the account of '{}': {:?}",
+                        user.name(),
+                        e
+                    )
                 }
             }
         }
@@ -347,7 +418,7 @@ impl Octosync {
     ) -> anyhow::Result<store::UserStore> {
         let mut new_store = store::UserStore::new(&self.data_dir, self.dry_run).await?;
         *new_store.departed_mut() = store.departed().clone();
-        *new_store.purged_mut() = store.purged().clone();
+        *new_store.deleted_mut() = store.deleted().clone();
         *new_store.data_mut() = stream::iter(org_members)
             .map(|gh_user| {
                 let groups = assignments.user_groups(gh_user.id);
@@ -365,7 +436,7 @@ impl Octosync {
             .map(|user| (user.id(), user))
             .collect()
             .await;
-        // Successful processing spends any tombstone for a rejoining member.
+        // Successful processing drops retained departure records for a rejoining member.
         new_store.prune_rejoined();
         Ok(new_store)
     }
@@ -375,12 +446,14 @@ impl Octosync {
         let mut store = store::UserStore::from_dir(&self.data_dir, self.dry_run).await?;
         let users: Vec<store::User> = store.data().values().cloned().collect();
         let count = users.len();
-        // The store file is kept: the tombstones preserve every UID so members
-        // re-created by a later sync get their old UID back
-        self.depart_and_expire(&mut store, users).await?;
+        // Despite the command name, this disables accounts rather than deleting them.
+        // The store keeps each departure and its IDs so a later rejoin can reactivate
+        // the same account. An empty membership is intentional here, so every active
+        // user is processed as departed.
+        self.depart_and_disable(&mut store, users, &collections::HashMap::new())
+            .await?;
         tracing::info!(
-            "Recorded {count} departures and expired their accounts, keeping the tombstones \
-             in the store"
+            "Recorded {count} departures and disabled their accounts. The accounts and homes remain"
         );
         Ok(())
     }
@@ -401,8 +474,13 @@ impl Octosync {
             collections::HashMap::from_iter(
                 org_members.iter().map(|user| (user.id, user.login.clone())),
             );
-        self.purge_expired(&mut store, &org_member_map, args.purge_after_days)
-            .await
+        self.purge_disabled_accounts(
+            &mut store,
+            &args.octocrab.org,
+            &org_member_map,
+            args.purge_after_days,
+        )
+        .await
     }
 }
 
@@ -419,8 +497,20 @@ fn partition_stale_users<'a>(
         .partition(|user| org_member_map.contains_key(&user.id()))
 }
 
-/// Refuse a sync that would expire every previously stored user.
-fn would_expire_all_users(
+/// Whether no stored user appears in the fetched membership.
+///
+/// This is the same failure [`would_disable_all_users`] catches, seen before any platform
+/// operation runs: a mis-scoped installation or a partially failed member list makes
+/// every managed account look departed. An empty store needs no guard.
+fn membership_has_no_stored_users(
+    stored: &collections::HashMap<octocrab::models::UserId, store::User>,
+    org_member_map: &collections::HashMap<octocrab::models::UserId, String>,
+) -> bool {
+    !stored.is_empty() && !stored.keys().any(|id| org_member_map.contains_key(id))
+}
+
+/// Refuse a sync that would disable every previously stored account.
+fn would_disable_all_users(
     old_users: &collections::HashMap<octocrab::models::UserId, store::User>,
     leavers: &[&store::User],
 ) -> bool {
@@ -526,13 +616,13 @@ mod tests {
             (octosync, data_dir)
         }
 
-        /// A dry run must not write the users database: new members would be
-        /// persisted with invented mock IDs and tombstone changes would be acted on
-        /// by a later real run.
+        /// A dry run must not write the users database. New members would otherwise be
+        /// persisted with invented mock IDs, and a later real run would act on previewed
+        /// departure changes.
         #[tokio::test]
         async fn dry_run_does_not_write_the_store() {
             let mut actor = TestingUserManager::default();
-            actor.expire_account.push_back(Ok(()));
+            actor.disable_account.push_back(Ok(()));
             let data_dir = tempfile::tempdir().unwrap();
             let octosync = Octosync {
                 data_dir: data_dir.path().to_path_buf(),
@@ -542,7 +632,7 @@ mod tests {
             let mut store = store::UserStore::new(data_dir.path(), true).await.unwrap();
 
             octosync
-                .depart_and_expire(&mut store, vec![user(1, "alice")])
+                .depart_and_disable(&mut store, vec![user(1, "alice")], &member_map(&[]))
                 .await
                 .unwrap();
 
@@ -633,8 +723,9 @@ mod tests {
             );
         }
 
-        /// A member whose processing fails must be left out of the new store, so
-        /// [`partition_stale_users`] keeps them for a retry instead of deleting them.
+        /// A member whose processing fails must be left out of the new store.
+        /// [`partition_stale_users`] then keeps the existing active record for a retry
+        /// instead of treating the member as departed.
         #[tokio::test]
         async fn process_members_leaves_a_failed_member_out_of_the_new_store() {
             let mut actor = TestingUserManager::default();
@@ -681,8 +772,8 @@ mod tests {
             assert_eq!(stored.name(), "alice");
         }
 
-        /// A rejoining member (present in the archived map, absent from the active
-        /// users) is created with the stored UID and GID and their tombstone is spent.
+        /// A rejoining member has a departure record but no active record. The account
+        /// is restored with its retained UID and GID, then the departure record is dropped.
         #[tokio::test]
         async fn process_members_recreates_a_rejoined_member_with_the_stored_ids() {
             let mut actor = TestingUserManager::default();
@@ -716,10 +807,10 @@ mod tests {
             assert!(new_store.departed().is_empty());
         }
 
-        /// A brand-new member's creation carries the IDs reserved by tombstones, so
-        /// the backend never allocates a departed user's UID or GID to them.
+        /// A brand-new member's creation carries IDs retained for departed members, so
+        /// the backend never assigns one of those UIDs or GIDs to the new account.
         #[tokio::test]
-        async fn process_members_reserves_archived_ids_for_a_new_member() {
+        async fn process_members_reserves_departed_ids_for_a_new_member() {
             let mut actor = TestingUserManager::default();
             actor.create_user.push_back(Ok(user(2, "bob")));
             actor.sync_supplementary_groups.push_back(Ok(()));
@@ -750,8 +841,8 @@ mod tests {
         }
 
         /// A departed member's login claimed by a different person must not adopt the
-        /// expired account: no user manager response is scripted, so the test also
-        /// proves the guard refuses before any platform operation runs.
+        /// disabled account. No user manager response is scripted, which also proves
+        /// the guard refuses before any platform operation runs.
         #[tokio::test]
         async fn recycled_login_of_a_departed_member_is_refused() {
             let (octosync, _data_dir) = octosync_with(TestingUserManager::default());
@@ -768,10 +859,10 @@ mod tests {
             assert!(err.to_string().contains("recycled"));
         }
 
-        /// Tombstones survive member processing structurally: a failed re-creation
-        /// leaves the tombstone in place for a retry on the next sync.
+        /// Departure records survive member processing. A failed account restoration
+        /// leaves the record in place for a retry on the next sync.
         #[tokio::test]
-        async fn process_members_keeps_the_tombstone_when_recreation_fails() {
+        async fn process_members_keeps_the_departure_when_restoration_fails() {
             let mut actor = TestingUserManager::default();
             actor
                 .create_user
@@ -800,85 +891,113 @@ mod tests {
             );
         }
 
-        /// A leaver is tombstoned and the store saved before the account is expired,
-        /// so an expiry failure leaves a durable tombstone instead of in-memory
+        /// A departure is saved before the account is disabled. A failure therefore
+        /// leaves a durable record for the next sync instead of relying on in-memory
         /// retry state.
         #[tokio::test]
-        async fn depart_and_expire_keeps_the_tombstone_when_expiry_fails() {
+        async fn depart_and_disable_keeps_the_record_when_disabling_fails() {
             let mut actor = TestingUserManager::default();
-            actor.expire_account.push_back(Err(anyhow::anyhow!("boom")));
+            actor
+                .disable_account
+                .push_back(Err(anyhow::anyhow!("boom")));
             let (octosync, data_dir) = octosync_with(actor);
             let mut store = store::UserStore::new(data_dir.path(), false).await.unwrap();
 
             octosync
-                .depart_and_expire(&mut store, vec![user(1, "alice")])
+                .depart_and_disable(&mut store, vec![user(1, "alice")], &member_map(&[]))
                 .await
                 .unwrap();
 
             let saved = store::UserStore::from_dir(data_dir.path(), false)
                 .await
                 .unwrap();
-            let tombstone = &saved.departed()[&octocrab::models::UserId(1)];
-            assert_eq!(tombstone.name(), "alice");
-            // No completion timestamp, so the next sync retries the teardown
-            assert!(tombstone.expired_at().is_none());
+            let departure = &saved.departed()[&octocrab::models::UserId(1)];
+            assert_eq!(departure.name(), "alice");
+            // No completion timestamp means the next sync retries the disablement.
+            assert!(departure.disabled_at().is_none());
             assert!(saved.data().is_empty());
         }
 
-        /// A tombstone whose teardown never completed is retried by a later sync, so a
-        /// failed or interrupted expiry converges without in-memory retry state.
+        /// A departure whose disablement never completed is retried by a later sync.
+        /// This lets a failed or interrupted operation converge without in-memory state.
         #[tokio::test]
-        async fn depart_and_expire_retries_an_unfinished_tombstone() {
+        async fn depart_and_disable_retries_an_unfinished_departure() {
             let mut actor = TestingUserManager::default();
-            actor.expire_account.push_back(Ok(()));
-            let expired_users = actor.expired_users.clone();
+            actor.disable_account.push_back(Ok(()));
+            let disabled_users = actor.disabled_users.clone();
             let (octosync, data_dir) = octosync_with(actor);
             let mut store = store::UserStore::new(data_dir.path(), false).await.unwrap();
             store.depart_user(user(1, "alice"), chrono::Utc::now());
 
-            // No leavers this sync, the unfinished tombstone alone drives the teardown
+            // No members left in this sync. The unfinished departure alone drives disablement.
             octosync
-                .depart_and_expire(&mut store, vec![])
+                .depart_and_disable(&mut store, vec![], &member_map(&[]))
                 .await
                 .unwrap();
 
-            assert_eq!(*expired_users.lock().unwrap(), ["alice"]);
+            assert_eq!(*disabled_users.lock().unwrap(), ["alice"]);
             assert!(
                 store.departed()[&octocrab::models::UserId(1)]
-                    .expired_at()
+                    .disabled_at()
                     .is_some()
             );
         }
 
-        /// A tombstone whose teardown completed is left alone for the rest of the
-        /// retention period, instead of paying the full teardown on every sync.
+        /// A rejoining member whose account was restored but whose group or key sync
+        /// then failed keeps their unfinished departure for this sync. Repeating account
+        /// disablement would undo the account restoration.
         #[tokio::test]
-        async fn depart_and_expire_skips_a_finished_tombstone() {
-            // No scripted response: reaching the actor would fail with "No scripted
-            // response left", which the loop only logs, so the assertion below is what
-            // proves the message is never sent
+        async fn depart_and_disable_skips_unfinished_departure_for_current_member() {
+            // No scripted response is provided. The assertion below proves the message
+            // is never sent.
             let actor = TestingUserManager::default();
-            let expired_users = actor.expired_users.clone();
+            let disabled_users = actor.disabled_users.clone();
+            let (octosync, data_dir) = octosync_with(actor);
+            let mut store = store::UserStore::new(data_dir.path(), false).await.unwrap();
+            let alice = user(1, "alice");
+            store.depart_user(alice.clone(), chrono::Utc::now());
+
+            octosync
+                .depart_and_disable(&mut store, vec![], &member_map(&[alice]))
+                .await
+                .unwrap();
+
+            assert!(disabled_users.lock().unwrap().is_empty());
+            // The departure remains unfinished for a later successful sync to remove.
+            assert!(
+                store.departed()[&octocrab::models::UserId(1)]
+                    .disabled_at()
+                    .is_none()
+            );
+        }
+
+        /// A completed disablement is not repeated during the retention period.
+        #[tokio::test]
+        async fn depart_and_disable_skips_a_finished_departure() {
+            // No scripted response is provided. The assertion below proves the message
+            // is never sent.
+            let actor = TestingUserManager::default();
+            let disabled_users = actor.disabled_users.clone();
             let (octosync, data_dir) = octosync_with(actor);
             let mut store = store::UserStore::new(data_dir.path(), false).await.unwrap();
             let now = chrono::Utc::now();
             store.depart_user(user(1, "alice"), now);
-            store.mark_expired(&octocrab::models::UserId(1), now);
+            store.mark_disabled(&octocrab::models::UserId(1), now);
 
             octosync
-                .depart_and_expire(&mut store, vec![])
+                .depart_and_disable(&mut store, vec![], &member_map(&[]))
                 .await
                 .unwrap();
 
-            assert!(expired_users.lock().unwrap().is_empty());
+            assert!(disabled_users.lock().unwrap().is_empty());
         }
 
-        /// The `delete` command tombstones every user instead of removing the store
-        /// file, so the UID memory survives a full wipe.
+        /// The `delete` command disables every account and retains each departure record,
+        /// so UIDs remain available for later account restoration.
         #[tokio::test]
-        async fn delete_command_keeps_the_store_file_with_tombstones() {
+        async fn delete_command_keeps_departure_records() {
             let mut actor = TestingUserManager::default();
-            actor.expire_account.push_back(Ok(()));
+            actor.disable_account.push_back(Ok(()));
             let (octosync, data_dir) = octosync_with(actor);
             let mut store = store::UserStore::new(data_dir.path(), false).await.unwrap();
             store
@@ -905,80 +1024,98 @@ mod tests {
         use crate::user_manager::{PurgeOutcome, backends::testing::TestingUserManager};
 
         const RETENTION_DAYS: u32 = 180;
+        const ORG: &str = "acme";
 
         /// A departure timestamp safely past the retention period
         fn old_departure() -> chrono::DateTime<chrono::Utc> {
             chrono::Utc::now() - chrono::Duration::days(RETENTION_DAYS as i64 + 30)
         }
 
+        /// A current member unrelated to the departure records under test. The purge
+        /// refuses an empty member list, so a different member represents a nonmember.
+        fn other_member() -> store::User {
+            user(99, "zoe")
+        }
+
         #[tokio::test]
-        async fn purges_a_tombstone_older_than_the_retention_period() {
+        async fn deletes_an_account_past_the_retention_period() {
             let mut actor = TestingUserManager::default();
-            actor.purge_account.push_back(Ok(PurgeOutcome::Purged));
+            actor.purge_account.push_back(Ok(PurgeOutcome::Deleted));
             let (octosync, data_dir) = octosync_with(actor);
             let mut store = store::UserStore::new(data_dir.path(), false).await.unwrap();
             store.depart_user(user(1, "alice"), old_departure());
 
             octosync
-                .purge_expired(&mut store, &member_map(&[]), RETENTION_DAYS)
+                .purge_disabled_accounts(
+                    &mut store,
+                    ORG,
+                    &member_map(&[other_member()]),
+                    RETENTION_DAYS,
+                )
                 .await
                 .unwrap();
 
             assert!(store.departed().is_empty());
-            // The tombstone survives the purge and is saved, so the UID stays
-            // reserved for a rejoin even after the purge
+            // The retained record keeps the UID available for a later rejoin.
             let saved = store::UserStore::from_dir(data_dir.path(), false)
                 .await
                 .unwrap();
-            let purged = &saved.purged()[&octocrab::models::UserId(1)];
-            assert_eq!(purged.name(), "alice");
+            let deleted_account = &saved.deleted()[&octocrab::models::UserId(1)];
+            assert_eq!(deleted_account.name(), "alice");
         }
 
-        /// A tombstone younger than the retention period is not purged: the scripted
-        /// Purged response would move it if the message were sent.
+        /// A recent departure is not eligible for account deletion. The scripted
+        /// response would move its record if the purge message were sent.
         #[tokio::test]
-        async fn young_tombstone_is_not_purged() {
+        async fn recent_departure_is_not_deleted() {
             let mut actor = TestingUserManager::default();
-            actor.purge_account.push_back(Ok(PurgeOutcome::Purged));
+            actor.purge_account.push_back(Ok(PurgeOutcome::Deleted));
             let (octosync, data_dir) = octosync_with(actor);
             let mut store = store::UserStore::new(data_dir.path(), false).await.unwrap();
             store.depart_user(user(1, "alice"), chrono::Utc::now());
 
             octosync
-                .purge_expired(&mut store, &member_map(&[]), RETENTION_DAYS)
+                .purge_disabled_accounts(
+                    &mut store,
+                    ORG,
+                    &member_map(&[other_member()]),
+                    RETENTION_DAYS,
+                )
                 .await
                 .unwrap();
 
             assert!(store.departed().contains_key(&octocrab::models::UserId(1)));
-            assert!(store.purged().is_empty());
+            assert!(store.deleted().is_empty());
         }
 
-        /// A member present in the fetched member list is never purged, however old
-        /// their tombstone is.
+        /// A current member's account is never deleted, regardless of the retained
+        /// departure date.
         #[tokio::test]
-        async fn current_org_member_is_not_purged() {
+        async fn current_org_member_is_not_deleted() {
             let mut actor = TestingUserManager::default();
-            actor.purge_account.push_back(Ok(PurgeOutcome::Purged));
+            actor.purge_account.push_back(Ok(PurgeOutcome::Deleted));
             let (octosync, data_dir) = octosync_with(actor);
             let mut store = store::UserStore::new(data_dir.path(), false).await.unwrap();
             let alice = user(1, "alice");
             store.depart_user(alice.clone(), old_departure());
 
             octosync
-                .purge_expired(&mut store, &member_map(&[alice]), RETENTION_DAYS)
+                .purge_disabled_accounts(&mut store, ORG, &member_map(&[alice]), RETENTION_DAYS)
                 .await
                 .unwrap();
 
             assert!(store.departed().contains_key(&octocrab::models::UserId(1)));
-            assert!(store.purged().is_empty());
+            assert!(store.deleted().is_empty());
         }
 
-        /// The account-side clock disagrees with the tombstone: the backend reports
-        /// the account as not expired long enough, the tombstone stays departed.
+        /// The departure date and shadow expiry disagree. The backend reports that the
+        /// account was not disabled before the cutoff, so the departure record remains.
         #[tokio::test]
-        async fn account_side_disagreement_keeps_the_tombstone_departed() {
+        async fn account_side_disagreement_keeps_the_departure() {
             let mut actor = TestingUserManager::default();
-            actor.purge_account.push_back(Ok(PurgeOutcome::NotExpired));
+            actor
+                .purge_account
+                .push_back(Ok(PurgeOutcome::NotDisabledLongEnough));
             actor.purge_account.push_back(Ok(PurgeOutcome::NoAccount));
             let (octosync, data_dir) = octosync_with(actor);
             let mut store = store::UserStore::new(data_dir.path(), false).await.unwrap();
@@ -986,18 +1123,22 @@ mod tests {
             store.depart_user(user(2, "bob"), old_departure());
 
             octosync
-                .purge_expired(&mut store, &member_map(&[]), RETENTION_DAYS)
+                .purge_disabled_accounts(
+                    &mut store,
+                    ORG,
+                    &member_map(&[other_member()]),
+                    RETENTION_DAYS,
+                )
                 .await
                 .unwrap();
 
             assert_eq!(store.departed().len(), 2);
-            assert!(store.purged().is_empty());
+            assert!(store.deleted().is_empty());
         }
 
-        /// A failed purge keeps the tombstone departed, so it is retried on the next
-        /// sync.
+        /// A failed purge keeps the departure record for a later retry.
         #[tokio::test]
-        async fn failed_purge_keeps_the_tombstone_departed() {
+        async fn failed_purge_keeps_the_departure() {
             let mut actor = TestingUserManager::default();
             actor.purge_account.push_back(Err(anyhow::anyhow!("boom")));
             let (octosync, data_dir) = octosync_with(actor);
@@ -1005,42 +1146,196 @@ mod tests {
             store.depart_user(user(1, "alice"), old_departure());
 
             octosync
-                .purge_expired(&mut store, &member_map(&[]), RETENTION_DAYS)
+                .purge_disabled_accounts(
+                    &mut store,
+                    ORG,
+                    &member_map(&[other_member()]),
+                    RETENTION_DAYS,
+                )
                 .await
                 .unwrap();
 
             assert!(store.departed().contains_key(&octocrab::models::UserId(1)));
-            assert!(store.purged().is_empty());
+            assert!(store.deleted().is_empty());
         }
 
-        /// A purged tombstone is left alone by the expiry reconciliation: the two
-        /// rules must not fight over an entry.
+        /// An empty member list makes every departure record look eligible, so the purge
+        /// refuses it. No user manager response is provided, which also proves no account
+        /// was deleted before the guard ran.
         #[tokio::test]
-        async fn purged_tombstone_is_not_re_expired() {
-            let actor = TestingUserManager::default();
-            let expired_users = actor.expired_users.clone();
+        async fn empty_member_list_refuses_the_purge() {
+            let (octosync, data_dir) = octosync_with(TestingUserManager::default());
+            let mut store = store::UserStore::new(data_dir.path(), false).await.unwrap();
+            store.depart_user(user(1, "alice"), old_departure());
+
+            let err = octosync
+                .purge_disabled_accounts(&mut store, ORG, &member_map(&[]), RETENTION_DAYS)
+                .await
+                .unwrap_err();
+
+            assert!(err.to_string().contains("returned no members"));
+            assert!(store.departed().contains_key(&octocrab::models::UserId(1)));
+        }
+
+        /// A store containing only departure records has no active user left to detect a
+        /// broken member list, so the guard must not depend on active users.
+        #[tokio::test]
+        async fn empty_member_list_is_refused_with_departures_only() {
+            let (octosync, data_dir) = octosync_with(TestingUserManager::default());
+            let mut store = store::UserStore::new(data_dir.path(), false).await.unwrap();
+            store.depart_user(user(1, "alice"), old_departure());
+            store.depart_user(user(2, "bob"), old_departure());
+
+            assert!(store.data().is_empty());
+            assert!(
+                octosync
+                    .purge_disabled_accounts(&mut store, ORG, &member_map(&[]), RETENTION_DAYS)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(store.departed().len(), 2);
+        }
+
+        /// A failure may happen after `userdel` removed the account, so the persisted
+        /// marker is retained for the next run to resolve.
+        #[tokio::test]
+        async fn failed_purge_keeps_the_pending_marker() {
+            let mut actor = TestingUserManager::default();
+            actor.purge_account.push_back(Err(anyhow::anyhow!("boom")));
             let (octosync, data_dir) = octosync_with(actor);
             let mut store = store::UserStore::new(data_dir.path(), false).await.unwrap();
             store.depart_user(user(1, "alice"), old_departure());
-            store.mark_purged(&octocrab::models::UserId(1), chrono::Utc::now());
 
             octosync
-                .depart_and_expire(&mut store, vec![])
+                .purge_disabled_accounts(
+                    &mut store,
+                    ORG,
+                    &member_map(&[other_member()]),
+                    RETENTION_DAYS,
+                )
                 .await
                 .unwrap();
 
-            assert!(expired_users.lock().unwrap().is_empty());
+            let saved = store::UserStore::from_dir(data_dir.path(), false)
+                .await
+                .unwrap();
+            assert!(
+                saved.departed()[&octocrab::models::UserId(1)]
+                    .deletion_started_at()
+                    .is_some()
+            );
+        }
+
+        /// The account is gone and the departure record shows an interrupted purge.
+        /// The next run completes octosync's unfinished store update.
+        #[tokio::test]
+        async fn interrupted_purge_is_completed_on_the_next_run() {
+            let mut actor = TestingUserManager::default();
+            actor.purge_account.push_back(Ok(PurgeOutcome::NoAccount));
+            let (octosync, data_dir) = octosync_with(actor);
+            let mut store = store::UserStore::new(data_dir.path(), false).await.unwrap();
+            store.depart_user(user(1, "alice"), old_departure());
+            store.mark_deletion_started(&octocrab::models::UserId(1), old_departure());
+
+            octosync
+                .purge_disabled_accounts(
+                    &mut store,
+                    ORG,
+                    &member_map(&[other_member()]),
+                    RETENTION_DAYS,
+                )
+                .await
+                .unwrap();
+
+            assert!(store.departed().is_empty());
+            assert_eq!(
+                store.deleted()[&octocrab::models::UserId(1)].name(),
+                "alice"
+            );
+        }
+
+        /// Without a marker, a missing account may have been deleted independently.
+        /// Its departure record must remain.
+        #[tokio::test]
+        async fn account_deleted_by_an_operator_keeps_its_departure() {
+            let mut actor = TestingUserManager::default();
+            actor.purge_account.push_back(Ok(PurgeOutcome::NoAccount));
+            let (octosync, data_dir) = octosync_with(actor);
+            let mut store = store::UserStore::new(data_dir.path(), false).await.unwrap();
+            store.depart_user(user(1, "alice"), old_departure());
+
+            octosync
+                .purge_disabled_accounts(
+                    &mut store,
+                    ORG,
+                    &member_map(&[other_member()]),
+                    RETENTION_DAYS,
+                )
+                .await
+                .unwrap();
+
+            assert!(store.departed().contains_key(&octocrab::models::UserId(1)));
+            assert!(store.deleted().is_empty());
+        }
+
+        /// Each purge result is persisted before the next `userdel` starts.
+        #[tokio::test]
+        async fn each_purge_is_saved_before_the_next_one_starts() {
+            let mut actor = TestingUserManager::default();
+            actor.purge_account.push_back(Ok(PurgeOutcome::Deleted));
+            actor.purge_account.push_back(Err(anyhow::anyhow!("boom")));
+            let (octosync, data_dir) = octosync_with(actor);
+            let mut store = store::UserStore::new(data_dir.path(), false).await.unwrap();
+            store.depart_user(user(1, "alice"), old_departure());
+            store.depart_user(user(2, "bob"), old_departure());
+
+            octosync
+                .purge_disabled_accounts(
+                    &mut store,
+                    ORG,
+                    &member_map(&[other_member()]),
+                    RETENTION_DAYS,
+                )
+                .await
+                .unwrap();
+
+            // One account was deleted and one purge failed. Both outcomes are saved.
+            // The processing order is not fixed, so only the counts are asserted.
+            let saved = store::UserStore::from_dir(data_dir.path(), false)
+                .await
+                .unwrap();
+            assert_eq!(saved.deleted().len(), 1);
+            assert_eq!(saved.departed().len(), 1);
+        }
+
+        /// A record for a permanently deleted account is not processed by account
+        /// disablement again.
+        #[tokio::test]
+        async fn deleted_record_is_not_disabled_again() {
+            let actor = TestingUserManager::default();
+            let disabled_users = actor.disabled_users.clone();
+            let (octosync, data_dir) = octosync_with(actor);
+            let mut store = store::UserStore::new(data_dir.path(), false).await.unwrap();
+            store.depart_user(user(1, "alice"), old_departure());
+            store.mark_deleted(&octocrab::models::UserId(1), chrono::Utc::now());
+
+            octosync
+                .depart_and_disable(&mut store, vec![], &member_map(&[]))
+                .await
+                .unwrap();
+
+            assert!(disabled_users.lock().unwrap().is_empty());
         }
     }
 
     mod partition_stale_users {
         use super::*;
 
-        /// Regression test for the 2026-08-12 incident: every member is still in the
-        /// org, but all of them failed processing, so the new store is empty.
-        /// No user may be expired; all must be retried.
+        /// Regression test for the 2026-08-12 incident. Every member is still in the
+        /// organization, but all processing failed and the new store is empty. No account
+        /// may be disabled. Every member must be retried.
         #[test]
-        fn all_members_failed_processing_expires_nobody() {
+        fn all_members_failed_processing_disables_nobody() {
             let users = [user(1, "a"), user(2, "b"), user(3, "c")];
             let old = user_map(&users);
             let new = user_map(&[]);
@@ -1053,7 +1348,7 @@ mod tests {
         }
 
         #[test]
-        fn user_absent_from_member_list_is_expired() {
+        fn user_absent_from_member_list_is_a_leaver() {
             let remaining = user(1, "a");
             let left = user(2, "b");
             let old = user_map(&[remaining.clone(), left.clone()]);
@@ -1067,7 +1362,7 @@ mod tests {
         }
 
         #[test]
-        fn successfully_processed_user_is_neither_retried_nor_expired() {
+        fn successfully_processed_user_is_neither_retried_nor_departed() {
             let processed = user(1, "a");
             let old = user_map(std::slice::from_ref(&processed));
             let new = user_map(std::slice::from_ref(&processed));
@@ -1080,7 +1375,7 @@ mod tests {
         }
 
         #[test]
-        fn failed_member_is_retried_while_removed_member_is_expired() {
+        fn failed_member_is_retried_while_absent_member_is_a_leaver() {
             let processed = user(1, "a");
             let failed = user(2, "b");
             let left = user(3, "c");
@@ -1094,8 +1389,8 @@ mod tests {
             assert_eq!(leavers, vec![&left]);
         }
 
-        /// The successful-but-empty member list: `sync()` bails on this before
-        /// processing, but the circuit breaker must still trip as defense in depth.
+        /// `sync()` rejects an empty member list before processing. The later
+        /// mass-disablement safeguard remains as a second check.
         #[test]
         fn empty_member_list_puts_all_users_in_leaver_bucket_and_trips_guard() {
             let users = [user(1, "a"), user(2, "b")];
@@ -1107,7 +1402,7 @@ mod tests {
 
             assert!(retry.is_empty());
             assert_eq!(leavers.len(), 2);
-            assert!(would_expire_all_users(&old, &leavers));
+            assert!(would_disable_all_users(&old, &leavers));
         }
 
         #[test]
@@ -1124,43 +1419,90 @@ mod tests {
         }
     }
 
-    mod expires_entire_store {
+    mod membership_has_no_stored_users {
+        use super::*;
+
+        /// The 2026-08-12 failure seen one step earlier. An empty member list must stop
+        /// the sync before any group is created or user is processed.
+        #[test]
+        fn empty_member_list_contains_no_stored_users() {
+            let stored = user_map(&[user(1, "a"), user(2, "b")]);
+
+            assert!(membership_has_no_stored_users(&stored, &member_map(&[])));
+        }
+
+        /// A mis-scoped installation returns members, just not the managed ones.
+        #[test]
+        fn membership_with_only_unrelated_users_contains_no_stored_users() {
+            let stored = user_map(&[user(1, "a")]);
+
+            assert!(membership_has_no_stored_users(
+                &stored,
+                &member_map(&[user(2, "b")])
+            ));
+        }
+
+        /// One surviving member is enough to trust the list. The users missing from it
+        /// are real leavers, and `partition_stale_users` still separates them from
+        /// members whose processing merely failed.
+        #[test]
+        fn membership_with_a_stored_user_is_accepted() {
+            let kept = user(1, "a");
+            let stored = user_map(&[kept.clone(), user(2, "b")]);
+
+            assert!(!membership_has_no_stored_users(
+                &stored,
+                &member_map(&[kept])
+            ));
+        }
+
+        /// A first run has no stored users to protect.
+        #[test]
+        fn empty_store_does_not_trigger_guard() {
+            assert!(!membership_has_no_stored_users(
+                &user_map(&[]),
+                &member_map(&[])
+            ));
+        }
+    }
+
+    mod disables_entire_store {
         use super::*;
 
         #[test]
-        fn expiring_every_stored_user_trips_the_guard() {
+        fn disabling_every_stored_user_trips_the_guard() {
             let users = [user(1, "a"), user(2, "b")];
             let old = user_map(&users);
             let leavers: Vec<&store::User> = old.values().collect();
 
-            assert!(would_expire_all_users(&old, &leavers));
+            assert!(would_disable_all_users(&old, &leavers));
         }
 
         #[test]
-        fn expiring_a_subset_is_allowed() {
+        fn disabling_a_subset_is_allowed() {
             let users = [user(1, "a"), user(2, "b")];
             let old = user_map(&users);
             let leavers = vec![&old[&octocrab::models::UserId(1)]];
 
-            assert!(!would_expire_all_users(&old, &leavers));
+            assert!(!would_disable_all_users(&old, &leavers));
         }
 
         #[test]
-        fn nothing_to_expire_is_allowed() {
+        fn nothing_to_disable_is_allowed() {
             let old = user_map(&[user(1, "a")]);
 
-            assert!(!would_expire_all_users(&old, &[]));
+            assert!(!would_disable_all_users(&old, &[]));
         }
 
-        /// A single-user store where that user really left still trips the guard;
-        /// the explicit delete command is the intentional path for this case.
+        /// A single-user store where that user really left still triggers the safeguard.
+        /// The explicit `delete` command is the intentional path for this case.
         #[test]
-        fn expiring_the_only_stored_user_trips_the_guard() {
+        fn disabling_the_only_stored_user_trips_the_guard() {
             let only = user(1, "a");
             let old = user_map(std::slice::from_ref(&only));
             let leavers: Vec<&store::User> = old.values().collect();
 
-            assert!(would_expire_all_users(&old, &leavers));
+            assert!(would_disable_all_users(&old, &leavers));
         }
     }
 }
