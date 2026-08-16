@@ -915,19 +915,51 @@ fn shadow_days(timestamp: chrono::DateTime<chrono::Utc>) -> i64 {
     timestamp.timestamp().div_euclid(SECONDS_PER_DAY)
 }
 
-/// Read the shadow expiry as days since the epoch through libc's `getspnam`.
+/// Initial size of the buffer `getspnam_r` writes the entry's strings into.
+const SHADOW_BUFFER_SIZE: usize = 1024;
+/// Refuse to grow the buffer past this. A shadow entry never approaches it.
+const SHADOW_BUFFER_MAX: usize = 64 * 1024;
+
+/// Read the shadow expiry as days since the epoch through libc's `getspnam_r`.
+///
+/// The reentrant call writes into caller-owned storage instead of a static buffer, so
+/// correctness does not rest on no other thread in the process reading shadow entries.
 fn account_expire_days(name: &str) -> anyhow::Result<Option<i64>> {
     let c_name = std::ffi::CString::new(name).context("User name contains an interior NUL byte")?;
-    // SAFETY: getspnam returns a pointer into static storage, which is only unsound
-    // when another thread calls it concurrently. Every call site runs on the user
-    // manager actor, which processes one message at a time.
-    let entry = unsafe { libc::getspnam(c_name.as_ptr()) };
-    if entry.is_null() {
+    let mut entry = std::mem::MaybeUninit::<libc::spwd>::uninit();
+    let mut buf = vec![0 as libc::c_char; SHADOW_BUFFER_SIZE];
+
+    let found = loop {
+        let mut result: *mut libc::spwd = std::ptr::null_mut();
+        // SAFETY: every pointer refers to live local storage of the length passed
+        // alongside it, and getspnam_r only writes through them.
+        let rc = unsafe {
+            libc::getspnam_r(
+                c_name.as_ptr(),
+                entry.as_mut_ptr(),
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut result,
+            )
+        };
+        match rc {
+            // A null result with a successful call means no shadow entry exists.
+            0 => break !result.is_null(),
+            libc::ERANGE if buf.len() < SHADOW_BUFFER_MAX => {
+                buf.resize((buf.len() * 2).min(SHADOW_BUFFER_MAX), 0);
+            }
+            rc => {
+                return Err(std::io::Error::from_raw_os_error(rc))
+                    .with_context(|| format!("Failed to read the shadow entry of '{name}'"));
+            }
+        }
+    };
+
+    if !found {
         return Ok(None);
     }
-    // SAFETY: checked to be non-null above, and the field is copied out before any
-    // following getspnam call can overwrite the storage
-    let expire_days = unsafe { (*entry).sp_expire };
+    // SAFETY: a successful call with a non-null result initialized the entry
+    let expire_days = unsafe { entry.assume_init() }.sp_expire;
     // An empty expiry field is reported as -1
     Ok((expire_days >= 0).then_some(expire_days))
 }
