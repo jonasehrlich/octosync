@@ -466,22 +466,34 @@ async fn terminate_logind_user(connection: &zbus::Connection, uid: u32) -> anyho
 
 /// Remove `cron` and `at` jobs that can outlive login sessions.
 ///
-/// Expiring the account already blocks the PAM account check `cron` and `at` perform, so
+/// The shadow expiry already blocks the PAM account check `cron` and `at` perform, so
 /// this is the second half of that guarantee rather than the only one, and it also
 /// covers a machine whose `cron` does not consult PAM.
 async fn remove_scheduled_jobs(user: &nix::unistd::User) -> anyhow::Result<()> {
-    remove_crontab(&user.name).await?;
-    remove_at_jobs(&user.name).await
+    // The two schedulers are independent, so a crontab that could not be removed must
+    // not leave the queued `at` jobs in place as well.
+    let crontab = remove_crontab(&user.name).await;
+    let at_jobs = remove_at_jobs(&user.name).await;
+    crontab.and(at_jobs)
 }
 
 /// Remove the user's `crontab`
 ///
 /// List the `crontab` first to avoid treating absence as an error.
 async fn remove_crontab(name: &str) -> anyhow::Result<()> {
-    let Some(list) = optional_command("/usr/bin/crontab", &["-l", "-u", name]).await? else {
+    let Some(list) = optional_command("/usr/bin/crontab", ["-l", "-u", name]).await? else {
         return Ok(());
     };
     if !list.status.success() {
+        // A user without a crontab and an unreadable spool both exit non-zero, and only
+        // the first means there is nothing to remove. Reporting the rest keeps a
+        // permission or spool failure from silently leaving scheduled work behind.
+        if !is_missing_crontab(&list.stderr) {
+            anyhow::bail!(
+                "Failed to list the crontab of '{name}': {}",
+                String::from_utf8_lossy(&list.stderr)
+            );
+        }
         return Ok(());
     }
 
@@ -500,12 +512,22 @@ async fn remove_crontab(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether `crontab -l` reported an absent crontab rather than a failure.
+///
+/// There is no distinct exit code for it, so the message is the only signal. cronie and
+/// vixie-cron print "no crontab for <user>". busybox prints "no job for <user>".
+/// Anything else is treated as a real failure.
+fn is_missing_crontab(stderr: &[u8]) -> bool {
+    let stderr = String::from_utf8_lossy(stderr).to_lowercase();
+    stderr.contains("no crontab for") || stderr.contains("no job for")
+}
+
 /// Remove the user's queued `at` jobs from root's global listing.
 ///
 /// `atq` lists the jobs of every user with the owner in the last field, which is the only way to
 /// select one user's jobs for `atrm`.
 async fn remove_at_jobs(name: &str) -> anyhow::Result<()> {
-    let Some(queue) = optional_command("/usr/bin/atq", &[]).await? else {
+    let Some(queue) = optional_command("/usr/bin/atq", std::iter::empty::<&str>()).await? else {
         return Ok(());
     };
     if !queue.status.success() {
@@ -527,11 +549,16 @@ async fn remove_at_jobs(name: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let output = process::Command::new("/usr/bin/atrm")
-        .args(&job_ids)
-        .output()
-        .await
-        .context("Failed to wait for atrm command to finish")?;
+    // `atrm` ships with `atq`, so a machine that has one and not the other is broken
+    // rather than simply without `at`. Failing the whole departure cleanup over it
+    // would keep the account enabled, so report the queued jobs and continue.
+    let Some(output) = optional_command("/usr/bin/atrm", &job_ids).await? else {
+        tracing::warn!(
+            jobs = job_ids.len(),
+            "'atrm' is not installed, leaving the at jobs of '{name}' queued"
+        );
+        return Ok(());
+    };
     if !output.status.success() {
         anyhow::bail!(
             "Failed to remove the at jobs of '{name}': {}",
@@ -546,10 +573,14 @@ async fn remove_at_jobs(name: &str) -> anyhow::Result<()> {
 }
 
 /// Treat a missing optional command as no work to do.
-async fn optional_command(
+async fn optional_command<I, S>(
     program: &str,
-    args: &[&str],
-) -> anyhow::Result<Option<std::process::Output>> {
+    args: I,
+) -> anyhow::Result<Option<std::process::Output>>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
     match process::Command::new(program).args(args).output().await {
         Ok(output) => Ok(Some(output)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
