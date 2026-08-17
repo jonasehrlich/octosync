@@ -283,6 +283,23 @@ impl UserStore {
         })
     }
 
+    /// Create a snapshot of this store to process users.
+    ///
+    /// Departed, deleted records and the migration flag are copied so that the snapshot can be
+    /// processed without affecting the original store.
+    pub(crate) fn new_for_processing(&self) -> Self {
+        Self {
+            dir: self.dir.clone(),
+            dry_run: self.dry_run,
+            users: UserMap::new(),
+            departed: self.departed.clone(),
+            deleted: self.deleted.clone(),
+            migrated_from_v1: sync::atomic::AtomicBool::new(
+                self.migrated_from_v1.load(sync::atomic::Ordering::Relaxed),
+            ),
+        }
+    }
+
     /// Load a store from a directory.
     #[tracing::instrument(name = "Store::from_dir")]
     pub async fn from_dir(dir: &path::Path, dry_run: bool) -> anyhow::Result<Self> {
@@ -303,16 +320,8 @@ impl UserStore {
         &self.departed
     }
 
-    pub fn departed_mut(&mut self) -> &mut DepartedMap {
-        &mut self.departed
-    }
-
     pub fn deleted(&self) -> &DeletedMap {
         &self.deleted
-    }
-
-    pub fn deleted_mut(&mut self) -> &mut DeletedMap {
-        &mut self.deleted
     }
 
     /// Record a departure and keep the account IDs for a later rejoin.
@@ -773,6 +782,26 @@ mod tests {
             let backup = fs::read_to_string(temp_dir.path().join(USERS_V1_FILE_NAME))
                 .await
                 .expect("Backup file was not created");
+            assert_eq!(backup, v1_content());
+        }
+
+        /// A normal sync writes a replacement snapshot rather than the store it loaded.
+        /// The pending backup must follow that snapshot to its first save.
+        #[tokio::test]
+        async fn sync_snapshot_save_after_v1_migration_backs_up_v1() {
+            let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
+            write_users_file(temp_dir.path(), &v1_content()).await;
+
+            let old_store = UserStore::from_dir(temp_dir.path(), false).await.unwrap();
+            let new_store = old_store.new_for_processing();
+            new_store
+                .save()
+                .await
+                .expect("Failed to save sync snapshot");
+
+            let backup = fs::read_to_string(temp_dir.path().join(USERS_V1_FILE_NAME))
+                .await
+                .expect("Initial sync did not write the v1 backup");
             assert_eq!(backup, v1_content());
         }
 

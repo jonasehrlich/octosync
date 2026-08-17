@@ -416,9 +416,7 @@ impl Octosync {
         store: &store::UserStore,
         assignments: &groups::GroupAssignments,
     ) -> anyhow::Result<store::UserStore> {
-        let mut new_store = store::UserStore::new(&self.data_dir, self.dry_run).await?;
-        *new_store.departed_mut() = store.departed().clone();
-        *new_store.deleted_mut() = store.deleted().clone();
+        let mut new_store = store.new_for_processing();
         *new_store.data_mut() = stream::iter(org_members)
             .map(|gh_user| {
                 let groups = assignments.user_groups(gh_user.id);
