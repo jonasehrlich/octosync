@@ -1615,7 +1615,6 @@ dependencies = [
  "fs2",
  "futures",
  "hannibal",
- "jsonwebtoken",
  "libc",
  "nix",
  "octocrab",
