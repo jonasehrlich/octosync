@@ -452,7 +452,7 @@ async fn terminate_logind_user(connection: &zbus::Connection, uid: u32) -> anyho
 
     // GetUser fails when there is no session or lingering user manager.
     if manager
-        .call::<_, _, zbus::zvariant::OwnedObjectPath>("GetUser", &uid)
+        .call::<_, _, zbus::OwnedObjectPath>("GetUser", &uid)
         .await
         .is_err()
     {

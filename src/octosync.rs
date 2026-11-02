@@ -21,7 +21,7 @@ async fn org_client(args: &InstallationClientArgs) -> anyhow::Result<octocrab::O
                 args.private_key.display()
             )
         })?;
-    let jwt = jsonwebtoken::EncodingKey::from_rsa_pem(private_key.as_slice())?;
+    let jwt = octocrab::EncodingKey::from_rsa_pem(private_key.as_slice())?;
 
     let app_client = octocrab::Octocrab::builder()
         .app(args.app_id, jwt)
